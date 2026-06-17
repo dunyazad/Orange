@@ -52,6 +52,6 @@ if(ORANGE_BUILD_VK)
     endif()
 endif()
 
-add_subdirectory(app/sandbox)
+add_subdirectory(app/appOrange)
 
 message(STATUS "Orange: output dir = ${ORANGE_BIN_DIR}")

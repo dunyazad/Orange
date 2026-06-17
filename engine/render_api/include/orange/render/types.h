@@ -38,7 +38,7 @@ struct TextureDesc {
     const uint8_t* pixels = nullptr;  // width*height*4 bytes, RGBA8
 };
 
-// A convenience interleaved vertex used by the sandbox. Backends never depend
+// A convenience interleaved vertex used by appOrange. Backends never depend
 // on it -- they only see raw buffers + a VertexLayout. layout() returns the
 // matching layout so callers don't hand-write offsets.
 struct Vertex {

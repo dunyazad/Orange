@@ -1,9 +1,9 @@
-// Orange sandbox: loads a render backend plugin at runtime, builds an ECS
+// Orange appOrange: loads a render backend plugin at runtime, builds an ECS
 // world (no scene graph), and spins a cube.
 //
-//   sandbox            -> OpenGL backend (default)
-//   sandbox --vulkan   -> Vulkan backend (if the render_vk plugin was built)
-//   sandbox --gl       -> OpenGL backend (explicit)
+//   appOrange            -> OpenGL backend (default)
+//   appOrange --vulkan   -> Vulkan backend (if the render_vk plugin was built)
+//   appOrange --gl       -> OpenGL backend (explicit)
 
 #define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
@@ -248,7 +248,7 @@ int main(int argc, char** argv) {
     core::setupConsoleWindow();
 
     core::AppConfig config;
-    config.title  = "Orange Sandbox";
+    config.title  = "Orange appOrange";
     config.width  = 1280;
     config.height = 720;
     config.backend = render::Backend::OpenGL;
@@ -263,7 +263,7 @@ int main(int argc, char** argv) {
 
     core::Application app;
     if (!app.init(config)) {
-        SDL_Log("sandbox: initialization failed");
+        SDL_Log("appOrange: initialization failed");
         return 1;
     }
 
@@ -485,7 +485,7 @@ int main(int argc, char** argv) {
         world.emplace<ecs::Spin>(e, spin);
     }
 
-    SDL_Log("sandbox: running. ESC or close the window to quit.");
+    SDL_Log("appOrange: running. ESC or close the window to quit.");
     app.run();  // spinSystem + renderSystem run internally each frame
     return 0;
 }

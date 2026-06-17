@@ -92,7 +92,7 @@ private:
     VkFormat       depthFormat_ = VK_FORMAT_D32_SFLOAT;
 
     // Graphics pipeline for mesh rendering (built lazily from the first mesh's
-    // vertex layout; all sandbox meshes share the same layout).
+    // vertex layout; all appOrange meshes share the same layout).
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline       pipeline_       = VK_NULL_HANDLE;
 

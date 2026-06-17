@@ -17,7 +17,7 @@ core never links against OpenGL or Vulkan directly.
 ## Architecture
 
 ```
-app/sandbox ─────────────┐  loads at runtime (dlopen / LoadLibrary)
+app/appOrange ───────────┐  loads at runtime (dlopen / LoadLibrary)
                          │
 engine/core  ── ECS (EnTT), window (SDL3), plugin loader, app loop
    │  depends on
@@ -92,7 +92,7 @@ engine/render_api/   interface-only contract (header library)
 engine/core/         platform layer + ECS (components, systems, app loop)
 plugins/render_gl/   OpenGL backend plugin
 plugins/render_vk/   Vulkan backend plugin (built only if the Vulkan SDK exists)
-app/sandbox/         demo app: spinning cubes via ECS
+app/appOrange/       demo app: spinning cubes via ECS
 ```
 
 ## Build
@@ -111,8 +111,8 @@ Binaries (app + plugins) land in `build/bin/`.
 ## Run
 
 ```sh
-./build/bin/sandbox            # OpenGL (default)
-./build/bin/sandbox --vulkan   # Vulkan (clears + presents; mesh draw is WIP)
+./build/bin/appOrange            # OpenGL (default)
+./build/bin/appOrange --vulkan   # Vulkan (clears + presents; mesh draw is WIP)
 ```
 
 ### Controls

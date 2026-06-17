@@ -28,7 +28,7 @@ engine/render_api/   interface-only C-ABI contract (header library) — no GL/VK
 engine/core/         platform layer + ECS (components, systems, app loop, window)
 plugins/render_gl/   OpenGL 3.3 backend plugin
 plugins/render_vk/   Vulkan backend plugin (built only if a Vulkan SDK is found)
-app/sandbox/         demo app: three spinning cubes via ECS (also hosts font/UI impl)
+app/appOrange/       demo app: three spinning cubes via ECS (also hosts font/UI impl)
 ```
 
 ## Build & run
@@ -41,8 +41,8 @@ Generic (per README):
 ```sh
 cmake -S . -B build
 cmake --build build --config Debug
-./build/bin/sandbox            # OpenGL (default)
-./build/bin/sandbox --vulkan   # Vulkan
+./build/bin/appOrange            # OpenGL (default)
+./build/bin/appOrange --vulkan   # Vulkan
 ```
 
 ### ⚠️ This Windows machine (D:\Library\Orange)
@@ -60,8 +60,8 @@ cmake --build D:/Library/Orange/build --config Debug
   `VULKAN_SDK` is set machine-wide, but a fresh shell may not have it yet —
   if CMake reports "Vulkan SDK not found", set `$env:VULKAN_SDK` for the
   session, delete `build/CMakeCache.txt`, and reconfigure.
-- Binaries land in `build/bin/Debug`. Run `sandbox.exe` (GL) or
-  `sandbox.exe --vulkan`.
+- Binaries land in `build/bin/Debug`. Run `appOrange.exe` (GL) or
+  `appOrange.exe --vulkan`.
 
 ## Key facts to keep in mind
 

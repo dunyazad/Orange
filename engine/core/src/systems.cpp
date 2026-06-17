@@ -21,7 +21,7 @@ constexpr float kGizmoEyeZ      = 3.0f;  // overlay camera distance along +Z
 // must start beyond that to never be covered by the cube.
 constexpr float kRingInner      = 1.9f;  // clickable ring behind the cube
 constexpr float kRingOuter      = 2.3f;
-// kGizmoEdge (face/edge boundary) lives in components.h so the sandbox grid uses
+// kGizmoEdge (face/edge boundary) lives in components.h so the appOrange grid uses
 // the same value; it is in scope here via namespace orange::ecs.
 constexpr float kGizmoOrthoHalf = 2.45f; // ortho half-extent (fits the ring + margin)
 constexpr float kHalfPi         = 1.57079633f;
