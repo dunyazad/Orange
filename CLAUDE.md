@@ -55,7 +55,11 @@ cmake -S D:/Library/Orange -B D:/Library/Orange/build -G "Visual Studio 16 2019"
 cmake --build D:/Library/Orange/build --config Debug
 ```
 
-- Vulkan SDK is at `C:\VulkanSDK\1.3.283.0`, so `render_vk` builds here.
+- Vulkan SDK is at `C:\VulkanSDK\1.4.350.0` (installed via
+  `winget install KhronosGroup.VulkanSDK`), so `render_vk` builds here.
+  `VULKAN_SDK` is set machine-wide, but a fresh shell may not have it yet —
+  if CMake reports "Vulkan SDK not found", set `$env:VULKAN_SDK` for the
+  session, delete `build/CMakeCache.txt`, and reconfigure.
 - Binaries land in `build/bin/Debug`. Run `sandbox.exe` (GL) or
   `sandbox.exe --vulkan`.
 

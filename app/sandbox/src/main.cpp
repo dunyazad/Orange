@@ -21,6 +21,7 @@
 
 #include "orange/core/application.h"
 #include "orange/core/buffer.h"
+#include "orange/core/console.h"
 #include "orange/ecs/components.h"
 #include "orange/render/types.h"
 
@@ -241,6 +242,10 @@ void buildRing(std::vector<render::Vertex>& verts, std::vector<uint32_t>& idx) {
 
 int main(int argc, char** argv) {
     SDL_SetMainReady();
+
+    // Console on the monitor right of the largest; 3D window maximizes on the
+    // largest monitor (handled in Window::create).
+    core::setupConsoleWindow();
 
     core::AppConfig config;
     config.title  = "Orange Sandbox";

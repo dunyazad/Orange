@@ -4,7 +4,8 @@ add_library(orange_core STATIC
     src/window.cpp
     src/systems.cpp
     src/application.cpp
-    src/screenshot.cpp)
+    src/screenshot.cpp
+    src/console.cpp)
 add_library(orange::core ALIAS orange_core)
 
 target_include_directories(orange_core PUBLIC
