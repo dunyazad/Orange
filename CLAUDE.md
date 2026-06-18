@@ -66,7 +66,9 @@ cmake --build D:/Library/Orange/build --config Debug
 ## Key facts to keep in mind
 
 - **Plugin ABI is v6.** Changing the C contract means bumping
-  `ORANGE_PLUGIN_ABI_VERSION` and updating both backends.
+  `ORANGE_PLUGIN_ABI_VERSION` and updating both backends. v6 added
+  `IRenderer::setVsync(bool)` (GL flips the swap interval; VK recreates the
+  swapchain with a FIFO / immediate-mailbox present mode).
 - **Buffers are two-layer:** handle + byte-size based ABI in `render_api`, and a
   type-safe `core::Buffer<T>` (VertexBuffer/IndexBuffer/UniformBuffer) in
   `engine/core/include/orange/core/buffer.h` that wraps it with RAII. App code
@@ -86,6 +88,10 @@ cmake --build D:/Library/Orange/build --config Debug
 - **No gimbal lock:** `Transform::orientation` is a unit quaternion; the camera
   is a quaternion arcball trackball (`CameraManipulator`). Any camera controller
   is just a system that writes a `Transform`.
+- **Input scheme:** right-drag orbits, middle-drag pans, wheel zooms, and
+  **left-click picks** the nearest `Renderable` via `pickingSystem` (builds a
+  world ray from the camera and ray-tests each entity's local AABB; the hit gets
+  `Renderable::selected`). UI widgets set `Input::captured` to suppress picking.
 - **Text/UI:** gizmo labels and FPS/controls widgets are rasterized with
   stb_truetype (loads `C:/Windows/Fonts/malgun.ttf` on Windows) into RGBA atlases
   drawn as textured overlay quads via `IRenderer::beginOverlay`. Overlay layers

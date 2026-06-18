@@ -121,10 +121,15 @@ A trackball camera (`CameraManipulator` component) orbits the scene:
 
 | Input               | Action          |
 |---------------------|-----------------|
-| Left-drag           | Orbit (quaternion trackball — tumbles freely, no gimbal lock) |
+| Right-drag          | Orbit (quaternion trackball — tumbles freely, no gimbal lock) |
 | Mouse wheel         | Zoom (distance) |
-| Middle/right-drag   | Pan (move target) |
+| Middle-drag         | Pan (move target) |
+| Left-click          | Pick the nearest entity under the cursor (`pickingSystem`); the hit pops slightly larger |
 | ESC / close window  | Quit            |
+
+The FPS widget (top-left) has a **VSYNC** checkbox that toggles vsync at runtime
+(`IRenderer::setVsync`); the camera-controls panel's **+/-** buttons hold to
+change FOV/size continuously, and **Shift** snaps to a coarse grid.
 
 Orientation is accumulated as a unit quaternion (`Transform::orientation`), so
 there is no gimbal lock. `Spin` and the camera both integrate rotations on the
