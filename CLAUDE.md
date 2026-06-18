@@ -65,19 +65,32 @@ cmake --build D:/Library/Orange/build --config Debug
 
 ## Key facts to keep in mind
 
-- **Plugin ABI is v7.** Changing the C contract means bumping
+- **Plugin ABI is v8.** Changing the C contract means bumping
   `ORANGE_PLUGIN_ABI_VERSION` and updating both backends. v6 added
   `IRenderer::setVsync(bool)` (GL flips the swap interval; VK recreates the
   swapchain with a FIFO / immediate-mailbox present mode). v7 added
-  `IRenderer::drawGrid()`.
-- **Infinite grid:** `renderSystem` calls `IRenderer::drawGrid()` after the scene
-  submits (before the gizmo overlay). Each backend renders a vertex-less
+  `IRenderer::drawGrid()`. v8 made it `drawGrid(int upAxis)` (1 = Y up, 2 = Z up)
+  — the axis arg only recolors the in-plane depth line, not the grid plane.
+- **Infinite grid:** `renderSystem` calls `IRenderer::drawGrid(upAxis)` after the
+  scene submits (before the gizmo overlay). Each backend renders a vertex-less
   full-screen pass (GL: inline shader + empty VAO; VK: a second pipeline +
   `shaders/grid.{vert,frag}` → SPIR-V) that ray-casts each pixel onto the world
   y=0 plane and draws `fwidth`-based AA grid lines with distance fade and correct
-  depth (so the scene occludes it). Each plugin inverts its own clip-corrected
-  `viewProj` for the unprojection (the host doesn't, since VK's correction is
-  applied plugin-side).
+  depth (so the scene occludes it). `upAxis` colors the in-plane depth axis line
+  blue (Z, Y-up) or green (Y, Z-up); GL passes a `uUpAxis` uniform, VK an `int` at
+  push-constant offset 128. Each plugin inverts its own clip-corrected `viewProj`
+  for the unprojection (the host doesn't, since VK's correction is plugin-side).
+- **Up-axis (Y/Z) toggle:** a small "Y"/"Z" button in the gizmo's bottom-left
+  corner (`AxisGizmo::zUp`, hit-tested in `axisGizmoInputSystem` via
+  `upToggleRect`). It is a real coordinate-frame change, **not** a camera spin: a
+  world up-axis basis `Mworld` (identity for Y up, `rotateX(-90°)` for Z up, so a
+  model's logical +Z maps to render +Y) is prepended to every renderable's model
+  in `renderSystem` and to the gizmo cube (`conjugate(camOrient)·Mworld`). The
+  camera and the horizontal y=0 grid stay put; content is re-expressed in the new
+  frame (a Z-up mesh stands up under Z up). The grid's depth-axis line recolors
+  (blue Z → green Y) via the `drawGrid` arg. Picking undoes `Mworld` on the ray;
+  gizmo cube-face snaps map the picked logical axis back through `Mworld`. Helpers
+  `worldUpQuat/worldUpMatrix/worldZUp` live in `systems.cpp`.
 - **Buffers are two-layer:** handle + byte-size based ABI in `render_api`, and a
   type-safe `core::Buffer<T>` (VertexBuffer/IndexBuffer/UniformBuffer) in
   `engine/core/include/orange/core/buffer.h` that wraps it with RAII. App code

@@ -128,6 +128,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         input_.shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
 
         if (onUpdate) onUpdate(world_, dt);
+        ecs::menuBarInputSystem(world_, input_, window_.width(), window_.height());
         ecs::fpsWidgetInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::cameraControlsInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::axisGizmoInputSystem(world_, input_, dt, window_.width(), window_.height());

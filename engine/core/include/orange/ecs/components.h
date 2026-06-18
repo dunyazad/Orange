@@ -100,6 +100,19 @@ struct AxisGizmo {
     int sizePx = 150;  // square size in pixels
     int margin = 14;   // distance from the top-right corner
 
+    // World up-axis toggle, shown as a small button in a corner of the gizmo.
+    // false => Y up (grid on y=0), true => Z up (grid on z=0). axisGizmoInputSystem
+    // flips it on click and smoothly re-orients the camera; renderSystem passes the
+    // axis to IRenderer::drawGrid and draws the button.
+    bool zUp = false;
+    bool upBtnHover = false;  // cursor over the toggle button (set each frame)
+
+    // GPU resources for the toggle button (dynamic vertex buffer + UI font).
+    render::MeshHandle    upBtnMesh = render::kInvalidMesh;
+    render::BufferHandle  upBtnVbo  = render::kInvalidBuffer;
+    const core::Font*     font      = nullptr;
+    render::TextureHandle uiAtlas   = render::kInvalidTexture;
+
     // Runtime state, updated each frame by axisGizmoInputSystem.
     GizmoPart  hoverPart   = GizmoPart::None;
     math::Vec3 hoverDir = math::Vec3::Zero();  // cube region (face/edge/corner) under cursor
@@ -119,7 +132,7 @@ struct FpsWidget {
     // Position is stored as a fraction of the viewport (top-left corner) so the
     // panel keeps its relative spot when the window is resized. fpsWidgetInputSystem
     // derives x/y from these each frame; dragging writes them back.
-    float relX = 0.0125f, relY = 0.022f;
+    float relX = 0.0125f, relY = 0.052f;  // below the menu bar
 
     static constexpr int kSamples = 64;
     float history[kSamples] = {};   // recent FPS values (ring buffer)
@@ -167,6 +180,36 @@ struct CameraControls {
     render::TextureHandle atlas = render::kInvalidTexture;
     render::MeshHandle    mesh = render::kInvalidMesh;
     render::BufferHandle  vbo  = render::kInvalidBuffer;
+};
+
+// Height (px) of the top menu bar. The axis gizmo and camera-controls panel are
+// pushed down by this so they never overlap the bar. Shared by systems.cpp.
+inline constexpr int kMenuBarHeight = 28;
+
+// A classic top-of-window menu bar with a single "File" menu whose only item is
+// "Open...". menuBarInputSystem handles open/close + clicks and renderSystem
+// draws it as an overlay. When "Open..." is chosen, requestOpenFile is raised
+// for the app to consume (e.g. show a native file dialog and load a mesh).
+// There is normally a single one in the world.
+struct MenuBar {
+    int  height  = kMenuBarHeight;  // bar height in px
+    bool visible = true;
+
+    bool fileOpen  = false;  // is the File dropdown expanded?
+    int  hoverItem = -1;     // hovered dropdown item index (-1 = none)
+
+    // Raised by menuBarInputSystem when "Open..." is clicked; the app clears it
+    // once it has acted on it (one-shot edge flag, like FpsWidget::vsyncDirty).
+    bool requestOpenFile = false;
+
+    // GPU resources (dynamic vertex buffer rewritten each frame).
+    render::MeshHandle   mesh = render::kInvalidMesh;
+    render::BufferHandle vbo  = render::kInvalidBuffer;
+
+    // Shared proportional font; atlas = font->texture (its white texel backs the
+    // opaque bar + dropdown fills).
+    const core::Font*     font  = nullptr;
+    render::TextureHandle atlas = render::kInvalidTexture;
 };
 
 // Demo behavior: continuous rotation, consumed by SpinSystem.

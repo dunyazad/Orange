@@ -10,18 +10,23 @@
 #include <SDL3/SDL_main.h>  // declares SDL_SetMainReady() under SDL_MAIN_HANDLED
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
+#include "mesh_io.h"
 #include "orange/core/application.h"
 #include "orange/core/buffer.h"
 #include "orange/core/console.h"
+#include "orange/core/math.h"
 #include "orange/ecs/components.h"
 #include "orange/render/types.h"
 
@@ -238,6 +243,24 @@ void buildRing(std::vector<render::Vertex>& verts, std::vector<uint32_t>& idx) {
     }
 }
 
+// Thread-safe handoff for the async open-file dialog. SDL invokes the callback
+// from a platform thread, so it just parks the chosen path under a mutex; the
+// main loop drains it. `busy` guards against opening a second dialog.
+struct FileDropResult {
+    std::mutex               mtx;
+    std::vector<std::string> paths;
+    std::atomic<bool>        busy{false};
+};
+
+void SDLCALL onFilePicked(void* userdata, const char* const* filelist, int /*filter*/) {
+    auto* res = static_cast<FileDropResult*>(userdata);
+    if (filelist && filelist[0]) {  // null => error, empty => cancelled
+        std::lock_guard<std::mutex> lk(res->mtx);
+        res->paths.emplace_back(filelist[0]);
+    }
+    res->busy.store(false);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -405,6 +428,25 @@ int main(int argc, char** argv) {
     hlMeshDesc.vertexCount  = static_cast<uint32_t>(kHlVerts);
     hlMeshDesc.indexCount   = static_cast<uint32_t>(kHlQuads * 6);
 
+    // Gizmo up-axis (Y/Z) toggle button: a small dynamic mesh (panel + glyph)
+    // drawn in a corner of the gizmo. Capacity must match kUpBtnQuads in systems.cpp.
+    const int kUpQ = 16, kUpV = kUpQ * 4;
+    const std::vector<render::Vertex> upInit(kUpV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
+    std::vector<uint32_t> upIdx;
+    for (uint32_t q = 0; q < static_cast<uint32_t>(kUpQ); ++q) {
+        uint32_t b = q * 4;
+        upIdx.insert(upIdx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+    }
+    core::VertexBuffer<render::Vertex> upBtnVbo(*app.renderer(), upInit,
+                                                render::BufferUsage::Dynamic);
+    core::IndexBuffer                  upBtnIbo(*app.renderer(), upIdx);
+    render::MeshDesc upBtnMeshDesc;
+    upBtnMeshDesc.vertexBuffer = upBtnVbo.handle();
+    upBtnMeshDesc.indexBuffer  = upBtnIbo.handle();
+    upBtnMeshDesc.layout       = render::Vertex::layout();
+    upBtnMeshDesc.vertexCount  = static_cast<uint32_t>(kUpV);
+    upBtnMeshDesc.indexCount   = static_cast<uint32_t>(kUpQ * 6);
+
     {
         auto giz = world.create();
         ecs::AxisGizmo gizmo;
@@ -414,6 +456,10 @@ int main(int argc, char** argv) {
         gizmo.ringMesh      = app.renderer()->createMesh(ringMesh);
         gizmo.highlightMesh = app.renderer()->createMesh(hlMeshDesc);
         gizmo.highlightVbo  = hlVbo.handle();
+        gizmo.upBtnMesh     = app.renderer()->createMesh(upBtnMeshDesc);
+        gizmo.upBtnVbo      = upBtnVbo.handle();
+        gizmo.font          = &uiFont;            // shared proportional UI font
+        gizmo.uiAtlas       = uiFont.texture;
         world.emplace<ecs::AxisGizmo>(giz, gizmo);
     }
 
@@ -473,6 +519,33 @@ int main(int argc, char** argv) {
         world.emplace<ecs::CameraControls>(e, cc);
     }
 
+    // Top menu bar (File > Open...). Dynamic vertex buffer rewritten each frame.
+    const int kMenuQ = 64, kMenuV = kMenuQ * 4;  // must match kMenuQuads in systems.cpp
+    const std::vector<render::Vertex> menuInit(kMenuV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
+    std::vector<uint32_t> menuIdx;
+    for (uint32_t q = 0; q < static_cast<uint32_t>(kMenuQ); ++q) {
+        uint32_t b = q * 4;
+        menuIdx.insert(menuIdx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+    }
+    core::VertexBuffer<render::Vertex> menuVbo(*app.renderer(), menuInit,
+                                               render::BufferUsage::Dynamic);
+    core::IndexBuffer                  menuIbo(*app.renderer(), menuIdx);
+    render::MeshDesc menuMeshDesc;
+    menuMeshDesc.vertexBuffer = menuVbo.handle();
+    menuMeshDesc.indexBuffer  = menuIbo.handle();
+    menuMeshDesc.layout       = render::Vertex::layout();
+    menuMeshDesc.vertexCount  = static_cast<uint32_t>(kMenuV);
+    menuMeshDesc.indexCount   = static_cast<uint32_t>(kMenuQ * 6);
+    {
+        auto e = world.create();
+        ecs::MenuBar mb;
+        mb.mesh  = app.renderer()->createMesh(menuMeshDesc);
+        mb.vbo   = menuVbo.handle();
+        mb.font  = &uiFont;
+        mb.atlas = uiFont.texture;
+        world.emplace<ecs::MenuBar>(e, mb);
+    }
+
     // A few spinning cubes, each sharing the same GPU mesh.
     const float xs[] = {-1.6f, 0.0f, 1.6f};
     for (float x : xs) {
@@ -486,7 +559,98 @@ int main(int argc, char** argv) {
         world.emplace<ecs::Spin>(e, spin);
     }
 
-    SDL_Log("appOrange: running. ESC or close the window to quit.");
-    app.run();  // spinSystem + renderSystem run internally each frame
+    // --- File > Open... -> load a mesh ---------------------------------
+    // Buffers for loaded meshes must outlive the renderer, so they live here
+    // (destroyed before `app`) and are kept alive past the loading scope.
+    render::IRenderer* renderer = app.renderer();
+    std::vector<std::unique_ptr<core::VertexBuffer<render::Vertex>>> loadedVbos;
+    std::vector<std::unique_ptr<core::IndexBuffer>>                  loadedIbos;
+
+    FileDropResult fileDrop;
+    static const SDL_DialogFileFilter kMeshFilters[] = {
+        {"Mesh files (OBJ, STL, PLY)", "obj;stl;ply"},
+        {"All files", "*"},
+    };
+
+    // Parses a mesh file, centers + uniform-scales it to fit, uploads GPU buffers,
+    // and spawns a (Transform, Renderable) entity that renderSystem picks up.
+    auto spawnMesh = [&](const std::string& path) {
+        std::vector<render::Vertex> mv;
+        std::vector<uint32_t>       mi;
+        if (!meshio::loadMeshFile(path, mv, mi) || mv.empty()) {
+            SDL_Log("Mesh: failed to load '%s'", path.c_str());
+            return;
+        }
+        math::Vec3 mn(mv[0].position[0], mv[0].position[1], mv[0].position[2]);
+        math::Vec3 mx = mn;
+        for (const auto& v : mv) {
+            math::Vec3 p(v.position[0], v.position[1], v.position[2]);
+            mn = mn.cwiseMin(p);
+            mx = mx.cwiseMax(p);
+        }
+        math::Vec3 center = (mn + mx) * 0.5f;
+        math::Vec3 size   = mx - mn;
+        float      ext    = (std::max)({size.x(), size.y(), size.z()});
+        float      sf     = ext > 1e-6f ? 3.0f / ext : 1.0f;  // fit to ~3 world units
+        for (auto& v : mv) {                                  // recenter on origin
+            v.position[0] -= center.x();
+            v.position[1] -= center.y();
+            v.position[2] -= center.z();
+        }
+
+        loadedVbos.push_back(
+            std::make_unique<core::VertexBuffer<render::Vertex>>(*renderer, mv));
+        loadedIbos.push_back(std::make_unique<core::IndexBuffer>(*renderer, mi));
+        render::MeshDesc md;
+        md.vertexBuffer = loadedVbos.back()->handle();
+        md.indexBuffer  = loadedIbos.back()->handle();
+        md.layout       = render::Vertex::layout();
+        md.vertexCount  = static_cast<uint32_t>(loadedVbos.back()->count());
+        md.indexCount   = static_cast<uint32_t>(loadedIbos.back()->count());
+        render::MeshHandle mesh = renderer->createMesh(md);
+
+        auto e = world.create();
+        ecs::Transform t;
+        t.scale = math::Vec3(sf, sf, sf);
+        world.emplace<ecs::Transform>(e, t);
+        ecs::Renderable r;
+        r.mesh      = mesh;
+        r.boundsMin = mn - center;  // local-space bounds (pre-scale) for picking
+        r.boundsMax = mx - center;
+        world.emplace<ecs::Renderable>(e, r);
+        SDL_Log("Mesh: loaded '%s' (%zu verts, %zu tris)", path.c_str(), mv.size(),
+                mi.size() / 3);
+    };
+
+    auto onUpdate = [&](entt::registry& w, float /*dt*/) {
+        // Menu raised a request? Open the native dialog (unless one is already up).
+        auto mbv = w.view<ecs::MenuBar>();
+        for (auto e : mbv) {
+            auto& mb = mbv.get<ecs::MenuBar>(e);
+            if (mb.requestOpenFile) {
+                mb.requestOpenFile = false;
+                if (!fileDrop.busy.exchange(true)) {
+                    SDL_ShowOpenFileDialog(onFilePicked, &fileDrop, app.window().handle(),
+                                           kMeshFilters, 2, nullptr, /*allow_many=*/false);
+                }
+            }
+            break;
+        }
+        // Drain whatever the dialog callback handed back (it runs on a platform
+        // thread), then load it on the main thread.
+        std::string path;
+        {
+            std::lock_guard<std::mutex> lk(fileDrop.mtx);
+            if (!fileDrop.paths.empty()) {
+                path = fileDrop.paths.front();
+                fileDrop.paths.clear();
+            }
+        }
+        if (!path.empty()) spawnMesh(path);
+    };
+
+    SDL_Log("appOrange: running. File > Open... loads a mesh (OBJ/STL).");
+    SDL_Log("appOrange: ESC or close the window to quit.");
+    app.run(onUpdate);  // onUpdate + spinSystem + renderSystem run each frame
     return 0;
 }

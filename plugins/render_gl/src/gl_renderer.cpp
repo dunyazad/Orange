@@ -61,6 +61,7 @@ const char* kGridFragmentShader = R"(#version 330 core
 in vec3 vNear;
 in vec3 vFar;
 uniform mat4 uViewProj;
+uniform int  uUpAxis;   // 1 = Y up, 2 = Z up (recolors the in-plane "depth" axis)
 out vec4 FragColor;
 
 float gridFactor(vec2 coord) {
@@ -87,8 +88,8 @@ void main() {
     float a   = max(minor * 0.55, major);
 
     vec2 aw = fwidth(world.xz);
-    if (abs(world.x) < aw.x) {              // Z axis (blue)
-        col = vec3(0.30, 0.52, 0.95);
+    if (abs(world.x) < aw.x) {              // depth axis: Z (blue) in Y-up, Y (green) in Z-up
+        col = (uUpAxis == 2) ? vec3(0.35, 0.85, 0.40) : vec3(0.30, 0.52, 0.95);
         a   = max(a, 1.0 - clamp(abs(world.x) / aw.x, 0.0, 1.0));
     }
     if (abs(world.z) < aw.y) {              // X axis (red)
@@ -251,6 +252,7 @@ bool GLRenderer::buildGridProgram() {
     }
     uGridViewProj_    = glGetUniformLocation(gridProgram_, "uViewProj");
     uGridInvViewProj_ = glGetUniformLocation(gridProgram_, "uInvViewProj");
+    uGridUpAxis_      = glGetUniformLocation(gridProgram_, "uUpAxis");
     glGenVertexArrays(1, &gridVao_);  // empty VAO for the vertex-less pass
     return true;
 }
@@ -417,10 +419,11 @@ void GLRenderer::beginFrame(const render::FrameContext& frame) {
     glUniformMatrix4fv(uViewProj_, 1, GL_FALSE, viewProj_);
 }
 
-void GLRenderer::drawGrid() {
+void GLRenderer::drawGrid(int upAxis) {
     glUseProgram(gridProgram_);
     glUniformMatrix4fv(uGridViewProj_, 1, GL_FALSE, viewProj_);
     glUniformMatrix4fv(uGridInvViewProj_, 1, GL_FALSE, invViewProj_);
+    glUniform1i(uGridUpAxis_, upAxis);
     glBindVertexArray(gridVao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);  // full-screen triangle, vertex-less
     glBindVertexArray(0);

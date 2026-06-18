@@ -28,6 +28,23 @@ constexpr float kHalfPi         = 1.57079633f;
 constexpr int   kHlQuads        = 12;           // highlight mesh capacity (corner = 3 faces x 4 border strips)
 constexpr int   kHlVerts        = kHlQuads * 4; // = 48
 
+// World up-axis basis. Identity for Y up; for Z up, rotateX(-90deg) so a model's
+// logical +Z maps to render +Y (vertical). Applied to ALL scene content + the
+// gizmo cube so toggling genuinely re-expresses the world's coordinate frame
+// (the camera and the horizontal ground stay put -- it is not a view spin).
+math::Quat worldUpQuat(bool zUp) {
+    return zUp ? math::quatAxisAngle(math::Vec3(1, 0, 0), -kHalfPi)
+               : math::Quat::Identity();
+}
+math::Mat4 worldUpMatrix(bool zUp) { return math::toMat4(worldUpQuat(zUp)); }
+
+// The single gizmo's up-axis flag (true => Z up), or false if there is none.
+bool worldZUp(entt::registry& world) {
+    auto v = world.view<AxisGizmo>();
+    for (auto e : v) return v.get<AxisGizmo>(e).zUp;
+    return false;
+}
+
 struct GizmoRect { int x, y, w, h; };
 
 GizmoRect gizmoRect(const AxisGizmo& g, uint32_t W, uint32_t H) {
@@ -36,7 +53,7 @@ GizmoRect gizmoRect(const AxisGizmo& g, uint32_t W, uint32_t H) {
     r.w = g.sizePx;
     r.h = g.sizePx;
     r.x = static_cast<int>(W) - g.sizePx - g.margin;  // top-right
-    r.y = g.margin;
+    r.y = g.margin + kMenuBarHeight;                  // below the menu bar
     if (r.x < 0) r.x = 0;
     return r;
 }
@@ -107,15 +124,19 @@ math::Vec3 classifyDir(math::Vec3 hit) {
 // Ray-pick the gizmo cube under cursor (mx,my). Returns the picked region's
 // direction triple, or false if the cursor misses the cube.
 bool pickGizmo(const math::Quat& camOrient, const GizmoRect& r, float mx, float my,
-               math::Vec3& outDir) {
+               bool zUp, math::Vec3& outDir) {
     if (mx < r.x || mx > r.x + r.w || my < r.y || my > r.y + r.h) return false;
     float ndcX = (mx - r.x) / r.w * 2.0f - 1.0f;
     float ndcY = 1.0f - (my - r.y) / r.h * 2.0f;
-    // Pick ray built directly in the cube's local space (cube model =
-    // conjugate(camera), so its local axes are the world axes).
+    // Pick ray into the cube's local space. The cube model is
+    // conjugate(camera) * Mworld, so undo the camera then the world up-axis basis
+    // to land in the cube's (logical-axis) local frame.
     math::Vec3 lo = math::rotate(
         camOrient, math::Vec3(ndcX * kGizmoOrthoHalf, ndcY * kGizmoOrthoHalf, kGizmoEyeZ));
     math::Vec3 ld = math::rotate(camOrient, math::Vec3(0, 0, -1));
+    math::Quat mwInv = math::conjugate(worldUpQuat(zUp));
+    lo = math::rotate(mwInv, lo);
+    ld = math::rotate(mwInv, ld);
     math::Vec3 hit;
     if (!intersectUnitBox(lo, ld, hit)) return false;
     outDir = classifyDir(hit);
@@ -210,6 +231,24 @@ void buildRingHighlight(int sector, const float col[3], render::Vertex out[kHlVe
     padDegenerate(out, q);
 }
 
+// --- Gizmo up-axis toggle button -------------------------------------------
+constexpr int kUpBtnQuads = 16;            // dynamic mesh capacity (bg + glyph)
+constexpr int kUpBtnVerts = kUpBtnQuads * 4;
+constexpr int kUpBtnPx     = 28;           // square button size (px)
+constexpr int kUpBtnMargin = 4;            // inset from the gizmo's bottom-left corner
+
+// The toggle button as a screen-pixel rect, tucked into the gizmo's bottom-left
+// corner (outside the ring). Shared by the input hit-test and the renderer.
+GizmoRect upToggleRect(const GizmoRect& g) {
+    GizmoRect b;
+    b.w = kUpBtnPx;
+    b.h = kUpBtnPx;
+    b.x = g.x + kUpBtnMargin;
+    b.y = g.y + g.h - kUpBtnPx - kUpBtnMargin;
+    return b;
+}
+// buildUpToggleGeometry is defined after appendText (which it uses), below.
+
 // --- FPS widget geometry ---------------------------------------------------
 constexpr int kFpsQuads = 256;            // dynamic mesh capacity
 constexpr int kFpsVerts = kFpsQuads * 4;  // = 1024
@@ -248,6 +287,40 @@ void appendText(render::Vertex* out, int& q, int cap, const core::Font& f,
         }
         penX += g.advance * h * xScale;
     }
+}
+
+// Builds the up-axis toggle button in normalized [0,1]^2 (y-up): a panel fill
+// plus the current up-axis letter ("Y" or "Z") centered. `out` holds kUpBtnVerts.
+void buildUpToggleGeometry(const AxisGizmo& g, render::Vertex* out) {
+    int q = 0;
+    if (!g.font) { for (int i = 0; i < kUpBtnVerts; ++i) out[i] = {{0,0,0},{0,0,0}}; return; }
+    const core::Font& f = *g.font;
+    const float wu = f.whiteU, wv = f.whiteV;
+    auto solid = [&](float x0, float y0, float x1, float y1, float r, float gg, float b,
+                     float z) {
+        if (q >= kUpBtnQuads) return;
+        out[q*4+0] = {{x0,y0,z},{r,gg,b},{wu,wv}};
+        out[q*4+1] = {{x1,y0,z},{r,gg,b},{wu,wv}};
+        out[q*4+2] = {{x1,y1,z},{r,gg,b},{wu,wv}};
+        out[q*4+3] = {{x0,y1,z},{r,gg,b},{wu,wv}};
+        ++q;
+    };
+    // Panel: brighter when hovered; blue accent strip when active (Z up).
+    float bg = g.upBtnHover ? 0.30f : 0.18f;
+    solid(0.04f, 0.04f, 0.96f, 0.96f, bg, bg + 0.02f, bg + 0.05f, 0.0f);
+    if (g.zUp)
+        solid(0.04f, 0.04f, 0.96f, 0.12f, 0.30f, 0.62f, 0.95f, 0.1f);
+
+    const char  letter[2] = {g.zUp ? 'Z' : 'Y', '\0'};
+    const float col[3]    = {0.93f, 0.95f, 0.97f};
+    const float h = 0.5f, xs = 1.0f;                    // button is square
+    // Center the glyph's bounding box in the button so it is never clipped.
+    const core::Glyph& gl = f.glyph(letter[0]);
+    float penX  = 0.5f - (gl.xoff + gl.w * 0.5f) * h * xs;
+    float baseY = 0.5f + gl.yoff * h + gl.h * h * 0.5f;  // box vertically centered
+    appendText(out, q, kUpBtnQuads, f, letter, penX, baseY, h, col, 0.5f, xs);
+
+    for (int i = q * 4; i < kUpBtnVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
 
 // Builds the widget geometry in normalized [0,1]^2 space (y-up). Layout is
@@ -459,6 +532,66 @@ void buildControlsGeometry(const CameraControls& cc, const Camera& cam,
 
     for (int i = q * 4; i < kCtrlVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
+
+// --- Top menu bar ----------------------------------------------------------
+constexpr int   kMenuQuads = 64;            // must match kMenuQ in main.cpp
+constexpr int   kMenuVerts = kMenuQuads * 4;
+constexpr float kMenuFileW = 54.0f;         // width of the "File" hit area (px)
+constexpr float kMenuDropW = 170.0f;        // dropdown panel width (px)
+constexpr float kMenuItemH = 26.0f;         // dropdown item height (px)
+constexpr int   kMenuItems = 1;             // dropdown items ("Open...")
+
+// Builds the bar in normalized [0,1]^2 (y-up) over an overlay whose pixel size is
+// viewportW x overlayH. Working in pixels and converting keeps the text crisp and
+// the layout identical to the hit-tests in menuBarInputSystem. overlayH grows to
+// include the dropdown while the File menu is open.
+void buildMenuGeometry(const MenuBar& mb, render::Vertex* out, uint32_t viewportW,
+                       float overlayH) {
+    int q = 0;
+    if (!mb.font) { for (int i = 0; i < kMenuVerts; ++i) out[i] = {{0,0,0},{0,0,0}}; return; }
+    const core::Font& f = *mb.font;
+    const float wu = f.whiteU, wv = f.whiteV;
+    const float W = static_cast<float>(viewportW);
+    const float barH = static_cast<float>(mb.height);
+    const float xs = overlayH / W;                       // glyph horizontal aspect fix
+    auto nx  = [&](float px) { return px / W; };
+    auto nyT = [&](float py) { return 1.0f - py / overlayH; };  // px-from-top -> norm y
+    // Solid (white-texel) rect from a top-left pixel rect.
+    auto solid = [&](float x0, float yTop, float x1, float yBot, float r, float g,
+                     float b, float z) {
+        if (q >= kMenuQuads) return;
+        float ny0 = nyT(yBot), ny1 = nyT(yTop), nx0 = nx(x0), nx1 = nx(x1);
+        out[q * 4 + 0] = {{nx0, ny0, z}, {r, g, b}, {wu, wv}};
+        out[q * 4 + 1] = {{nx1, ny0, z}, {r, g, b}, {wu, wv}};
+        out[q * 4 + 2] = {{nx1, ny1, z}, {r, g, b}, {wu, wv}};
+        out[q * 4 + 3] = {{nx0, ny1, z}, {r, g, b}, {wu, wv}};
+        ++q;
+    };
+    // Text at a pixel pen position; baseY is the baseline measured from the top.
+    auto text = [&](const char* s, float penPxX, float basePxY, float hPx,
+                    const float col[3], float z) {
+        appendText(out, q, kMenuQuads, f, s, nx(penPxX), nyT(basePxY), hPx / overlayH,
+                   col, z, xs);
+    };
+
+    const float txt[3] = {0.90f, 0.92f, 0.95f};
+    const float th = 15.0f;                              // text px height
+
+    solid(0, 0, W, barH, 0.16f, 0.17f, 0.20f, 0.0f);     // bar background
+    if (mb.fileOpen)                                     // highlight "File" when open
+        solid(0, 0, kMenuFileW, barH, 0.26f, 0.28f, 0.34f, 0.1f);
+    text("File", 12.0f, (barH + th) * 0.5f - 2.0f, th, txt, 0.5f);
+
+    if (mb.fileOpen) {
+        float dy0 = barH, dy1 = barH + kMenuItemH * kMenuItems;
+        solid(0, dy0, kMenuDropW, dy1, 0.13f, 0.14f, 0.17f, 0.2f);  // dropdown panel
+        if (mb.hoverItem == 0)                                       // hovered item
+            solid(0, dy0, kMenuDropW, dy0 + kMenuItemH, 0.24f, 0.30f, 0.42f, 0.25f);
+        text("Open...", 14.0f, dy0 + (kMenuItemH + th) * 0.5f - 2.0f, th, txt, 0.5f);
+    }
+
+    for (int i = q * 4; i < kMenuVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
+}
 } // namespace
 
 void spinSystem(entt::registry& world, float dt) {
@@ -524,6 +657,44 @@ void cameraManipulatorSystem(entt::registry& world, const core::Input& input,
     }
 }
 
+void menuBarInputSystem(entt::registry& world, core::Input& input,
+                        uint32_t viewportW, uint32_t viewportH) {
+    (void)viewportH;
+    MenuBar* mb = nullptr;
+    auto view = world.view<MenuBar>();
+    for (auto e : view) { mb = &view.get<MenuBar>(e); break; }
+    if (!mb || !mb->visible) return;
+
+    const float barH = static_cast<float>(mb->height);
+    const float dropY0 = barH, dropY1 = barH + kMenuItemH * kMenuItems;
+    float mx = input.mousePosX, my = input.mousePosY;
+
+    bool onFile = mx >= 0.0f && mx < kMenuFileW && my >= 0.0f && my < barH;
+    bool inBar  = my >= 0.0f && my < barH;
+    bool inDrop = mb->fileOpen && mx >= 0.0f && mx < kMenuDropW && my >= dropY0 &&
+                  my < dropY1;
+
+    // Which dropdown item is hovered (only meaningful while open).
+    mb->hoverItem = inDrop ? static_cast<int>((my - dropY0) / kMenuItemH) : -1;
+
+    // The bar (and an open dropdown) own their pixels: suppress orbit/picking
+    // while the pointer is over them.
+    if (inBar || inDrop) input.captured = true;
+
+    if (input.leftClicked) {
+        if (onFile) {
+            mb->fileOpen   = !mb->fileOpen;   // toggle the menu
+            input.captured = true;
+        } else if (inDrop) {
+            if (mb->hoverItem == 0) mb->requestOpenFile = true;  // "Open..."
+            mb->fileOpen   = false;
+            input.captured = true;
+        } else {
+            mb->fileOpen = false;             // click anywhere else closes it
+        }
+    }
+}
+
 void pickingSystem(entt::registry& world, const core::Input& input,
                    uint32_t viewportW, uint32_t viewportH) {
     // Only act on a fresh left-click that no UI widget already consumed.
@@ -564,6 +735,12 @@ void pickingSystem(entt::registry& world, const core::Input& input,
                                up * (ndcY * tanHalf));
     }
 
+    // Content is rendered as Mworld * T*R*S, so undo the world up-axis basis on
+    // the ray before the per-entity inverse(T*R*S) below.
+    math::Quat mwInv = math::conjugate(worldUpQuat(worldZUp(world)));
+    rayO = math::rotate(mwInv, rayO);
+    rayD = math::rotate(mwInv, rayD);
+
     // Test every drawable; keep the nearest hit along the ray.
     entt::entity best = entt::null;
     float bestT = 1e30f;
@@ -600,7 +777,7 @@ void pickingSystem(entt::registry& world, const core::Input& input,
     }
 }
 
-void axisGizmoInputSystem(entt::registry& world, const core::Input& input,
+void axisGizmoInputSystem(entt::registry& world, core::Input& input,
                           float dt, uint32_t viewportW, uint32_t viewportH) {
     AxisGizmo* gizmo = nullptr;
     auto gz = world.view<AxisGizmo>();
@@ -619,9 +796,23 @@ void axisGizmoInputSystem(entt::registry& world, const core::Input& input,
 
     GizmoRect r = gizmoRect(*gizmo, viewportW, viewportH);
 
+    // Up-axis toggle button (bottom-left corner): flip Y/Z up. This re-expresses
+    // the whole world (content + gizmo) in renderSystem via the up-axis basis;
+    // the camera and the horizontal ground stay put. Takes priority over the
+    // cube/ring beneath it.
+    GizmoRect b = upToggleRect(r);
+    float mx = input.mousePosX, my = input.mousePosY;
+    gizmo->upBtnHover = mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h;
+    if (gizmo->upBtnHover) {
+        gizmo->hoverPart = GizmoPart::None;
+        input.captured   = true;  // suppress orbit/picking over the button
+        if (input.leftClicked) gizmo->zUp = !gizmo->zUp;
+        return;
+    }
+
     // Hover: cube first (it sits in front of the ring), then the ring.
     math::Vec3 dir;
-    if (pickGizmo(manip->orientation, r, input.mousePosX, input.mousePosY, dir)) {
+    if (pickGizmo(manip->orientation, r, input.mousePosX, input.mousePosY, gizmo->zUp, dir)) {
         gizmo->hoverPart = GizmoPart::Cube;
         gizmo->hoverDir  = dir;
     } else {
@@ -638,7 +829,9 @@ void axisGizmoInputSystem(entt::registry& world, const core::Input& input,
     if (input.leftClicked && gizmo->hoverPart != GizmoPart::None) {
         math::Quat target;
         if (gizmo->hoverPart == GizmoPart::Cube)
-            target = math::quatLookZ(gizmo->hoverDir);           // look at that view
+            // hoverDir is a logical axis; map it through the up-axis basis to the
+            // render direction the camera should look down.
+            target = math::quatLookZ(math::rotate(worldUpQuat(gizmo->zUp), gizmo->hoverDir));
         else
             target = math::normalize(manip->orientation * ringDelta(gizmo->hoverSector));
 
@@ -724,9 +917,10 @@ void cameraControlsInputSystem(entt::registry& world, core::Input& input, float 
     for (auto e : view) { cc = &view.get<CameraControls>(e); break; }
     if (!cc) return;
 
-    // Position under the gizmo (top-right). Gizmo: size 150, margin 14.
+    // Position under the gizmo (top-right). Gizmo: size 150, margin 14, itself
+    // pushed down by the menu bar.
     cc->x = static_cast<int>(viewportW) - cc->w - 14;
-    cc->y = 14 + 150 + 10;
+    cc->y = kMenuBarHeight + 14 + 150 + 10;
     if (cc->x < 0) cc->x = 0;
 
     Camera* cam = nullptr;
@@ -839,6 +1033,10 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     // --- Submit all drawables ------------------------------------------
     renderer.beginFrame(frame);
 
+    // World up-axis basis: prepended to every model so the scene's coordinate
+    // frame (not the camera) changes when the gizmo toggles Y/Z up.
+    const math::Mat4 Mworld = worldUpMatrix(worldZUp(world));
+
     auto drawables = world.view<Transform, Renderable>();
     for (auto entity : drawables) {
         const auto& t = drawables.get<Transform>(entity);
@@ -854,12 +1052,16 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
                                      math::toMat4(t.orientation) *
                                      math::scale(t.scale * 1.15f)
                                : t.matrix();
+        model = Mworld * model;
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);
     }
 
     // --- Infinite ground grid (depth-tested against the scene) ---------
-    renderer.drawGrid();
+    // The grid is always the horizontal ground; the up-axis toggle re-expresses
+    // content via Mworld. The axis arg only recolors the in-plane depth line
+    // (blue Z in Y-up, green Y in Z-up) to match the gizmo.
+    renderer.drawGrid(worldZUp(world) ? 2 : 1);
 
     // --- Axis gizmo overlay (top-right corner) -------------------------
     auto gz = world.view<AxisGizmo>();
@@ -881,9 +1083,11 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         renderer.beginOverlay(ov);
 
         math::Mat4 identity = math::Mat4::Identity();
-        // Cube model = inverse(camera orientation): shows world axes as the
-        // camera sees them. The ring is screen-aligned (identity model).
-        math::Mat4 cubeModel = math::toMat4(math::conjugate(camOrient));
+        // Cube model = inverse(camera orientation) * world up-axis basis: shows the
+        // logical world axes (Y or Z up) as the camera sees them. The ring is
+        // screen-aligned (identity model).
+        math::Mat4 cubeModel =
+            math::toMat4(math::conjugate(camOrient)) * worldUpMatrix(gizmo.zUp);
         render::DrawItem item;
 
         // 1) Ring background (behind the cube), screen-aligned.
@@ -925,6 +1129,39 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
             renderer.submit(item);
             item.texture = render::kInvalidTexture;
         }
+        break;
+    }
+
+    // --- Gizmo up-axis toggle button overlay (corner of the gizmo) -----
+    auto upbtn = world.view<AxisGizmo>();
+    for (auto entity : upbtn) {
+        auto& g = upbtn.get<AxisGizmo>(entity);
+        if (!g.font || g.upBtnMesh == render::kInvalidMesh ||
+            g.upBtnVbo == render::kInvalidBuffer)
+            break;
+
+        GizmoRect gr = gizmoRect(g, viewportW, viewportH);
+        GizmoRect br = upToggleRect(gr);
+
+        render::Vertex verts[kUpBtnVerts];
+        buildUpToggleGeometry(g, verts);
+        renderer.updateBuffer(g.upBtnVbo, verts, sizeof(verts));
+
+        render::OverlayContext ov;
+        ov.x = br.x; ov.y = br.y; ov.width = br.w; ov.height = br.h;
+        ov.clearDepth = true;
+        math::Mat4 ovView = math::Mat4::Identity();
+        math::Mat4 ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+        std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+        renderer.beginOverlay(ov);
+
+        render::DrawItem item;
+        item.mesh    = g.upBtnMesh;
+        item.texture = g.uiAtlas;
+        math::Mat4 model = math::Mat4::Identity();
+        std::memcpy(item.model, model.data(), sizeof(item.model));
+        renderer.submit(item);
         break;
     }
 
@@ -988,6 +1225,42 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::DrawItem item;
         item.mesh    = cc.mesh;
         item.texture = cc.atlas;
+        math::Mat4 model = math::Mat4::Identity();
+        std::memcpy(item.model, model.data(), sizeof(item.model));
+        renderer.submit(item);
+        break;
+    }
+
+    // --- Top menu bar overlay (full width, on top) ---------------------
+    auto mbs = world.view<MenuBar>();
+    for (auto entity : mbs) {
+        auto& mb = mbs.get<MenuBar>(entity);
+        if (!mb.visible || !mb.font || mb.mesh == render::kInvalidMesh ||
+            mb.vbo == render::kInvalidBuffer)
+            break;
+
+        // Overlay grows downward to include the dropdown when the menu is open.
+        float overlayH = static_cast<float>(mb.height) +
+                         (mb.fileOpen ? kMenuItemH * kMenuItems : 0.0f);
+
+        render::Vertex verts[kMenuVerts];
+        buildMenuGeometry(mb, verts, viewportW, overlayH);
+        renderer.updateBuffer(mb.vbo, verts, sizeof(verts));
+
+        render::OverlayContext ov;
+        ov.x = 0; ov.y = 0;
+        ov.width = static_cast<int>(viewportW);
+        ov.height = static_cast<int>(overlayH);
+        ov.clearDepth = true;
+        math::Mat4 ovView = math::Mat4::Identity();
+        math::Mat4 ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+        std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+        renderer.beginOverlay(ov);
+
+        render::DrawItem item;
+        item.mesh    = mb.mesh;
+        item.texture = mb.atlas;
         math::Mat4 model = math::Mat4::Identity();
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);

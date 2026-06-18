@@ -3,6 +3,7 @@
 layout(push_constant) uniform Push {
     mat4 viewProj;
     mat4 invViewProj;
+    int  upAxis;        // 1 = Y up, 2 = Z up (recolors the in-plane depth axis)
 } pc;
 
 layout(location = 0) in vec3 vNear;
@@ -33,8 +34,8 @@ void main() {
     float a   = max(minor * 0.55, major);
 
     vec2 aw = fwidth(world.xz);
-    if (abs(world.x) < aw.x) {              // Z axis (blue)
-        col = vec3(0.30, 0.52, 0.95);
+    if (abs(world.x) < aw.x) {              // depth axis: Z (blue) in Y-up, Y (green) in Z-up
+        col = (pc.upAxis == 2) ? vec3(0.35, 0.85, 0.40) : vec3(0.30, 0.52, 0.95);
         a   = max(a, 1.0 - clamp(abs(world.x) / aw.x, 0.0, 1.0));
     }
     if (abs(world.z) < aw.y) {              // X axis (red)

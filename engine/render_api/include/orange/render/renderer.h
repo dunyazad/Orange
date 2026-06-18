@@ -51,9 +51,11 @@ public:
     // Draws an "infinite" ground grid on the world y=0 plane: a full-screen pass
     // that ray-casts each pixel onto the plane and renders anti-aliased grid lines
     // (fwidth-based) with distance fade and correct depth, so the scene occludes
-    // it. Uses the current frame's view/proj/invViewProj. Call between the scene
-    // submits and endFrame().
-    virtual void drawGrid() = 0;
+    // it. Uses the current frame's view/proj/invViewProj. `upAxis` (1 = Y up,
+    // 2 = Z up) only recolors the in-plane depth axis line (blue Z vs green Y) to
+    // match the gizmo's up-axis toggle; the grid plane itself is unchanged. Call
+    // between the scene submits and endFrame().
+    virtual void drawGrid(int upAxis) = 0;
 
     // Events ---------------------------------------------------------------
     virtual void resize(uint32_t width, uint32_t height) = 0;

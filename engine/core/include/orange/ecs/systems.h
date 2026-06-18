@@ -29,8 +29,15 @@ void cameraControlsInputSystem(entt::registry& world, core::Input& input, float 
 // update the hover region; on click, classifies the hit as face/edge/corner and
 // starts a smooth camera snap toward that view (plus a click-flash). Runs before
 // cameraManipulatorSystem.
-void axisGizmoInputSystem(entt::registry& world, const core::Input& input,
+void axisGizmoInputSystem(entt::registry& world, core::Input& input,
                           float dt, uint32_t viewportW, uint32_t viewportH);
+
+// Top menu bar: handles opening/closing the File menu and clicking its items.
+// Sets input.captured while the pointer is over the bar or open dropdown (so the
+// scene neither orbits nor picks), and raises MenuBar::requestOpenFile when
+// "Open..." is chosen. Runs first so it gets first crack at the click.
+void menuBarInputSystem(entt::registry& world, core::Input& input,
+                        uint32_t viewportW, uint32_t viewportH);
 
 // Picking: on a fresh left-click (not consumed by a UI widget), casts a ray
 // from the primary camera through the cursor, finds the nearest (Transform,
