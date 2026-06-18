@@ -48,6 +48,13 @@ public:
     virtual void beginOverlay(const OverlayContext& overlay) = 0;
     virtual void endFrame() = 0;
 
+    // Draws an "infinite" ground grid on the world y=0 plane: a full-screen pass
+    // that ray-casts each pixel onto the plane and renders anti-aliased grid lines
+    // (fwidth-based) with distance fade and correct depth, so the scene occludes
+    // it. Uses the current frame's view/proj/invViewProj. Call between the scene
+    // submits and endFrame().
+    virtual void drawGrid() = 0;
+
     // Events ---------------------------------------------------------------
     virtual void resize(uint32_t width, uint32_t height) = 0;
 

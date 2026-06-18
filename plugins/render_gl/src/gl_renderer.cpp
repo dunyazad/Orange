@@ -36,6 +36,97 @@ void main() {
 }
 )";
 
+// --- Infinite grid: a vertex-less full-screen pass ------------------------
+// The VS emits a screen-covering triangle and unprojects two points along each
+// pixel's view ray; the FS intersects that ray with the world y=0 plane and
+// draws anti-aliased grid lines (fwidth) with distance fade + correct depth.
+const char* kGridVertexShader = R"(#version 330 core
+uniform mat4 uInvViewProj;
+out vec3 vNear;
+out vec3 vFar;
+vec3 unproject(float x, float y, float z) {
+    vec4 p = uInvViewProj * vec4(x, y, z, 1.0);
+    return p.xyz / p.w;
+}
+void main() {
+    vec2 c = vec2((gl_VertexID == 1) ? 3.0 : -1.0,
+                  (gl_VertexID == 2) ? 3.0 : -1.0);
+    vNear = unproject(c.x, c.y, -1.0);  // GL NDC near
+    vFar  = unproject(c.x, c.y,  1.0);  // GL NDC far
+    gl_Position = vec4(c, 0.0, 1.0);
+}
+)";
+
+const char* kGridFragmentShader = R"(#version 330 core
+in vec3 vNear;
+in vec3 vFar;
+uniform mat4 uViewProj;
+out vec4 FragColor;
+
+float gridFactor(vec2 coord) {
+    vec2 d = fwidth(coord);
+    vec2 g = abs(fract(coord - 0.5) - 0.5) / d;
+    return 1.0 - clamp(min(g.x, g.y), 0.0, 1.0);
+}
+
+void main() {
+    float t = -vNear.y / (vFar.y - vNear.y);
+    if (t <= 0.0) discard;                 // y=0 plane is behind the camera
+    vec3 world = vNear + t * (vFar - vNear);
+
+    vec4 clip = uViewProj * vec4(world, 1.0);
+    if (clip.w <= 0.0) discard;
+    gl_FragDepth = (clip.z / clip.w) * 0.5 + 0.5;   // GL NDC [-1,1] -> [0,1]
+
+    float fade = 1.0 - smoothstep(22.0, 75.0, length(world.xz));
+    if (fade <= 0.0) discard;
+
+    float minor = gridFactor(world.xz);
+    float major = gridFactor(world.xz * 0.1);
+    vec3  col = mix(vec3(0.33, 0.35, 0.40), vec3(0.60, 0.63, 0.70), major);
+    float a   = max(minor * 0.55, major);
+
+    vec2 aw = fwidth(world.xz);
+    if (abs(world.x) < aw.x) {              // Z axis (blue)
+        col = vec3(0.30, 0.52, 0.95);
+        a   = max(a, 1.0 - clamp(abs(world.x) / aw.x, 0.0, 1.0));
+    }
+    if (abs(world.z) < aw.y) {              // X axis (red)
+        col = vec3(0.95, 0.32, 0.36);
+        a   = max(a, 1.0 - clamp(abs(world.z) / aw.y, 0.0, 1.0));
+    }
+
+    a *= fade;
+    if (a <= 0.001) discard;
+    FragColor = vec4(col, a);
+}
+)";
+
+// Inverse of a column-major 4x4 (used to unproject screen rays for the grid).
+void invert4x4(const float* m, float* out) {
+    float inv[16];
+    inv[0]  =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4]  = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8]  =  m[4]*m[9]*m[15]  - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14]  + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1]  = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5]  =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9]  = -m[0]*m[9]*m[15]  + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] =  m[0]*m[9]*m[14]  - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2]  =  m[1]*m[6]*m[15]  - m[1]*m[7]*m[14]  - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7]  - m[13]*m[3]*m[6];
+    inv[6]  = -m[0]*m[6]*m[15]  + m[0]*m[7]*m[14]  + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7]  + m[12]*m[3]*m[6];
+    inv[10] =  m[0]*m[5]*m[15]  - m[0]*m[7]*m[13]  - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7]  - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14]  + m[0]*m[6]*m[13]  + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6]  + m[12]*m[2]*m[5];
+    inv[3]  = -m[1]*m[6]*m[11]  + m[1]*m[7]*m[10]  + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7]   + m[9]*m[3]*m[6];
+    inv[7]  =  m[0]*m[6]*m[11]  - m[0]*m[7]*m[10]  - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7]   - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11]  + m[0]*m[7]*m[9]   + m[4]*m[1]*m[11] - m[4]*m[3]*m[9]  - m[8]*m[1]*m[7]   + m[8]*m[3]*m[5];
+    inv[15] =  m[0]*m[5]*m[10]  - m[0]*m[6]*m[9]   - m[4]*m[1]*m[10] + m[4]*m[2]*m[9]  + m[8]*m[1]*m[6]   - m[8]*m[2]*m[5];
+    float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+    if (det == 0.0f) { for (int i = 0; i < 16; ++i) out[i] = (i % 5 == 0) ? 1.0f : 0.0f; return; }
+    det = 1.0f / det;
+    for (int i = 0; i < 16; ++i) out[i] = inv[i] * det;
+}
+
 GLenum toTarget(render::BufferType type) {
     switch (type) {
         case render::BufferType::Vertex:  return GL_ARRAY_BUFFER;
@@ -86,6 +177,9 @@ bool GLRenderer::init(const render::InitInfo& info) {
     }
 
     if (!buildProgram()) return false;
+    if (!buildGridProgram()) return false;
+    std::memset(invViewProj_, 0, sizeof(invViewProj_));
+    invViewProj_[0] = invViewProj_[5] = invViewProj_[10] = invViewProj_[15] = 1.0f;
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
@@ -133,6 +227,31 @@ bool GLRenderer::buildProgram() {
     uTex_      = glGetUniformLocation(program_, "uTex");
     glUseProgram(program_);
     glUniform1i(uTex_, 0);  // sampler uses texture unit 0
+    return true;
+}
+
+bool GLRenderer::buildGridProgram() {
+    unsigned int vs = compile(GL_VERTEX_SHADER, kGridVertexShader);
+    unsigned int fs = compile(GL_FRAGMENT_SHADER, kGridFragmentShader);
+    if (!vs || !fs) return false;
+
+    gridProgram_ = glCreateProgram();
+    glAttachShader(gridProgram_, vs);
+    glAttachShader(gridProgram_, fs);
+    glLinkProgram(gridProgram_);
+    GLint ok = GL_FALSE;
+    glGetProgramiv(gridProgram_, GL_LINK_STATUS, &ok);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    if (!ok) {
+        char log[1024];
+        glGetProgramInfoLog(gridProgram_, sizeof(log), nullptr, log);
+        SDL_Log("GLRenderer: grid program link error: %s", log);
+        return false;
+    }
+    uGridViewProj_    = glGetUniformLocation(gridProgram_, "uViewProj");
+    uGridInvViewProj_ = glGetUniformLocation(gridProgram_, "uInvViewProj");
+    glGenVertexArrays(1, &gridVao_);  // empty VAO for the vertex-less pass
     return true;
 }
 
@@ -292,9 +411,19 @@ void GLRenderer::beginFrame(const render::FrameContext& frame) {
             for (int k = 0; k < 4; ++k) s += a[k * 4 + r] * b[c * 4 + k];
             viewProj_[c * 4 + r] = s;
         }
+    invert4x4(viewProj_, invViewProj_);  // for the grid's screen-ray unprojection
 
     glUseProgram(program_);
     glUniformMatrix4fv(uViewProj_, 1, GL_FALSE, viewProj_);
+}
+
+void GLRenderer::drawGrid() {
+    glUseProgram(gridProgram_);
+    glUniformMatrix4fv(uGridViewProj_, 1, GL_FALSE, viewProj_);
+    glUniformMatrix4fv(uGridInvViewProj_, 1, GL_FALSE, invViewProj_);
+    glBindVertexArray(gridVao_);
+    glDrawArrays(GL_TRIANGLES, 0, 3);  // full-screen triangle, vertex-less
+    glBindVertexArray(0);
 }
 
 void GLRenderer::submit(const render::DrawItem& item) {

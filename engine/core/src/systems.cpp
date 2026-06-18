@@ -858,6 +858,9 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         renderer.submit(item);
     }
 
+    // --- Infinite ground grid (depth-tested against the scene) ---------
+    renderer.drawGrid();
+
     // --- Axis gizmo overlay (top-right corner) -------------------------
     auto gz = world.view<AxisGizmo>();
     for (auto entity : gz) {

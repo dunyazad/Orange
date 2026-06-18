@@ -65,10 +65,19 @@ cmake --build D:/Library/Orange/build --config Debug
 
 ## Key facts to keep in mind
 
-- **Plugin ABI is v6.** Changing the C contract means bumping
+- **Plugin ABI is v7.** Changing the C contract means bumping
   `ORANGE_PLUGIN_ABI_VERSION` and updating both backends. v6 added
   `IRenderer::setVsync(bool)` (GL flips the swap interval; VK recreates the
-  swapchain with a FIFO / immediate-mailbox present mode).
+  swapchain with a FIFO / immediate-mailbox present mode). v7 added
+  `IRenderer::drawGrid()`.
+- **Infinite grid:** `renderSystem` calls `IRenderer::drawGrid()` after the scene
+  submits (before the gizmo overlay). Each backend renders a vertex-less
+  full-screen pass (GL: inline shader + empty VAO; VK: a second pipeline +
+  `shaders/grid.{vert,frag}` → SPIR-V) that ray-casts each pixel onto the world
+  y=0 plane and draws `fwidth`-based AA grid lines with distance fade and correct
+  depth (so the scene occludes it). Each plugin inverts its own clip-corrected
+  `viewProj` for the unprojection (the host doesn't, since VK's correction is
+  applied plugin-side).
 - **Buffers are two-layer:** handle + byte-size based ABI in `render_api`, and a
   type-safe `core::Buffer<T>` (VertexBuffer/IndexBuffer/UniformBuffer) in
   `engine/core/include/orange/core/buffer.h` that wraps it with RAII. App code

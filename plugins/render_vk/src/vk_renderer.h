@@ -59,6 +59,7 @@ public:
     void submit(const render::DrawItem& item) override;
     void beginOverlay(const render::OverlayContext& overlay) override;
     void endFrame() override;
+    void drawGrid() override;
 
     void resize(uint32_t width, uint32_t height) override;
     void setVsync(bool enabled) override;
@@ -97,6 +98,11 @@ private:
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline       pipeline_       = VK_NULL_HANDLE;
 
+    // Infinite-grid pipeline: a vertex-less full-screen pass (own layout with a
+    // 128-byte push constant = viewProj + invViewProj, vertex + fragment stages).
+    VkPipelineLayout gridLayout_   = VK_NULL_HANDLE;
+    VkPipeline       gridPipeline_ = VK_NULL_HANDLE;
+
     VkCommandPool                commandPool_ = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> commandBuffers_;
     std::vector<VkSemaphore>     imageAvailable_;
@@ -125,11 +131,14 @@ private:
     std::unordered_map<render::TextureHandle, VkTexture> textures_;
     VkDescriptorSet       whiteSet_    = VK_NULL_HANDLE;
 
-    // Per-frame view*proj (with Vulkan clip correction), pushed each draw.
+    // Per-frame view*proj (with Vulkan clip correction), pushed each draw, plus
+    // its inverse for the grid's screen-ray unprojection.
     float viewProj_[16];
+    float invViewProj_[16];
 
     uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags props) const;
     bool     createTextureResources();  // sampler, descriptor layout/pool, white tex
+    bool     createGridPipeline();      // vertex-less infinite-grid pipeline
 
     bool createInstance();
     bool createSurface();
