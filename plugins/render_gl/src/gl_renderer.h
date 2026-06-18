@@ -44,6 +44,7 @@ public:
     void endFrame() override;
 
     void resize(uint32_t width, uint32_t height) override;
+    void setVsync(bool enabled) override;
     bool readPixels(std::vector<uint8_t>& out, uint32_t& w, uint32_t& h) override;
 
     render::Backend backend() const override { return render::Backend::OpenGL; }

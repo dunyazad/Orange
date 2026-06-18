@@ -61,6 +61,7 @@ public:
     void endFrame() override;
 
     void resize(uint32_t width, uint32_t height) override;
+    void setVsync(bool enabled) override;
     bool readPixels(std::vector<uint8_t>& out, uint32_t& w, uint32_t& h) override;
 
     render::Backend backend() const override { return render::Backend::Vulkan; }
@@ -106,6 +107,7 @@ private:
     uint32_t imageIndex_   = 0;
     bool     frameActive_  = false;
     bool     needsResize_  = false;
+    bool     vsync_        = true;  // FIFO present mode when set
     uint32_t pendingW_ = 0, pendingH_ = 0;
     float    clear_[4] = {0.05f, 0.06f, 0.08f, 1.0f};
 

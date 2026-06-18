@@ -125,11 +125,14 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         float dt = static_cast<float>((now - last) / freq);
         last = now;
 
+        input_.shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
+
         if (onUpdate) onUpdate(world_, dt);
         ecs::fpsWidgetInputSystem(world_, input_, dt, window_.width(), window_.height());
-        ecs::cameraControlsInputSystem(world_, input_, window_.width(), window_.height());
+        ecs::cameraControlsInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::axisGizmoInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::cameraManipulatorSystem(world_, input_, dt);
+        ecs::pickingSystem(world_, input_, window_.width(), window_.height());
         ecs::spinSystem(world_, dt);
         ecs::renderSystem(world_, *plugin_->renderer(), window_.width(),
                           window_.height());

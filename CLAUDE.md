@@ -65,7 +65,7 @@ cmake --build D:/Library/Orange/build --config Debug
 
 ## Key facts to keep in mind
 
-- **Plugin ABI is v4.** Changing the C contract means bumping
+- **Plugin ABI is v6.** Changing the C contract means bumping
   `ORANGE_PLUGIN_ABI_VERSION` and updating both backends.
 - **Buffers are two-layer:** handle + byte-size based ABI in `render_api`, and a
   type-safe `core::Buffer<T>` (VertexBuffer/IndexBuffer/UniformBuffer) in
@@ -75,6 +75,14 @@ cmake --build D:/Library/Orange/build --config Debug
   SPIR-V headers in `src/generated/` (CMake regenerates on change via the Vulkan
   SDK's glsl compiler). GL→VK clip-space correction (Y flip + depth 0..1) is
   applied so both backends show the identical scene.
+- **Math is Eigen-backed.** `orange/core/math.h` aliases `Vec3/Vec4/Mat4/Quat`
+  to `Eigen::Vector3f/Vector4f/Matrix4f/Quaternionf` (column-major, GL convention)
+  and keeps thin graphics helpers (`perspective`/`ortho`/`lookAt`/`quatAxisAngle`/
+  `toMat4`/...). Eigen is fetched via FetchContent (find_package first). The build
+  defines `EIGEN_MAX_ALIGN_BYTES=0` so Eigen members are safe inside EnTT pools.
+  Interop with the render ABI's `float[16]`/`float[3]` is via `.data()`. Use
+  `.x()/.y()/.z()` (methods), not `.x`, and construct with `Vec3(a,b,c)` /
+  `Quat::Identity()` (the default Eigen ctor leaves values uninitialized).
 - **No gimbal lock:** `Transform::orientation` is a unit quaternion; the camera
   is a quaternion arcball trackball (`CameraManipulator`). Any camera controller
   is just a system that writes a `Transform`.

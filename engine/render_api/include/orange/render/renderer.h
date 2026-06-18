@@ -51,6 +51,11 @@ public:
     // Events ---------------------------------------------------------------
     virtual void resize(uint32_t width, uint32_t height) = 0;
 
+    // Toggles vertical sync at runtime. GL flips the swap interval; Vulkan
+    // recreates the swapchain with a FIFO (on) or immediate/mailbox (off)
+    // present mode on the next frame.
+    virtual void setVsync(bool enabled) = 0;
+
     // Capture --------------------------------------------------------------
     // Reads the last presented frame into `out` as top-left-origin RGBA8.
     // Returns false if unsupported. Call after endFrame().

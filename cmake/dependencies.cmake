@@ -51,3 +51,24 @@ if(NOT EnTT_FOUND)
     )
     FetchContent_MakeAvailable(EnTT)
 endif()
+
+# --- Eigen (header-only linear algebra) -------------------------------------
+# Populate only (no add_subdirectory) to avoid Eigen's heavy CMake (tests, etc.);
+# we just need its header tree on the include path.
+find_package(Eigen3 QUIET CONFIG)
+if(NOT Eigen3_FOUND)
+    FetchContent_Declare(
+        Eigen3
+        GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+        GIT_TAG        3.4.0
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_GetProperties(Eigen3)
+    if(NOT eigen3_POPULATED)
+        message(STATUS "Orange: fetching Eigen ...")
+        FetchContent_Populate(Eigen3)
+    endif()
+    set(EIGEN_INCLUDE_DIR "${eigen3_SOURCE_DIR}" CACHE INTERNAL "Eigen include dir")
+else()
+    set(EIGEN_INCLUDE_DIR "" CACHE INTERNAL "Eigen include dir (system)")
+endif()

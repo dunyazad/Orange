@@ -351,6 +351,11 @@ void GLRenderer::resize(uint32_t width, uint32_t height) {
     height_ = height;
 }
 
+void GLRenderer::setVsync(bool enabled) {
+    SDL_GL_MakeCurrent(window_, static_cast<SDL_GLContext>(context_));
+    SDL_GL_SetSwapInterval(enabled ? 1 : 0);
+}
+
 bool GLRenderer::readPixels(std::vector<uint8_t>& out, uint32_t& w, uint32_t& h) {
     SDL_GL_MakeCurrent(window_, static_cast<SDL_GLContext>(context_));
     w = width_;

@@ -48,6 +48,7 @@ bool VkRenderer::init(const render::InitInfo& info) {
     window_ = static_cast<SDL_Window*>(info.nativeWindow);
     pendingW_ = info.width;
     pendingH_ = info.height;
+    vsync_  = info.vsync;
 
     if (!createInstance())        return false;
     if (!createSurface())         return false;
@@ -204,7 +205,25 @@ bool VkRenderer::createSwapchain() {
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;  // always supported (vsync)
+    // vsync on -> FIFO (always supported). vsync off -> prefer MAILBOX (low
+    // latency, no tearing), else IMMEDIATE (tearing), else fall back to FIFO.
+    VkPresentModeKHR present = VK_PRESENT_MODE_FIFO_KHR;
+    if (!vsync_) {
+        uint32_t pmCount = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical_, surface_, &pmCount, nullptr);
+        std::vector<VkPresentModeKHR> modes(pmCount);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical_, surface_, &pmCount,
+                                                  modes.data());
+        bool mailbox = false, immediate = false;
+        for (auto m : modes) {
+            if (m == VK_PRESENT_MODE_MAILBOX_KHR)   mailbox = true;
+            if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) immediate = true;
+        }
+        present = mailbox ? VK_PRESENT_MODE_MAILBOX_KHR
+                          : (immediate ? VK_PRESENT_MODE_IMMEDIATE_KHR
+                                       : VK_PRESENT_MODE_FIFO_KHR);
+    }
+    ci.presentMode = present;
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = VK_NULL_HANDLE;
 
@@ -1060,6 +1079,13 @@ void VkRenderer::endFrame() {
 void VkRenderer::resize(uint32_t width, uint32_t height) {
     pendingW_ = width;
     pendingH_ = height;
+    needsResize_ = true;
+}
+
+void VkRenderer::setVsync(bool enabled) {
+    if (vsync_ == enabled) return;
+    vsync_ = enabled;
+    // Recreate the swapchain (with the new present mode) on the next frame.
     needsResize_ = true;
 }
 

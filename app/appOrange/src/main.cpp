@@ -183,12 +183,12 @@ void buildLabelQuads(std::vector<render::Vertex>& verts, std::vector<uint32_t>& 
     using math::Vec3;
     struct LabelFace { Vec3 n, rt, up; };
     const LabelFace faces[6] = {
-        {{1, 0, 0},  {0, 0, -1}, {0, 1, 0}},   // X
-        {{-1, 0, 0}, {0, 0, 1},  {0, 1, 0}},   // -X
-        {{0, 1, 0},  {1, 0, 0},  {0, 0, 1}},   // Y
-        {{0, -1, 0}, {1, 0, 0},  {0, 0, -1}},  // -Y
-        {{0, 0, 1},  {1, 0, 0},  {0, 1, 0}},   // Z
-        {{0, 0, -1}, {-1, 0, 0}, {0, 1, 0}},   // -Z
+        {Vec3(1, 0, 0),  Vec3(0, 0, -1), Vec3(0, 1, 0)},   // X
+        {Vec3(-1, 0, 0), Vec3(0, 0, 1),  Vec3(0, 1, 0)},   // -X
+        {Vec3(0, 1, 0),  Vec3(1, 0, 0),  Vec3(0, 0, 1)},   // Y
+        {Vec3(0, -1, 0), Vec3(1, 0, 0),  Vec3(0, 0, -1)},  // -Y
+        {Vec3(0, 0, 1),  Vec3(1, 0, 0),  Vec3(0, 1, 0)},   // Z
+        {Vec3(0, 0, -1), Vec3(-1, 0, 0), Vec3(0, 1, 0)},   // -Z
     };
     const float hw = 0.55f, hh = 0.55f, out = 1.05f;  // square quad (square atlas cell)
     for (int c = 0; c < 6; ++c) {
@@ -201,7 +201,7 @@ void buildLabelQuads(std::vector<render::Vertex>& verts, std::vector<uint32_t>& 
         float uv[4][2] = {{u0, 0}, {u1, 0}, {u1, 1}, {u0, 1}};
         uint32_t base = static_cast<uint32_t>(verts.size());
         for (int i = 0; i < 4; ++i)
-            verts.push_back({{p[i].x, p[i].y, p[i].z}, {1, 1, 1}, {uv[i][0], uv[i][1]}});
+            verts.push_back({{p[i].x(), p[i].y(), p[i].z()}, {1, 1, 1}, {uv[i][0], uv[i][1]}});
         idx.insert(idx.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
     }
 }
@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
     config.width  = 1280;
     config.height = 720;
     config.backend = render::Backend::OpenGL;
-    config.vsync   = false;  // uncapped so the FPS graph shows variation
+    config.vsync   = true;   // vsync on by default (toggle via the FPS widget)
 
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--vulkan") == 0)
@@ -271,7 +271,7 @@ int main(int argc, char** argv) {
     entt::registry& world = app.world();
 
     // Camera entity with a trackball controller orbiting the origin.
-    // Left-drag orbits, wheel zooms, middle/right-drag pans.
+    // Right-drag orbits, wheel zooms, middle-drag pans, left-click picks.
     {
         auto cam = world.create();
         world.emplace<ecs::Transform>(cam);  // written each frame by the manipulator
@@ -279,9 +279,9 @@ int main(int argc, char** argv) {
         c.primary = true;
         world.emplace<ecs::Camera>(cam, c);
         ecs::CameraManipulator manip;
-        manip.target      = {0.0f, 0.0f, 0.0f};
+        manip.target      = math::Vec3(0.0f, 0.0f, 0.0f);
         manip.distance    = 7.0f;
-        manip.orientation = math::quatAxisAngle({1, 0, 0}, -0.3f);  // tilt down slightly
+        manip.orientation = math::quatAxisAngle(math::Vec3(1, 0, 0), -0.3f);  // tilt down slightly
         world.emplace<ecs::CameraManipulator>(cam, manip);
     }
 
@@ -419,7 +419,7 @@ int main(int argc, char** argv) {
 
     // Draggable FPS widget: dynamic vertex buffer (rewritten each frame) +
     // static quad index pattern.
-    const int kFpsQ = 160, kFpsV = kFpsQ * 4;
+    const int kFpsQ = 256, kFpsV = kFpsQ * 4;  // must match kFpsQuads in systems.cpp
     const std::vector<render::Vertex> fpsInit(kFpsV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
     std::vector<uint32_t> fpsIdx;
     for (uint32_t q = 0; q < static_cast<uint32_t>(kFpsQ); ++q) {
@@ -442,6 +442,7 @@ int main(int argc, char** argv) {
         widget.vbo   = fpsVbo.handle();
         widget.font  = &uiFont;            // shared proportional font
         widget.atlas = uiFont.texture;
+        widget.vsync = config.vsync;       // reflect the actual initial state
         world.emplace<ecs::FpsWidget>(e, widget);
     }
 

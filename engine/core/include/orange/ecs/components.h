@@ -11,9 +11,9 @@
 namespace orange::ecs {
 
 struct Transform {
-    math::Vec3 position{0, 0, 0};
-    math::Quat orientation{};       // unit quaternion (no gimbal lock)
-    math::Vec3 scale{1, 1, 1};
+    math::Vec3 position   = math::Vec3::Zero();
+    math::Quat orientation = math::Quat::Identity();  // unit quaternion (no gimbal lock)
+    math::Vec3 scale      = math::Vec3::Ones();
 
     math::Mat4 matrix() const {
         return math::translate(position) * math::toMat4(orientation) *
@@ -24,9 +24,17 @@ struct Transform {
 // Makes an entity drawable with a GPU mesh owned by the renderer. This is the
 // "actual rendering" component -- attached to an entity (composition), not a
 // base class others inherit from. Extend it with material/tint later.
+//
+// boundsMin/boundsMax are the mesh's local-space axis-aligned bounds, used by
+// the pickingSystem for left-click ray selection. They default to a unit cube
+// ([-0.5, 0.5]^3); set them to match the actual mesh for accurate picking.
 struct Renderable {
     render::MeshHandle mesh    = render::kInvalidMesh;
     bool               visible = true;
+
+    math::Vec3 boundsMin = math::Vec3(-0.5f, -0.5f, -0.5f);
+    math::Vec3 boundsMax = math::Vec3( 0.5f,  0.5f,  0.5f);
+    bool       selected = false;  // set by pickingSystem on left-click
 };
 
 enum class ProjectionMode { Perspective = 0, Orthographic = 1 };
@@ -45,13 +53,14 @@ struct Camera {
 // mouse input and writes the owning entity's Transform so it orbits `target`.
 // Orientation is a quaternion accumulated incrementally, so there is no gimbal
 // lock and the view can tumble freely in any direction:
-//   left-drag         -> orbit (rotate about the camera's own axes)
-//   wheel             -> zoom (distance)
-//   middle/right-drag -> pan (move target)
+//   right-drag  -> orbit (rotate about the camera's own axes)
+//   wheel       -> zoom (distance)
+//   middle-drag -> pan (move target)
+// (Left-click is reserved for picking; see pickingSystem.)
 struct CameraManipulator {
-    math::Vec3 target{0, 0, 0};        // pivot the camera orbits around
+    math::Vec3 target   = math::Vec3::Zero();  // pivot the camera orbits around
     float      distance = 6.0f;        // camera distance from target
-    math::Quat orientation{};          // camera orientation (identity => +Z)
+    math::Quat orientation = math::Quat::Identity();  // camera orientation (identity => +Z)
 
     float rotateSpeed = 0.006f;
     float zoomSpeed   = 0.6f;
@@ -63,8 +72,8 @@ struct CameraManipulator {
     // Smooth snap animation (driven by the axis gizmo). While animating, manual
     // orbit is suspended and `orientation` is slerped from animFrom to animTo.
     bool       animating    = false;
-    math::Quat animFrom{};
-    math::Quat animTo{};
+    math::Quat animFrom = math::Quat::Identity();
+    math::Quat animTo   = math::Quat::Identity();
     float      animTime     = 0.0f;
     float      animDuration = 0.45f;
 };
@@ -93,19 +102,24 @@ struct AxisGizmo {
 
     // Runtime state, updated each frame by axisGizmoInputSystem.
     GizmoPart  hoverPart   = GizmoPart::None;
-    math::Vec3 hoverDir{0, 0, 0};  // cube region (face/edge/corner) under cursor
+    math::Vec3 hoverDir = math::Vec3::Zero();  // cube region (face/edge/corner) under cursor
     int        hoverSector = -1;   // ring sector 0..3 (right/top/left/bottom)
 
     float      flash       = 0.0f; // click feedback timer (seconds remaining)
     GizmoPart  flashPart   = GizmoPart::None;
-    math::Vec3 flashDir{0, 0, 0};
+    math::Vec3 flashDir = math::Vec3::Zero();
     int        flashSector = -1;
 };
 
 // A draggable on-screen FPS graph widget (bar history + numeric readout).
 struct FpsWidget {
-    int  x = 16, y = 16, w = 240, h = 96;  // pixel rect (top-left origin)
+    int  x = 16, y = 16, w = 260, h = 132;  // pixel rect (computed each frame)
     bool visible = true;
+
+    // Position is stored as a fraction of the viewport (top-left corner) so the
+    // panel keeps its relative spot when the window is resized. fpsWidgetInputSystem
+    // derives x/y from these each frame; dragging writes them back.
+    float relX = 0.0125f, relY = 0.022f;
 
     static constexpr int kSamples = 64;
     float history[kSamples] = {};   // recent FPS values (ring buffer)
@@ -113,9 +127,21 @@ struct FpsWidget {
     float smoothFps = 60.0f;
     float maxScale  = 120.0f;       // FPS mapped to the top of the graph
 
+    // Sampling cadence: rather than push a sample / refresh the readout every
+    // frame (jittery at high FPS), accumulate and update once per interval.
+    float updateInterval = 0.5f;    // seconds between graph samples + readout
+    float accumTime      = 0.0f;
+    int   accumFrames    = 0;
+    bool  primed         = false;   // history pre-filled on the first update
+
     // Drag state.
     bool  dragging = false;
     float dragOffX = 0.0f, dragOffY = 0.0f;
+
+    // VSYNC toggle checkbox (top-right of the panel). vsyncDirty is set on click
+    // and consumed by renderSystem, which applies it to the renderer.
+    bool vsync      = true;
+    bool vsyncDirty = false;
 
     // GPU resources (dynamic vertex buffer rewritten each frame).
     render::MeshHandle   mesh = render::kInvalidMesh;
@@ -133,6 +159,10 @@ struct CameraControls {
     int w = 184, h = 76;   // panel size (px); positioned top-right under the gizmo
     int x = 0, y = 0;      // computed each frame
 
+    // +/- button hold state: time the active button has been held (for key-repeat
+    // in Shift-snap mode). Reset on each fresh press.
+    float holdTime = 0.0f;
+
     const core::Font*    font  = nullptr;  // shared text font
     render::TextureHandle atlas = render::kInvalidTexture;
     render::MeshHandle    mesh = render::kInvalidMesh;
@@ -141,7 +171,7 @@ struct CameraControls {
 
 // Demo behavior: continuous rotation, consumed by SpinSystem.
 struct Spin {
-    math::Vec3 axisRadiansPerSec{0, 1.0f, 0};
+    math::Vec3 axisRadiansPerSec = math::Vec3(0.0f, 1.0f, 0.0f);
 };
 
 } // namespace orange::ecs

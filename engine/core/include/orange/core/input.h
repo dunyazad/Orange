@@ -16,6 +16,7 @@ struct Input {
 
     bool leftClicked = false;  // left button went down this frame (edge)
     bool captured    = false;  // a UI widget consumed the mouse this frame
+    bool shift       = false;  // a Shift key is held this frame (level state)
 
     // Clear accumulators that are only meaningful for a single frame.
     void newFrame() {

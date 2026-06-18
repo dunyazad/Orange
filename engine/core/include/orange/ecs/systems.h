@@ -22,7 +22,7 @@ void fpsWidgetInputSystem(entt::registry& world, core::Input& input, float dt,
 
 // Camera controls panel: positions the panel under the gizmo and handles clicks
 // on its buttons (toggle projection, FOV/size +/-). Sets input.captured on use.
-void cameraControlsInputSystem(entt::registry& world, core::Input& input,
+void cameraControlsInputSystem(entt::registry& world, core::Input& input, float dt,
                                uint32_t viewportW, uint32_t viewportH);
 
 // Axis gizmo input: each frame, ray-picks the gizmo cube under the cursor to
@@ -31,6 +31,13 @@ void cameraControlsInputSystem(entt::registry& world, core::Input& input,
 // cameraManipulatorSystem.
 void axisGizmoInputSystem(entt::registry& world, const core::Input& input,
                           float dt, uint32_t viewportW, uint32_t viewportH);
+
+// Picking: on a fresh left-click (not consumed by a UI widget), casts a ray
+// from the primary camera through the cursor, finds the nearest (Transform,
+// Renderable) hit via ray-vs-local-AABB, and marks it Renderable::selected
+// (single-select). Runs after cameraManipulatorSystem so the camera is current.
+void pickingSystem(entt::registry& world, const core::Input& input,
+                   uint32_t viewportW, uint32_t viewportH);
 
 // Gathers the primary camera + all (Transform, MeshRenderer) entities and
 // issues draw calls through the renderer. This is the ECS -> render bridge.
