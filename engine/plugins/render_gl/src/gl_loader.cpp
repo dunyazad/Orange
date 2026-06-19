@@ -52,6 +52,11 @@ PFN_glPixelStorei             glPixelStorei             = nullptr;
 PFN_glPolygonMode             glPolygonMode             = nullptr;
 PFN_glPointSize               glPointSize               = nullptr;
 PFN_glPolygonOffset           glPolygonOffset           = nullptr;
+PFN_glCullFace                glCullFace                = nullptr;
+PFN_glColorMask               glColorMask               = nullptr;
+PFN_glStencilFunc             glStencilFunc             = nullptr;
+PFN_glStencilOp               glStencilOp               = nullptr;
+PFN_glStencilMask             glStencilMask             = nullptr;
 
 namespace orange::gl {
 
@@ -121,6 +126,11 @@ bool loadGLFunctions() {
     ORANGE_LOAD(glPolygonMode);
     ORANGE_LOAD(glPointSize);
     ORANGE_LOAD(glPolygonOffset);
+    ORANGE_LOAD(glCullFace);
+    ORANGE_LOAD(glColorMask);
+    ORANGE_LOAD(glStencilFunc);
+    ORANGE_LOAD(glStencilOp);
+    ORANGE_LOAD(glStencilMask);
     return g_ok;
 }
 

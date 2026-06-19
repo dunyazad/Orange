@@ -36,6 +36,14 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
         COMMENT "Compiling mesh.frag -> SPIR-V header"
         VERBATIM)
     add_custom_command(
+        OUTPUT "${_shader_gen}/points.frag.spv.h"
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V
+                "${CMAKE_CURRENT_SOURCE_DIR}/shaders/points.frag"
+                --vn g_pointsFragSpv -o "${_shader_gen}/points.frag.spv.h"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/points.frag"
+        COMMENT "Compiling points.frag -> SPIR-V header"
+        VERBATIM)
+    add_custom_command(
         OUTPUT "${_shader_gen}/grid.vert.spv.h"
         COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V
                 "${CMAKE_CURRENT_SOURCE_DIR}/shaders/grid.vert"
@@ -54,6 +62,7 @@ if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
     target_sources(render_vk PRIVATE
         "${_shader_gen}/mesh.vert.spv.h"
         "${_shader_gen}/mesh.frag.spv.h"
+        "${_shader_gen}/points.frag.spv.h"
         "${_shader_gen}/grid.vert.spv.h"
         "${_shader_gen}/grid.frag.spv.h")
 endif()

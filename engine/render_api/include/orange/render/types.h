@@ -57,16 +57,23 @@ struct Vertex {
     }
 };
 
+// How a mesh's vertices are assembled into primitives.
+enum class PrimitiveTopology : uint32_t {
+    Triangles = 0,  // the usual indexed/non-indexed triangle list
+    Points    = 1,  // a point cloud -- drawn as sphere-imposter point sprites
+};
+
 // A mesh is now a *composition* over buffer objects: a vertex buffer (required),
 // an optional index buffer, and the layout describing the vertex bytes. The
 // renderer owns the GPU-side binding state (e.g. a GL VAO) but NOT the buffers,
 // whose lifetime the caller controls via destroyBuffer().
 struct MeshDesc {
-    BufferHandle vertexBuffer = kInvalidBuffer;
-    BufferHandle indexBuffer  = kInvalidBuffer;  // kInvalidBuffer => non-indexed
-    VertexLayout layout{};
-    uint32_t     vertexCount  = 0;
-    uint32_t     indexCount   = 0;  // used only when indexBuffer is valid
+    BufferHandle      vertexBuffer = kInvalidBuffer;
+    BufferHandle      indexBuffer  = kInvalidBuffer;  // kInvalidBuffer => non-indexed
+    VertexLayout      layout{};
+    uint32_t          vertexCount  = 0;
+    uint32_t          indexCount   = 0;  // used only when indexBuffer is valid
+    PrimitiveTopology topology     = PrimitiveTopology::Triangles;
 };
 
 // Everything the renderer needs to stand up a swapchain / GL context.
@@ -92,6 +99,15 @@ struct DrawItem {
     MeshHandle    mesh    = kInvalidMesh;
     TextureHandle texture = kInvalidTexture;  // invalid => 1x1 white
     float         model[16];                  // column-major model matrix
+    // Selection silhouette via the stencil buffer (robust for any mesh shape):
+    //   stencilMask -- a solid pass that writes only the stencil (ref 1, no color/
+    //                  depth) marking the mesh's footprint;
+    //   outline     -- a slightly-enlarged copy in a solid outline color, drawn
+    //                  where stencil != 1 (outside the footprint) so only a thin
+    //                  border ring survives. The host submits the visible item,
+    //                  then stencilMask, then outline. Both ignore the draw mode.
+    bool          stencilMask = false;
+    bool          outline     = false;
 };
 
 // Begins an overlay sub-pass within the current frame: restricts subsequent

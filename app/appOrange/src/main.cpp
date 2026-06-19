@@ -546,6 +546,13 @@ int main(int argc, char** argv) {
         world.emplace<ecs::MenuBar>(e, mb);
     }
 
+    // CPU triangle soup of the cube for accurate (per-triangle) picking.
+    ecs::PickGeometry cubePick;
+    cubePick.positions.reserve(vertices.size());
+    for (const auto& v : vertices)
+        cubePick.positions.emplace_back(v.position[0], v.position[1], v.position[2]);
+    cubePick.indices = indices;
+
     // A few spinning cubes, each sharing the same GPU mesh.
     const float xs[] = {-1.6f, 0.0f, 1.6f};
     for (float x : xs) {
@@ -554,6 +561,7 @@ int main(int argc, char** argv) {
         t.position = {x, 0.0f, 0.0f};
         world.emplace<ecs::Transform>(e, t);
         world.emplace<ecs::Renderable>(e, ecs::Renderable{cube});
+        world.emplace<ecs::PickGeometry>(e, cubePick);
         ecs::Spin spin;
         spin.axisRadiansPerSec = {0.4f, 0.9f, 0.0f};
         world.emplace<ecs::Spin>(e, spin);
@@ -598,15 +606,21 @@ int main(int argc, char** argv) {
             v.position[2] -= center.z();
         }
 
+        const bool isPoints = mi.empty();  // faceless PLY -> point cloud
+
         loadedVbos.push_back(
             std::make_unique<core::VertexBuffer<render::Vertex>>(*renderer, mv));
-        loadedIbos.push_back(std::make_unique<core::IndexBuffer>(*renderer, mi));
         render::MeshDesc md;
         md.vertexBuffer = loadedVbos.back()->handle();
-        md.indexBuffer  = loadedIbos.back()->handle();
         md.layout       = render::Vertex::layout();
         md.vertexCount  = static_cast<uint32_t>(loadedVbos.back()->count());
-        md.indexCount   = static_cast<uint32_t>(loadedIbos.back()->count());
+        if (isPoints) {
+            md.topology = render::PrimitiveTopology::Points;  // sphere-imposter points
+        } else {
+            loadedIbos.push_back(std::make_unique<core::IndexBuffer>(*renderer, mi));
+            md.indexBuffer = loadedIbos.back()->handle();
+            md.indexCount  = static_cast<uint32_t>(loadedIbos.back()->count());
+        }
         render::MeshHandle mesh = renderer->createMesh(md);
 
         auto e = world.create();
@@ -617,9 +631,24 @@ int main(int argc, char** argv) {
         r.mesh      = mesh;
         r.boundsMin = mn - center;  // local-space bounds (pre-scale) for picking
         r.boundsMax = mx - center;
+        if (isPoints) r.pointCloud = true;  // drawn as point sprites; box-wireframe selection
         world.emplace<ecs::Renderable>(e, r);
-        SDL_Log("Mesh: loaded '%s' (%zu verts, %zu tris)", path.c_str(), mv.size(),
-                mi.size() / 3);
+
+        // Accurate triangle picking for real meshes; point clouds fall back to AABB.
+        if (!isPoints) {
+            ecs::PickGeometry pick;
+            pick.positions.reserve(mv.size());
+            for (const auto& v : mv)
+                pick.positions.emplace_back(v.position[0], v.position[1], v.position[2]);
+            pick.indices = mi;
+            world.emplace<ecs::PickGeometry>(e, std::move(pick));
+        }
+
+        if (isPoints)
+            SDL_Log("Mesh: loaded '%s' (%zu points)", path.c_str(), mv.size());
+        else
+            SDL_Log("Mesh: loaded '%s' (%zu verts, %zu tris)", path.c_str(), mv.size(),
+                    mi.size() / 3);
     };
 
     auto onUpdate = [&](entt::registry& w, float /*dt*/) {
@@ -650,7 +679,8 @@ int main(int argc, char** argv) {
     };
 
     SDL_Log("appOrange: running. File > Open... loads a mesh (OBJ/STL).");
-    SDL_Log("appOrange: Tab = drawing mode (none/solid/wire/wire+solid/point).");
+    SDL_Log("appOrange: click selects (Ctrl+click toggles, Ctrl+A all on-screen, empty clears, "
+            "Delete removes); Tab cycles the selection's drawing mode (H reveals None-hidden meshes).");
     SDL_Log("appOrange: ESC or close the window to quit.");
     app.run(onUpdate);  // onUpdate + spinSystem + renderSystem run each frame
     return 0;

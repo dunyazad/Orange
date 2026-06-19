@@ -11,6 +11,7 @@
 #include "generated/grid.vert.spv.h"
 #include "generated/mesh.frag.spv.h"
 #include "generated/mesh.vert.spv.h"
+#include "generated/points.frag.spv.h"
 
 namespace orange::vk {
 
@@ -194,15 +195,17 @@ bool VkRenderer::createSwapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_, surface_, &caps);
 
-    // Surface format: prefer B8G8R8A8 SRGB, else first available.
+    // Surface format: prefer a non-sRGB (UNORM) format so the fragment shader's
+    // display-space colors are written verbatim -- matching the GL backend, which
+    // does no sRGB conversion. An *_SRGB swapchain would gamma-encode the output,
+    // making the scene look brighter/washed-out compared to GL.
     uint32_t fmtCount = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(physical_, surface_, &fmtCount, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(fmtCount);
     vkGetPhysicalDeviceSurfaceFormatsKHR(physical_, surface_, &fmtCount, formats.data());
     VkSurfaceFormatKHR chosen = formats[0];
     for (const auto& f : formats) {
-        if (f.format == VK_FORMAT_B8G8R8A8_SRGB &&
-            f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        if (f.format == VK_FORMAT_B8G8R8A8_UNORM || f.format == VK_FORMAT_R8G8B8A8_UNORM) {
             chosen = f;
             break;
         }
@@ -304,7 +307,7 @@ bool VkRenderer::createRenderPass() {
     depth.samples = VK_SAMPLE_COUNT_1_BIT;
     depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depth.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;  // selection-outline stencil
     depth.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depth.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     depth.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -425,7 +428,8 @@ bool VkRenderer::createDepthResources() {
     vci.image = depthImage_;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
     vci.format = depthFormat_;
-    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    vci.subresourceRange.aspectMask =
+        VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     vci.subresourceRange.levelCount = 1;
     vci.subresourceRange.layerCount = 1;
     VK_CHECK(vkCreateImageView(device_, &vci, nullptr, &depthView_));
@@ -597,6 +601,82 @@ bool VkRenderer::createPipeline(const render::VertexLayout& layout) {
             SDL_Log("VkRenderer: point pipeline creation failed (%d)", (int)rp);
             pipelinePoint_ = VK_NULL_HANDLE;  // fall back to solid
         }
+        // Selection silhouette via stencil (robust for any mesh shape). Both are
+        // solid fill, no cull, no depth test.
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+
+        // (a) Stencil-mask pipeline: writes stencil = 1 over the footprint, no color.
+        VkStencilOpState writeOp{};
+        writeOp.failOp = VK_STENCIL_OP_KEEP;
+        writeOp.passOp = VK_STENCIL_OP_REPLACE;
+        writeOp.depthFailOp = VK_STENCIL_OP_KEEP;
+        writeOp.compareOp = VK_COMPARE_OP_ALWAYS;
+        writeOp.compareMask = 0xFF;
+        writeOp.writeMask = 0xFF;
+        writeOp.reference = 1;
+        VkPipelineDepthStencilStateCreateInfo dsMask = ds;
+        dsMask.depthTestEnable = VK_FALSE;
+        dsMask.depthWriteEnable = VK_FALSE;
+        dsMask.stencilTestEnable = VK_TRUE;
+        dsMask.front = writeOp;
+        dsMask.back = writeOp;
+        cba.colorWriteMask = 0;  // stencil only
+        pci.pDepthStencilState = &dsMask;
+        VkResult rm = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci,
+                                                nullptr, &pipelineStencilMask_);
+        if (rm != VK_SUCCESS) {
+            SDL_Log("VkRenderer: stencil-mask pipeline creation failed (%d)", (int)rm);
+            pipelineStencilMask_ = VK_NULL_HANDLE;
+        }
+
+        // (b) Outline pipeline: draws the enlarged copy only where stencil != 1.
+        VkStencilOpState testOp{};
+        testOp.failOp = VK_STENCIL_OP_KEEP;
+        testOp.passOp = VK_STENCIL_OP_KEEP;
+        testOp.depthFailOp = VK_STENCIL_OP_KEEP;
+        testOp.compareOp = VK_COMPARE_OP_NOT_EQUAL;
+        testOp.compareMask = 0xFF;
+        testOp.writeMask = 0x00;
+        testOp.reference = 1;
+        VkPipelineDepthStencilStateCreateInfo dsOutline = ds;
+        dsOutline.depthTestEnable = VK_FALSE;
+        dsOutline.depthWriteEnable = VK_FALSE;
+        dsOutline.stencilTestEnable = VK_TRUE;
+        dsOutline.front = testOp;
+        dsOutline.back = testOp;
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        pci.pDepthStencilState = &dsOutline;
+        VkResult ro = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci,
+                                                nullptr, &pipelineOutline_);
+        if (ro != VK_SUCCESS) {
+            SDL_Log("VkRenderer: outline pipeline creation failed (%d)", (int)ro);
+            pipelineOutline_ = VK_NULL_HANDLE;
+        }
+        pci.pDepthStencilState = &ds;  // restore for any later use
+
+        // Point-cloud pipeline: POINT_LIST topology + sphere-imposter fragment.
+        VkShaderModule fsPoints = makeModule(g_pointsFragSpv, sizeof(g_pointsFragSpv));
+        VkPipelineShaderStageCreateInfo ptStages[2] = {stages[0], stages[1]};
+        ptStages[1].module = fsPoints;
+        VkPipelineInputAssemblyStateCreateInfo iaPt = ia;
+        iaPt.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        pci.pStages = ptStages;
+        pci.pInputAssemblyState = &iaPt;
+        VkResult rpt = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci, nullptr,
+                                                 &pipelinePoints_);
+        if (rpt != VK_SUCCESS) {
+            SDL_Log("VkRenderer: points pipeline creation failed (%d)", (int)rpt);
+            pipelinePoints_ = VK_NULL_HANDLE;
+        }
+        pci.pStages = stages;
+        pci.pInputAssemblyState = &ia;
+        vkDestroyShaderModule(device_, fsPoints, nullptr);
     }
 
     vkDestroyShaderModule(device_, vs, nullptr);
@@ -1076,6 +1156,7 @@ render::MeshHandle VkRenderer::createMesh(const render::MeshDesc& desc) {
     mesh.indexed = desc.indexBuffer != render::kInvalidBuffer &&
                    desc.indexCount > 0 &&
                    buffers_.find(desc.indexBuffer) != buffers_.end();
+    mesh.points = (desc.topology == render::PrimitiveTopology::Points);
 
     render::MeshHandle handle = nextMesh_++;
     meshes_[handle] = mesh;
@@ -1191,10 +1272,8 @@ void VkRenderer::submit(const render::DrawItem& item) {
         vkCmdBindIndexBuffer(cmd, ib->buffer, 0, VK_INDEX_TYPE_UINT32);
     }
 
-    auto drawWith = [&](VkPipeline pipe, bool blackEdges) {
-        float forceColor[4] = {0.0f, 0.0f, 0.0f, blackEdges ? 1.0f : 0.0f};
-        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 128, 16,
-                           forceColor);
+    auto drawWith = [&](VkPipeline pipe, const float force[4]) {
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 128, 16, force);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                           pipe != VK_NULL_HANDLE ? pipe : pipeline_);
         if (mesh.indexed)
@@ -1202,21 +1281,49 @@ void VkRenderer::submit(const render::DrawItem& item) {
         else
             vkCmdDraw(cmd, mesh.vertexCount, 1, 0, 0);
     };
+    const float kNoForce[4] = {0, 0, 0, 0};
+    const float kBlack[4]   = {0, 0, 0, 1};
+
+    // Point cloud -> sphere-imposter point sprites (independent of the draw modes).
+    if (mesh.points) {
+        drawWith(pipelinePoints_, kNoForce);
+        return;
+    }
+
+    // Selection stencil mask: writes stencil=1 over the footprint (no color). Clear
+    // the stencil first so overlapping selections don't clip each other's outline.
+    if (item.stencilMask) {
+        VkClearAttachment ca{};
+        ca.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+        ca.clearValue.depthStencil = {1.0f, 0};
+        VkClearRect cr{};
+        cr.rect.extent = swapExtent_;
+        cr.layerCount = 1;
+        vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+        drawWith(pipelineStencilMask_, kNoForce);
+        return;
+    }
+    // Selection silhouette: enlarged copy drawn only where stencil != 1.
+    if (item.outline) {
+        const float kOutline[4] = {1.0f, 0.55f, 0.1f, 1.0f};
+        drawWith(pipelineOutline_, kOutline);
+        return;
+    }
 
     // Helium drawing modes (see IRenderer::setDrawMode).
     switch (drawMode_) {
         case 2:  // WireFrame
-            drawWith(pipelineWireframe_, false);
+            drawWith(pipelineWireframe_, kNoForce);
             break;
         case 3:  // WireFrameOverSolid: biased fill, then black edges on top
-            drawWith(pipeline_, false);
-            drawWith(pipelineWireframe_, true);
+            drawWith(pipeline_, kNoForce);
+            drawWith(pipelineWireframe_, kBlack);
             break;
         case 4:  // Point
-            drawWith(pipelinePoint_, false);
+            drawWith(pipelinePoint_, kNoForce);
             break;
         default:  // 1 = Solid
-            drawWith(pipeline_, false);
+            drawWith(pipeline_, kNoForce);
             break;
     }
 }
@@ -1329,6 +1436,12 @@ void VkRenderer::shutdown() {
     if (gridLayout_)     vkDestroyPipelineLayout(device_, gridLayout_, nullptr);
     gridPipeline_ = VK_NULL_HANDLE;
     gridLayout_   = VK_NULL_HANDLE;
+    if (pipelinePoints_)    vkDestroyPipeline(device_, pipelinePoints_, nullptr);
+    pipelinePoints_ = VK_NULL_HANDLE;
+    if (pipelineStencilMask_) vkDestroyPipeline(device_, pipelineStencilMask_, nullptr);
+    pipelineStencilMask_ = VK_NULL_HANDLE;
+    if (pipelineOutline_)   vkDestroyPipeline(device_, pipelineOutline_, nullptr);
+    pipelineOutline_ = VK_NULL_HANDLE;
     if (pipelinePoint_)     vkDestroyPipeline(device_, pipelinePoint_, nullptr);
     pipelinePoint_ = VK_NULL_HANDLE;
     if (pipelineWireframe_) vkDestroyPipeline(device_, pipelineWireframe_, nullptr);

@@ -1,5 +1,9 @@
 #pragma once
 
+#include <cstdint>
+#include <vector>
+
+#include "orange/core/draw_mode.h"
 #include "orange/core/font.h"
 #include "orange/core/math.h"
 #include "orange/render/types.h"
@@ -35,6 +39,23 @@ struct Renderable {
     Eigen::Vector3f boundsMin = Eigen::Vector3f(-0.5f, -0.5f, -0.5f);
     Eigen::Vector3f boundsMax = Eigen::Vector3f( 0.5f,  0.5f,  0.5f);
     bool       selected = false;  // set by pickingSystem on left-click
+
+    // Per-mesh drawing mode (Helium's set); Tab cycles it for the selection, so
+    // each mesh keeps its own. Selected meshes also get a silhouette outline.
+    core::DrawMode drawMode = core::DrawMode::Solid;
+
+    // A non-indexed point cloud (drawn as points). Selection shows a bounding-box
+    // wireframe instead of the stencil silhouette (which needs a solid surface).
+    bool pointCloud = false;
+};
+
+// Optional CPU-side triangle soup (local space) for accurate ray picking. When
+// present, the pickingSystem ray-tests the actual triangles instead of just the
+// Renderable's AABB -- so clicking through a concave/empty region of a mesh (e.g.
+// the gaps of a loaded model) correctly misses it and hits whatever is behind.
+struct PickGeometry {
+    std::vector<Eigen::Vector3f> positions;  // local-space vertex positions
+    std::vector<uint32_t>        indices;    // triangle list (3 per face)
 };
 
 enum class ProjectionMode { Perspective = 0, Orthographic = 1 };

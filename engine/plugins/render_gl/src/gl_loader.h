@@ -25,6 +25,7 @@ typedef void           GLvoid;
 // --- Constants we use -------------------------------------------------------
 #define GL_FALSE                0
 #define GL_TRUE                 1
+#define GL_POINTS               0x0000
 #define GL_TRIANGLES            0x0004
 #define GL_FLOAT                0x1406
 #define GL_UNSIGNED_INT         0x1405
@@ -40,6 +41,13 @@ typedef void           GLvoid;
 #define GL_COMPILE_STATUS       0x8B81
 #define GL_LINK_STATUS          0x8B82
 #define GL_DEPTH_TEST           0x0B71
+#define GL_CULL_FACE            0x0B44
+#define GL_STENCIL_TEST         0x0B90
+#define GL_STENCIL_BUFFER_BIT   0x00000400
+#define GL_KEEP                 0x1E00
+#define GL_REPLACE              0x1E01
+#define GL_ALWAYS               0x0207
+#define GL_NOTEQUAL             0x0205
 #define GL_LESS                 0x0201
 #define GL_SCISSOR_TEST         0x0C11
 #define GL_TEXTURE_2D           0x0DE1
@@ -63,6 +71,7 @@ typedef void           GLvoid;
 #define GL_LINE                 0x1B01
 #define GL_FILL                 0x1B02
 #define GL_POLYGON_OFFSET_FILL  0x8037
+#define GL_PROGRAM_POINT_SIZE   0x8642
 #define GL_PACK_ALIGNMENT       0x0D05
 
 // Windows GL calls use __stdcall; everything else is cdecl.
@@ -122,6 +131,11 @@ typedef void   (ORANGE_GLAPI* PFN_glPixelStorei)(GLenum, GLint);
 typedef void   (ORANGE_GLAPI* PFN_glPolygonMode)(GLenum, GLenum);
 typedef void   (ORANGE_GLAPI* PFN_glPointSize)(GLfloat);
 typedef void   (ORANGE_GLAPI* PFN_glPolygonOffset)(GLfloat, GLfloat);
+typedef void   (ORANGE_GLAPI* PFN_glCullFace)(GLenum);
+typedef void   (ORANGE_GLAPI* PFN_glColorMask)(GLboolean, GLboolean, GLboolean, GLboolean);
+typedef void   (ORANGE_GLAPI* PFN_glStencilFunc)(GLenum, GLint, GLuint);
+typedef void   (ORANGE_GLAPI* PFN_glStencilOp)(GLenum, GLenum, GLenum);
+typedef void   (ORANGE_GLAPI* PFN_glStencilMask)(GLuint);
 
 // --- Function pointers (defined in gl_loader.cpp) --------------------------
 extern PFN_glGenVertexArrays         glGenVertexArrays;
@@ -173,6 +187,11 @@ extern PFN_glPixelStorei             glPixelStorei;
 extern PFN_glPolygonMode             glPolygonMode;
 extern PFN_glPointSize               glPointSize;
 extern PFN_glPolygonOffset           glPolygonOffset;
+extern PFN_glCullFace                glCullFace;
+extern PFN_glColorMask               glColorMask;
+extern PFN_glStencilFunc             glStencilFunc;
+extern PFN_glStencilOp               glStencilOp;
+extern PFN_glStencilMask             glStencilMask;
 
 namespace orange::gl {
 // Resolve all entry points. Requires a current GL context. Returns false if

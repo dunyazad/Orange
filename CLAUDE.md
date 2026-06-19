@@ -101,7 +101,12 @@ cmake --build D:/Library/Orange/build --config Debug
 
 ## Key facts to keep in mind
 
-- **Plugin ABI is v10.** Changing the C contract means bumping
+- **Plugin ABI is v13** (v13 added `MeshDesc::topology`: `Triangles` or `Points`;
+  a `Points` mesh is drawn as **sphere-imposter point sprites** — real GL_POINTS /
+  VK POINT_LIST with a fragment shader that rounds + shades each sprite via
+  `gl_PointCoord`, not instanced spheres. Faceless PLYs load as such point clouds;
+  their selection shows a bounding-box wireframe, not the stencil silhouette).
+  Changing the C contract means bumping
   `ORANGE_PLUGIN_ABI_VERSION` and updating both backends. v6 added
   `IRenderer::setVsync(bool)` (GL flips the swap interval; VK recreates the
   swapchain with a FIFO / immediate-mailbox present mode). v7 added
@@ -113,10 +118,25 @@ cmake --build D:/Library/Orange/build --config Debug
   (`glPolygonMode` + `glPointSize` + `glPolygonOffset` for the over-solid pass);
   VK binds the matching fill/line/point pipeline (needs the `fillModeNonSolid` +
   `largePoints` device features; the fill pipeline carries a small depth bias so
-  the over-solid edges sit on top, and mode 3 double-draws). **Tab** cycles the
-  modes — handled in `Application` (writes `core::DrawModeState` into the registry
-  ctx); the `renderSystem` applies it to scene meshes only, resetting to solid
-  before the debug geometry, grid and overlays.
+  the over-solid edges sit on top, and mode 3 double-draws). v11 added
+  `DrawItem::outline` and v12 `DrawItem::stencilMask` for the stencil selection
+  silhouette (below).
+- **Per-mesh drawing mode + selection.** Each `Renderable` carries its own
+  `core::DrawMode` (so meshes keep distinct modes). The `renderSystem` calls
+  `setDrawMode(r.drawMode)` per drawable; **Tab** cycles the mode of the *selected*
+  meshes (`Application` iterates `Renderable::selected`). Selection shows as a
+  **stencil silhouette outline** (a thin border that holds for any mesh shape and
+  draw mode): for a selected mesh the renderSystem submits, after the visible mesh,
+  a solid `DrawItem::stencilMask` pass (writes stencil = 1 over the footprint, no
+  color/depth) then a slightly-enlarged `DrawItem::outline` pass drawn only where
+  stencil != 1 (orange). GL drives `glStencil*` (needs `SDL_GL_STENCIL_SIZE`); VK
+  uses a D24S8 depth-stencil attachment + stencil-write / stencil-test pipelines,
+  clearing the stencil per mesh so multi-selection outlines don't clip. (The old
+  inverted-hull version filled in on concave/thin meshes — stencil fixed that.)
+  Picking: plain click single-selects (empty click clears), **Ctrl+click toggles**
+  (multi-select), **Ctrl+A** selects all meshes *visible on screen*
+  (`entityVisibleOnScreen` frustum-tests each AABB, so off-screen meshes are never
+  bulk-selected), **Delete** destroys the selected entities.
 - **Infinite grid:** `renderSystem` calls `IRenderer::drawGrid(upAxis)` after the
   scene submits (before the gizmo overlay). Each backend renders a vertex-less
   full-screen pass (GL: inline shader + empty VAO; VK: a second pipeline +
@@ -158,13 +178,19 @@ cmake --build D:/Library/Orange/build --config Debug
 - **No gimbal lock:** `Transform::orientation` is a unit quaternion; the camera
   is a quaternion arcball trackball (`CameraManipulator`). Any camera controller
   is just a system that writes a `Transform`.
-- **Input scheme:** right-drag orbits, middle-drag pans, wheel zooms, and
-  **left-click picks** the nearest `Renderable` via `pickingSystem` (builds a
-  world ray from the camera and ray-tests each entity's local AABB; the hit gets
-  `Renderable::selected`). UI widgets set `Input::captured` to suppress picking.
-  **Tab** cycles the scene drawing mode (Helium's set: none / solid / wireframe /
-  wireframe-over-solid / point); **M** cycles the point-cloud processing mode;
-  **C** screenshots; **Esc** quits.
+- **Input scheme:** right-drag orbits, middle-drag pans, wheel zooms. **Left-click
+  picks** the nearest `Renderable` via `pickingSystem` — a world ray is ray-tested
+  against each entity's actual triangles when it has a `PickGeometry` component
+  (CPU triangle soup), else its `Renderable` AABB; hits are compared by true world
+  distance. Triangle picking means clicking through a concave model's gaps misses
+  it and hits whatever is behind, instead of its bounding box stealing the click.
+  Plain click single-selects (empty click clears), **Ctrl+click**
+  toggles (multi-select), **Ctrl+A** selects all on-screen meshes, **Delete**
+  removes the selection. `Input::captured` (set by UI widgets) suppresses picking.
+  **Tab** cycles the *selected* meshes' drawing mode
+  (Helium's set: none / solid / wireframe / wireframe-over-solid / point);
+  selection shows as a silhouette outline. **M** cycles the point-cloud processing
+  mode; **C** screenshots; **Esc** quits.
 - **Processing modes (`orange::modes`):** the Orange take on Hydrogen's "apps" —
   selectable point-cloud operations that run on a `modes::ModeInput` (stored in
   the registry ctx) and emit a visualization via the debug-draw accumulator.

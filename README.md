@@ -132,8 +132,8 @@ A trackball camera (`CameraManipulator` component) orbits the scene:
 | Right-drag          | Orbit (quaternion trackball — tumbles freely, no gimbal lock) |
 | Mouse wheel         | Zoom (distance) |
 | Middle-drag         | Pan (move target) |
-| Left-click          | Pick the nearest entity under the cursor (`pickingSystem`); the hit pops slightly larger |
-| Tab                 | Cycle the scene drawing mode — Helium's set: none / solid / wireframe / wireframe-over-solid / point (`IRenderer::setDrawMode`) |
+| Left-click          | Select the nearest entity (silhouette outline); Ctrl+click toggles (multi-select), Ctrl+A all on-screen, empty click clears, Delete removes |
+| Tab                 | Cycle the *selected* meshes' drawing mode — Helium's per-mesh set: none / solid / wireframe / wireframe-over-solid / point |
 | C                   | Save a screenshot next to the exe (GL only) |
 | ESC / close window  | Quit            |
 

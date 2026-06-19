@@ -199,6 +199,8 @@ inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
     };
 
     int               vertexCount = 0, faceCount = 0, ix = -1, iy = -1, iz = -1;
+    int               inx = -1, iny = -1, inz = -1;  // normals (optional)
+    int               ir = -1, ig = -1, ib = -1;     // colors (optional)
     std::vector<Prop> vprops;
     Prop              faceProp;
     bool              haveFace = false;
@@ -228,9 +230,16 @@ inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
             } else if (curElem == "vertex") {
                 std::string nm; ss >> nm;
                 Prop p; mapType(t1, p.kind, p.size); vprops.push_back(p);
-                if (nm == "x") ix = static_cast<int>(vprops.size()) - 1;
-                else if (nm == "y") iy = static_cast<int>(vprops.size()) - 1;
-                else if (nm == "z") iz = static_cast<int>(vprops.size()) - 1;
+                int idx = static_cast<int>(vprops.size()) - 1;
+                if (nm == "x") ix = idx;
+                else if (nm == "y") iy = idx;
+                else if (nm == "z") iz = idx;
+                else if (nm == "nx") inx = idx;
+                else if (nm == "ny") iny = idx;
+                else if (nm == "nz") inz = idx;
+                else if (nm == "red")   ir = idx;
+                else if (nm == "green") ig = idx;
+                else if (nm == "blue")  ib = idx;
             }
         } else if (kw == "end_header") {
             break;
@@ -261,15 +270,40 @@ inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
     };
 
     std::vector<V3> pos(vertexCount);
+    std::vector<V3> nrm(vertexCount, V3{0, 0, 0});
+    std::vector<V3> col(vertexCount, V3{-1, -1, -1});  // -1 => no color
     for (int v = 0; v < vertexCount; ++v)
         for (size_t i = 0; i < vprops.size(); ++i) {
             double val;
             if (fmt == ASCII) { if (!(f >> val)) return false; }
             else              val = readVal(vprops[i]);
-            if (static_cast<int>(i) == ix) pos[v].x = static_cast<float>(val);
-            else if (static_cast<int>(i) == iy) pos[v].y = static_cast<float>(val);
-            else if (static_cast<int>(i) == iz) pos[v].z = static_cast<float>(val);
+            int ii = static_cast<int>(i);
+            float fv = static_cast<float>(val);
+            if (ii == ix) pos[v].x = fv;
+            else if (ii == iy) pos[v].y = fv;
+            else if (ii == iz) pos[v].z = fv;
+            else if (ii == inx) nrm[v].x = fv;
+            else if (ii == iny) nrm[v].y = fv;
+            else if (ii == inz) nrm[v].z = fv;
+            else if (ii == ir) col[v].x = fv / 255.0f;
+            else if (ii == ig) col[v].y = fv / 255.0f;
+            else if (ii == ib) col[v].z = fv / 255.0f;
         }
+
+    // No faces -> a point cloud: emit one (non-indexed) vertex per point, colored
+    // by its PLY color if present, else by its normal. spawnMesh draws it as points.
+    if (!haveFace || faceCount == 0) {
+        outV.resize(vertexCount);
+        for (int v = 0; v < vertexCount; ++v) {
+            if (col[v].x >= 0.0f) {
+                outV[v] = {{pos[v].x, pos[v].y, pos[v].z}, {col[v].x, col[v].y, col[v].z}};
+            } else {
+                outV[v] = vert(pos[v], normOrUp(nrm[v]));  // normal -> color
+            }
+        }
+        outI.clear();
+        return !outV.empty();
+    }
 
     std::vector<uint32_t> tris;
     if (haveFace) {

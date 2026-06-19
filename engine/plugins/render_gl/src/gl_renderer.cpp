@@ -23,6 +23,7 @@ void main() {
     vColor = aColor;
     vUV = aUV;
     gl_Position = uViewProj * uModel * vec4(aPos, 1.0);
+    gl_PointSize = 6.0;  // used only for point-cloud (sphere-imposter) draws
 }
 )";
 
@@ -31,9 +32,19 @@ in vec3 vColor;
 in vec2 vUV;
 uniform sampler2D uTex;
 uniform vec4 uForceColor;  // .a > 0 => draw this solid color (wireframe-over-solid edges)
+uniform int  uPointMode;   // 1 => render the point sprite as a shaded sphere imposter
 out vec4 FragColor;
 void main() {
     if (uForceColor.a > 0.0) { FragColor = vec4(uForceColor.rgb, 1.0); return; }
+    if (uPointMode == 1) {
+        vec2 d = gl_PointCoord * 2.0 - 1.0;  // [-1,1] across the sprite
+        float r2 = dot(d, d);
+        if (r2 > 1.0) discard;               // round, not square
+        vec3 N = vec3(d.x, -d.y, sqrt(1.0 - r2));            // sphere normal
+        float diff = max(dot(N, normalize(vec3(0.4, 0.7, 0.6))), 0.0) * 0.75 + 0.25;
+        FragColor = vec4(vColor * diff, 1.0);
+        return;
+    }
     FragColor = texture(uTex, vUV) * vec4(vColor, 1.0);
 }
 )";
@@ -229,9 +240,11 @@ bool GLRenderer::buildProgram() {
     uModel_      = glGetUniformLocation(program_, "uModel");
     uTex_        = glGetUniformLocation(program_, "uTex");
     uForceColor_ = glGetUniformLocation(program_, "uForceColor");
+    uPointMode_  = glGetUniformLocation(program_, "uPointMode");
     glUseProgram(program_);
     glUniform1i(uTex_, 0);  // sampler uses texture unit 0
     glUniform4f(uForceColor_, 0.0f, 0.0f, 0.0f, 0.0f);  // disabled by default
+    glUniform1i(uPointMode_, 0);
     return true;
 }
 
@@ -384,6 +397,7 @@ render::MeshHandle GLRenderer::createMesh(const render::MeshDesc& desc) {
         mesh.indexed = false;
         mesh.count   = static_cast<int>(desc.vertexCount);
     }
+    mesh.points = (desc.topology == render::PrimitiveTopology::Points);
 
     glBindVertexArray(0);
 
@@ -406,7 +420,8 @@ void GLRenderer::beginFrame(const render::FrameContext& frame) {
     glViewport(0, 0, static_cast<GLsizei>(frame.width), static_cast<GLsizei>(frame.height));
     glClearColor(frame.clearColor[0], frame.clearColor[1], frame.clearColor[2],
                  frame.clearColor[3]);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glStencilMask(0xFF);  // ensure stencil clears
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
     // viewProj = proj * view (column-major multiply).
     const float* a = frame.proj;
@@ -454,6 +469,54 @@ void GLRenderer::submit(const render::DrawItem& item) {
         else
             glDrawArrays(GL_TRIANGLES, 0, mesh.count);
     };
+
+    // Point cloud -> sphere-imposter point sprites (the fragment shader rounds and
+    // shades them). Independent of the triangle draw modes.
+    if (mesh.points) {
+        glEnable(GL_PROGRAM_POINT_SIZE);
+        glUniform1i(uPointMode_, 1);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        glDrawArrays(GL_POINTS, 0, mesh.count);
+        glUniform1i(uPointMode_, 0);
+        glDisable(GL_PROGRAM_POINT_SIZE);
+        return;
+    }
+
+    // Selection stencil mask: a solid pass that writes only the stencil (ref 1),
+    // marking the mesh's footprint. Cleared first so overlapping selections don't
+    // clip each other.
+    if (item.stencilMask) {
+        glStencilMask(0xFF);
+        glClear(GL_STENCIL_BUFFER_BIT);
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_ALWAYS, 1, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glDisable(GL_DEPTH_TEST);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        draw();
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glEnable(GL_DEPTH_TEST);
+        return;  // stencil test stays on for the outline pass that follows
+    }
+
+    // Selection silhouette: an enlarged copy drawn only where stencil != 1 (outside
+    // the footprint), in a solid outline color -> a thin border for any mesh shape.
+    if (item.outline) {
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_NOTEQUAL, 1, 0xFF);
+        glStencilMask(0x00);  // test only, don't write
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+        glDisable(GL_DEPTH_TEST);
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        glUniform4f(uForceColor_, 1.0f, 0.55f, 0.1f, 1.0f);  // selection orange
+        draw();
+        glUniform4f(uForceColor_, 0.0f, 0.0f, 0.0f, 0.0f);
+        glDisable(GL_STENCIL_TEST);
+        glStencilMask(0xFF);
+        glEnable(GL_DEPTH_TEST);
+        return;
+    }
 
     // Drawing modes mirror Helium's Renderable::DrawImplementation.
     switch (drawMode_) {

@@ -41,6 +41,7 @@ bool Window::create(const std::string& title, uint32_t width, uint32_t height,
                             SDL_GL_CONTEXT_PROFILE_CORE);
         SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
         SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);  // selection-outline stencil
         flags |= SDL_WINDOW_OPENGL;
     } else if (backend == render::Backend::Vulkan) {
         flags |= SDL_WINDOW_VULKAN;

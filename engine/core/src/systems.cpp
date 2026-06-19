@@ -7,6 +7,7 @@
 
 #include "orange/core/debug_draw.h"
 #include "orange/core/draw_mode.h"
+#include "orange/core/geometry.h"
 #include "orange/core/math.h"
 #include "orange/core/modes.h"
 #include "orange/ecs/components.h"
@@ -786,6 +787,56 @@ void menuBarInputSystem(entt::registry& world, core::Input& input,
     }
 }
 
+bool entityVisibleOnScreen(entt::registry& world, entt::entity e, uint32_t viewportW,
+                           uint32_t viewportH) {
+    if (!world.all_of<Transform, Renderable>(e) || viewportW == 0 || viewportH == 0)
+        return false;
+    // Not drawn (hidden or None draw mode) counts as not visible.
+    const auto& rr = world.get<Renderable>(e);
+    if (!rr.visible || rr.mesh == render::kInvalidMesh || rr.drawMode == core::DrawMode::None)
+        return false;
+
+    const Transform* camT = nullptr;
+    const Camera*    cam  = nullptr;
+    auto cams = world.view<Transform, Camera>();
+    for (auto ce : cams) {
+        if (cams.get<Camera>(ce).primary) {
+            camT = &cams.get<Transform>(ce);
+            cam  = &cams.get<Camera>(ce);
+            break;
+        }
+    }
+    if (!camT || !cam) return false;
+
+    float aspect = static_cast<float>(viewportW) / static_cast<float>(viewportH);
+    Eigen::Matrix4f proj =
+        cam->mode == ProjectionMode::Orthographic
+            ? math::ortho(-aspect * cam->orthoSize, aspect * cam->orthoSize, -cam->orthoSize,
+                          cam->orthoSize, cam->zNear, cam->zFar)
+            : math::perspective(cam->fovYDegrees * 3.14159265f / 180.0f, aspect, cam->zNear,
+                                cam->zFar);
+    Eigen::Vector3f fwd = math::rotate(camT->orientation, Eigen::Vector3f(0, 0, -1));
+    Eigen::Vector3f up  = math::rotate(camT->orientation, Eigen::Vector3f(0, 1, 0));
+    Eigen::Matrix4f view = math::lookAt(camT->position, camT->position + fwd, up);
+
+    // Same transform chain as the renderer: proj * view * Mworld * (T*R*S).
+    Eigen::Matrix4f clip = proj * view * worldUpMatrix(worldZUp(world)) *
+                           world.get<Transform>(e).matrix();
+    const auto& r = world.get<Renderable>(e);
+    const Eigen::Vector3f& mn = r.boundsMin;
+    const Eigen::Vector3f& mx = r.boundsMax;
+    for (int i = 0; i < 8; ++i) {
+        Eigen::Vector4f corner((i & 1) ? mx.x() : mn.x(), (i & 2) ? mx.y() : mn.y(),
+                               (i & 4) ? mx.z() : mn.z(), 1.0f);
+        Eigen::Vector4f c = clip * corner;
+        if (c.w() <= 1e-6f) continue;  // behind the camera
+        float x = c.x() / c.w(), y = c.y() / c.w(), z = c.z() / c.w();
+        if (x >= -1.0f && x <= 1.0f && y >= -1.0f && y <= 1.0f && z >= -1.0f && z <= 1.0f)
+            return true;
+    }
+    return false;
+}
+
 void pickingSystem(entt::registry& world, const core::Input& input,
                    uint32_t viewportW, uint32_t viewportH) {
     // Only act on a fresh left-click that no UI widget already consumed.
@@ -826,11 +877,15 @@ void pickingSystem(entt::registry& world, const core::Input& input,
                                up * (ndcY * tanHalf));
     }
 
-    // Content is rendered as Mworld * T*R*S, so undo the world up-axis basis on
-    // the ray before the per-entity inverse(T*R*S) below.
+    // Keep the world-space ray (camera position + normalized direction) so hits
+    // on different entities are compared by true distance, not per-entity local
+    // units. Content is rendered as Mworld * T*R*S, so undo the world up-axis
+    // basis on the ray before the per-entity inverse(T*R*S) below.
+    Eigen::Vector3f rayOW = rayO, rayDW = rayD;
     Eigen::Quaternionf mwInv = math::conjugate(worldUpQuat(worldZUp(world)));
     rayO = math::rotate(mwInv, rayO);
     rayD = math::rotate(mwInv, rayD);
+    const Eigen::Matrix4f Mworld = worldUpMatrix(worldZUp(world));
 
     // Test every drawable; keep the nearest hit along the ray.
     entt::entity best = entt::null;
@@ -839,7 +894,10 @@ void pickingSystem(entt::registry& world, const core::Input& input,
     for (auto e : drawables) {
         const auto& t = drawables.get<Transform>(e);
         const auto& r = drawables.get<Renderable>(e);
-        if (!r.visible || r.mesh == render::kInvalidMesh) continue;
+        // Skip what isn't drawn -- you can't pick an invisible (None-mode) mesh.
+        if (!r.visible || r.mesh == render::kInvalidMesh ||
+            r.drawMode == core::DrawMode::None)
+            continue;
 
         // Transform the ray into the entity's local space: inverse(T*R*S) =
         // S^-1 * R^-1 * T^-1. Scale is applied component-wise.
@@ -852,19 +910,50 @@ void pickingSystem(entt::registry& world, const core::Input& input,
         lo = lo.cwiseProduct(inv);
         ld = ld.cwiseProduct(inv);
 
-        float tHit;
-        if (intersectAABB(lo, ld, r.boundsMin, r.boundsMax, tHit) && tHit < bestT) {
-            bestT = tHit;
+        // Accurate triangle pick when CPU geometry is available, else the AABB.
+        float tLocal = 0.0f;
+        bool hit = false;
+        if (const PickGeometry* pg = world.try_get<PickGeometry>(e)) {
+            geometry::Ray ray(lo, ld);
+            float bestLocal = 1e30f;
+            for (size_t i = 0; i + 2 < pg->indices.size(); i += 3) {
+                const Eigen::Vector3f& a = pg->positions[pg->indices[i]];
+                const Eigen::Vector3f& b = pg->positions[pg->indices[i + 1]];
+                const Eigen::Vector3f& c = pg->positions[pg->indices[i + 2]];
+                float tt;
+                if (ray.intersectTriangle(a, b, c, tt) && tt >= 0.0f && tt < bestLocal) {
+                    bestLocal = tt;
+                    hit = true;
+                }
+            }
+            tLocal = bestLocal;
+        } else {
+            hit = intersectAABB(lo, ld, r.boundsMin, r.boundsMax, tLocal);
+        }
+        if (!hit) continue;
+
+        // Project the local hit back to world space and compare true distance.
+        Eigen::Vector3f localHit = lo + ld * tLocal;
+        Eigen::Vector4f wh =
+            Mworld * t.matrix() * Eigen::Vector4f(localHit.x(), localHit.y(), localHit.z(), 1.0f);
+        float tWorld = (Eigen::Vector3f(wh.x(), wh.y(), wh.z()) - rayOW).dot(rayDW);
+        if (tWorld > 0.0f && tWorld < bestT) {
+            bestT = tWorld;
             best  = e;
         }
     }
 
-    // Single-select: clear previous selection, mark the hit (if any).
-    for (auto e : drawables) drawables.get<Renderable>(e).selected = false;
-    if (best != entt::null) {
-        drawables.get<Renderable>(best).selected = true;
-        std::printf("picked entity %u\n", static_cast<unsigned>(best));
-        std::fflush(stdout);
+    if (input.ctrl) {
+        // Ctrl-click toggles the hit's selection and keeps the rest (multi-select);
+        // an empty Ctrl-click leaves the current selection untouched.
+        if (best != entt::null) {
+            auto& r = drawables.get<Renderable>(best);
+            r.selected = !r.selected;
+        }
+    } else {
+        // Plain click single-selects: clear all, mark the hit (empty click clears).
+        for (auto e : drawables) drawables.get<Renderable>(e).selected = false;
+        if (best != entt::null) drawables.get<Renderable>(best).selected = true;
     }
 }
 
@@ -1128,34 +1217,72 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     // frame (not the camera) changes when the gizmo toggles Y/Z up.
     const Eigen::Matrix4f Mworld = worldUpMatrix(worldZUp(world));
 
-    // Apply the scene draw mode (Tab cycles Helium's drawing modes) to the
-    // drawables only; reset to solid afterwards so debug geometry, grid and
-    // overlays stay filled.
-    uint32_t drawMode = static_cast<uint32_t>(core::DrawMode::Solid);
-    if (world.ctx().contains<core::DrawModeState>())
-        drawMode = static_cast<uint32_t>(world.ctx().get<core::DrawModeState>().mode);
-    renderer.setDrawMode(drawMode);
+    // Each mesh carries its own drawing mode (Tab cycles it for the selection).
+    // A selected mesh also gets a silhouette outline that reads as a thin border
+    // in *any* draw mode: draw the mesh, then a solid stencil footprint, then an
+    // enlarged copy drawn only outside that footprint (stencil != 1) -- so only a
+    // thin border ring shows. (Reset to solid after the loop so debug geometry,
+    // grid and overlays stay filled.)
+    const uint32_t kSolid = static_cast<uint32_t>(core::DrawMode::Solid);
 
     auto drawables = world.view<Transform, Renderable>();
     for (auto entity : drawables) {
         const auto& t = drawables.get<Transform>(entity);
         const auto& r = drawables.get<Renderable>(entity);
-        if (!r.visible || r.mesh == render::kInvalidMesh) continue;
+        // None draw mode == fully invisible: no visible pass and no silhouette.
+        if (!r.visible || r.mesh == render::kInvalidMesh ||
+            r.drawMode == core::DrawMode::None)
+            continue;
 
+        Eigen::Matrix4f model = Mworld * t.matrix();
+
+        // 1) Visible pass, in this mesh's own drawing mode.
+        renderer.setDrawMode(static_cast<uint32_t>(r.drawMode));
         render::DrawItem item;
         item.mesh = r.mesh;
-        // Selected entities pop slightly larger as a pick highlight (the render
-        // ABI carries no per-item tint, so scale stands in for it).
-        Eigen::Matrix4f model = r.selected
-                               ? math::translate(t.position) *
-                                     math::toMat4(t.orientation) *
-                                     math::scale(t.scale * 1.15f)
-                               : t.matrix();
-        model = Mworld * model;
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);
+
+        if (r.selected && r.pointCloud) {
+            // A point cloud has no solid surface for a stencil silhouette, so mark
+            // selection with a clean bounding-box wireframe instead. Compute it in
+            // content space (T*R*S, *not* Mworld) -- drawDebugGeometry applies Mworld
+            // itself, so folding it in here would double-apply on the Z-up toggle.
+            const Eigen::Matrix4f cm = t.matrix();
+            Eigen::Vector3f bmin = Eigen::Vector3f::Constant(1e30f);
+            Eigen::Vector3f bmax = Eigen::Vector3f::Constant(-1e30f);
+            for (int c = 0; c < 8; ++c) {
+                Eigen::Vector4f corner((c & 1) ? r.boundsMax.x() : r.boundsMin.x(),
+                                       (c & 2) ? r.boundsMax.y() : r.boundsMin.y(),
+                                       (c & 4) ? r.boundsMax.z() : r.boundsMin.z(), 1.0f);
+                Eigen::Vector4f w = cm * corner;
+                bmin = bmin.cwiseMin(w.head<3>());
+                bmax = bmax.cwiseMax(w.head<3>());
+            }
+            float thick = (bmax - bmin).norm() * 0.0015f;
+            debug::DebugDraw::instance().addWireBox(bmin, bmax, {1.0f, 0.55f, 0.1f}, thick);
+        } else if (r.selected) {
+            // 2) Solid stencil footprint (marks where the mesh is, so the outline
+            //    rings the silhouette regardless of the draw mode or mesh shape).
+            render::DrawItem mask;
+            mask.mesh = r.mesh;
+            mask.stencilMask = true;
+            std::memcpy(mask.model, model.data(), sizeof(mask.model));
+            renderer.submit(mask);
+
+            // 3) Enlarged copy in the outline color, drawn only outside the stencil
+            //    footprint -> only the border shows.
+            Eigen::Matrix4f hull = Mworld * math::translate(t.position) *
+                                   math::toMat4(t.orientation) *
+                                   math::scale(t.scale * 1.05f);
+            render::DrawItem outline;
+            outline.mesh = r.mesh;
+            outline.outline = true;
+            std::memcpy(outline.model, hull.data(), sizeof(outline.model));
+            renderer.submit(outline);
+        }
     }
-    renderer.setDrawMode(static_cast<uint32_t>(core::DrawMode::Solid));  // scene only: rest stays solid
+    renderer.setDrawMode(kSolid);  // scene only: rest stays solid
 
     // --- Immediate-mode debug geometry (world space, behind the grid) --
     drawDebugGeometry(world, renderer, Mworld);

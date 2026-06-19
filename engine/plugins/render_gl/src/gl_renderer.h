@@ -20,6 +20,7 @@ struct GLMesh {
     unsigned int vao     = 0;
     int          count   = 0;  // index count if indexed, else vertex count
     bool         indexed = false;
+    bool         points  = false;  // point cloud -> draw as sphere-imposter points
 };
 
 class GLRenderer final : public render::IRenderer {
@@ -60,6 +61,7 @@ private:
     int          uModel_      = -1;
     int          uTex_        = -1;
     int          uForceColor_ = -1;  // wireframe-over-solid edge color override
+    int          uPointMode_  = -1;  // sphere-imposter point rendering
     uint32_t     width_  = 0;
     uint32_t     height_ = 0;
     uint32_t     drawMode_ = 0;  // 0 = fill, 1 = wireframe (see setDrawMode)

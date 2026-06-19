@@ -33,6 +33,7 @@ struct VkMesh {
     uint32_t             vertexCount  = 0;
     uint32_t             indexCount   = 0;
     bool                 indexed      = false;
+    bool                 points       = false;  // point cloud -> sphere-imposter points
 };
 
 // Minimal Vulkan backend: brings up instance/device/swapchain and clears +
@@ -92,7 +93,7 @@ private:
     VkImage        depthImage_  = VK_NULL_HANDLE;
     VkDeviceMemory depthMemory_ = VK_NULL_HANDLE;
     VkImageView    depthView_   = VK_NULL_HANDLE;
-    VkFormat       depthFormat_ = VK_FORMAT_D32_SFLOAT;
+    VkFormat       depthFormat_ = VK_FORMAT_D24_UNORM_S8_UINT;  // depth + stencil (outline)
 
     // Graphics pipeline for mesh rendering (built lazily from the first mesh's
     // vertex layout; all appOrange meshes share the same layout).
@@ -100,6 +101,9 @@ private:
     VkPipeline       pipeline_       = VK_NULL_HANDLE;  // solid (fill, slight depth bias)
     VkPipeline       pipelineWireframe_ = VK_NULL_HANDLE;  // line polygon mode
     VkPipeline       pipelinePoint_     = VK_NULL_HANDLE;  // point polygon mode
+    VkPipeline       pipelineOutline_   = VK_NULL_HANDLE;  // enlarged, stencil!=1 (silhouette)
+    VkPipeline       pipelineStencilMask_ = VK_NULL_HANDLE;  // solid, writes stencil ref 1 only
+    VkPipeline       pipelinePoints_      = VK_NULL_HANDLE;  // POINT_LIST sphere imposters
     uint32_t         drawMode_ = 1;  // Helium DrawingMode (0=none..4=point)
 
     // Infinite-grid pipeline: a vertex-less full-screen pass (own layout with a

@@ -2,9 +2,12 @@
 
 #include <SDL3/SDL.h>
 
+#include <vector>
+
 #include "orange/core/draw_mode.h"
 #include "orange/core/modes.h"
 #include "orange/core/screenshot.h"
+#include "orange/ecs/components.h"
 #include "orange/ecs/systems.h"
 
 namespace orange::core {
@@ -83,14 +86,15 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                 case SDL_EVENT_KEY_DOWN:
                     if (e.key.key == SDLK_ESCAPE) running_ = false;
                     if (e.key.scancode == SDL_SCANCODE_C) capture_ = true;  // screenshot
-                    if (e.key.scancode == SDL_SCANCODE_TAB) {               // cycle draw mode
-                        auto& ctx = world_.ctx();
-                        if (!ctx.contains<DrawModeState>()) ctx.emplace<DrawModeState>();
-                        auto& dm = ctx.get<DrawModeState>();
-                        dm.mode = static_cast<DrawMode>(
-                            (static_cast<uint32_t>(dm.mode) + 1) %
-                            static_cast<uint32_t>(DrawMode::Count));
-                        SDL_Log("Application: draw mode = %s", to_string(dm.mode));
+                    if (e.key.scancode == SDL_SCANCODE_TAB) {  // cycle each selected mesh's draw mode
+                        auto v = world_.view<ecs::Renderable>();
+                        for (auto ent : v) {
+                            auto& r = v.get<ecs::Renderable>(ent);
+                            if (!r.selected) continue;
+                            r.drawMode = static_cast<DrawMode>(
+                                (static_cast<uint32_t>(r.drawMode) + 1) %
+                                static_cast<uint32_t>(DrawMode::Count));
+                        }
                     }
                     if (e.key.scancode == SDL_SCANCODE_M) {                 // cycle processing mode
                         auto& ctx = world_.ctx();
@@ -99,6 +103,35 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                         ms.index = (ms.index + 1) % modes::modeCount();
                         ms.generation++;
                         SDL_Log("Application: processing mode = %s", modes::modeName(ms.index));
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_A && (e.key.mod & SDL_KMOD_CTRL)) {
+                        // Ctrl+A: select every Renderable that is visible on screen.
+                        auto v = world_.view<ecs::Renderable>();
+                        for (auto ent : v)
+                            if (ecs::entityVisibleOnScreen(world_, ent, window_.width(),
+                                                           window_.height()))
+                                v.get<ecs::Renderable>(ent).selected = true;
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_DELETE) {
+                        // Delete the selected meshes (collect first, then destroy).
+                        std::vector<entt::entity> dead;
+                        auto v = world_.view<ecs::Renderable>();
+                        for (auto ent : v)
+                            if (v.get<ecs::Renderable>(ent).selected) dead.push_back(ent);
+                        for (auto ent : dead) world_.destroy(ent);
+                        if (!dead.empty())
+                            SDL_Log("Application: deleted %zu mesh(es)", dead.size());
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_H) {
+                        // Unhide all: reveal meshes hidden by the None draw mode so
+                        // they can be seen and selected again.
+                        int n = 0;
+                        auto v = world_.view<ecs::Renderable>();
+                        for (auto ent : v) {
+                            auto& r = v.get<ecs::Renderable>(ent);
+                            if (r.drawMode == DrawMode::None) { r.drawMode = DrawMode::Solid; ++n; }
+                        }
+                        if (n) SDL_Log("Application: revealed %d hidden mesh(es)", n);
                     }
                     break;
                 case SDL_EVENT_MOUSE_MOTION: {
@@ -145,6 +178,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         last = now;
 
         input_.shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
+        input_.ctrl  = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
 
         if (onUpdate) onUpdate(world_, dt);
         ecs::menuBarInputSystem(world_, input_, window_.width(), window_.height());

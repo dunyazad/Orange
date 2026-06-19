@@ -46,6 +46,12 @@ void menuBarInputSystem(entt::registry& world, core::Input& input,
 void pickingSystem(entt::registry& world, const core::Input& input,
                    uint32_t viewportW, uint32_t viewportH);
 
+// True if entity `e` (Transform + Renderable) projects inside the primary
+// camera's viewport — i.e. it is actually visible on screen. Used to stop
+// off-screen meshes from being selected (e.g. by Ctrl+A).
+bool entityVisibleOnScreen(entt::registry& world, entt::entity e,
+                           uint32_t viewportW, uint32_t viewportH);
+
 // Runs the active point-cloud processing mode (modes::ModeState in ctx) on the
 // input cloud (modes::ModeInput in ctx) and emits its visualization into the
 // debug-draw accumulator. Recomputes only when the selected mode changes; no-op
