@@ -1,15 +1,22 @@
-# Core engine: platform layer (SDL3), plugin loader, and the EnTT-based ECS.
+# Core engine: platform layer (SDL3), plugin loader, the EnTT-based ECS, and the
+# CPU geometry toolkit (sparse grid, TSDF voxels, surface extraction).
 add_library(orange_core STATIC
     src/plugin_loader.cpp
     src/window.cpp
     src/systems.cpp
     src/application.cpp
     src/screenshot.cpp
-    src/console.cpp)
+    src/console.cpp
+    src/geometry/sparse_grid.cpp
+    src/geometry/sparse_data_block.cpp
+    src/geometry/mesh_generation.cpp
+    src/io/serialization.cpp
+    src/modes/modes.cpp)
 add_library(orange::core ALIAS orange_core)
 
 target_include_directories(orange_core PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party")  # robin_hood (header-only)
 target_include_directories(orange_core PRIVATE ${STB_INCLUDE_DIR})  # stb_image_write
 
 # Eigen backs orange/core/math.h (a public header), so it must be on the public

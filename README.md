@@ -18,16 +18,22 @@ core never links against OpenGL or Vulkan directly.
 
 ```
 app/appOrange ───────────┐  loads at runtime (dlopen / LoadLibrary)
-                         │
+   (a thin consumer)      │
 engine/core  ── ECS (EnTT), window (SDL3), plugin loader, app loop
    │  depends on
    ▼
 engine/render_api  ── IRenderer interface + C ABI contract (no GL/VK/SDL)
    ▲  implements
    │
-plugins/render_gl  ── OpenGL 3.3 backend  (render_gl.dll / librender_gl.so)
-plugins/render_vk  ── Vulkan backend      (render_vk.dll / librender_vk.so)
+engine/plugins/render_gl  ── OpenGL 3.3 backend  (render_gl.dll / librender_gl.so)
+engine/plugins/render_vk  ── Vulkan backend      (render_vk.dll / librender_vk.so)
 ```
+
+The **engine** (`engine/`: core + render plugins) is the reusable half and never
+depends on any app. **Apps** (`app/<name>/`) are thin consumers built with
+`orange_add_app()` that link only `orange::core` + SDL3, so one engine can host
+many purpose-built apps. The top-level CMake is a superbuild:
+`add_subdirectory(engine)` then one `add_subdirectory` per app.
 
 The plugin contract lives in `engine/render_api/include/orange/render/`:
 
@@ -88,11 +94,13 @@ are drawn this way — a text atlas sampled by one quad per face.
 ## Layout
 
 ```
-engine/render_api/   interface-only contract (header library)
-engine/core/         platform layer + ECS (components, systems, app loop)
-plugins/render_gl/   OpenGL backend plugin
-plugins/render_vk/   Vulkan backend plugin (built only if the Vulkan SDK exists)
-app/appOrange/       demo app: spinning cubes via ECS
+engine/                  the reusable engine (add_subdirectory(engine))
+  render_api/            interface-only contract (header library)
+  core/                  platform layer + ECS (components, systems, app loop)
+  plugins/render_gl/     OpenGL backend plugin
+  plugins/render_vk/     Vulkan backend plugin (built only if the Vulkan SDK exists)
+  cmake/OrangeApp.cmake  orange_add_app() helper for building apps on the engine
+app/appOrange/           demo app: spinning cubes via ECS (a thin orange_add_app)
 ```
 
 ## Build
@@ -125,6 +133,8 @@ A trackball camera (`CameraManipulator` component) orbits the scene:
 | Mouse wheel         | Zoom (distance) |
 | Middle-drag         | Pan (move target) |
 | Left-click          | Pick the nearest entity under the cursor (`pickingSystem`); the hit pops slightly larger |
+| Tab                 | Cycle the scene drawing mode — Helium's set: none / solid / wireframe / wireframe-over-solid / point (`IRenderer::setDrawMode`) |
+| C                   | Save a screenshot next to the exe (GL only) |
 | ESC / close window  | Quit            |
 
 The FPS widget (top-left) has a **VSYNC** checkbox that toggles vsync at runtime

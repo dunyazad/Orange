@@ -65,6 +65,15 @@ public:
     // present mode on the next frame.
     virtual void setVsync(bool enabled) = 0;
 
+    // Sets the drawing mode for subsequent mesh submit()s, mirroring Helium's
+    // Renderable DrawingMode: 0 = none (skip), 1 = solid, 2 = wireframe,
+    // 3 = wireframe-over-solid (shaded fill + edges on top), 4 = point. GL drives
+    // glPolygonMode (+ point size, polygon offset); Vulkan binds the matching
+    // pipeline (fill / line / point) and double-draws for mode 3. The host scopes
+    // this to scene meshes (it resets to solid before the grid and overlays), so
+    // it does not affect drawGrid() or overlay passes.
+    virtual void setDrawMode(uint32_t mode) = 0;
+
     // Capture --------------------------------------------------------------
     // Reads the last presented frame into `out` as top-left-origin RGBA8.
     // Returns false if unsupported. Call after endFrame().

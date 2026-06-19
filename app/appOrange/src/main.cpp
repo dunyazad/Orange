@@ -185,23 +185,23 @@ void buildLabelAtlas(const std::vector<unsigned char>& ttf, std::vector<uint8_t>
 
 // One textured quad per gizmo face, with UVs into the atlas cell for that face.
 void buildLabelQuads(std::vector<render::Vertex>& verts, std::vector<uint32_t>& idx) {
-    using math::Vec3;
-    struct LabelFace { Vec3 n, rt, up; };
+    using Eigen::Vector3f;
+    struct LabelFace { Vector3f n, rt, up; };
     const LabelFace faces[6] = {
-        {Vec3(1, 0, 0),  Vec3(0, 0, -1), Vec3(0, 1, 0)},   // X
-        {Vec3(-1, 0, 0), Vec3(0, 0, 1),  Vec3(0, 1, 0)},   // -X
-        {Vec3(0, 1, 0),  Vec3(1, 0, 0),  Vec3(0, 0, 1)},   // Y
-        {Vec3(0, -1, 0), Vec3(1, 0, 0),  Vec3(0, 0, -1)},  // -Y
-        {Vec3(0, 0, 1),  Vec3(1, 0, 0),  Vec3(0, 1, 0)},   // Z
-        {Vec3(0, 0, -1), Vec3(-1, 0, 0), Vec3(0, 1, 0)},   // -Z
+        {Vector3f(1, 0, 0),  Vector3f(0, 0, -1), Vector3f(0, 1, 0)},   // X
+        {Vector3f(-1, 0, 0), Vector3f(0, 0, 1),  Vector3f(0, 1, 0)},   // -X
+        {Vector3f(0, 1, 0),  Vector3f(1, 0, 0),  Vector3f(0, 0, 1)},   // Y
+        {Vector3f(0, -1, 0), Vector3f(1, 0, 0),  Vector3f(0, 0, -1)},  // -Y
+        {Vector3f(0, 0, 1),  Vector3f(1, 0, 0),  Vector3f(0, 1, 0)},   // Z
+        {Vector3f(0, 0, -1), Vector3f(-1, 0, 0), Vector3f(0, 1, 0)},   // -Z
     };
     const float hw = 0.55f, hh = 0.55f, out = 1.05f;  // square quad (square atlas cell)
     for (int c = 0; c < 6; ++c) {
         const LabelFace& f = faces[c];
-        Vec3 C = f.n * out;
+        Vector3f C = f.n * out;
         float u0 = static_cast<float>(c) / kCells, u1 = static_cast<float>(c + 1) / kCells;
         // top-left, top-right, bottom-right, bottom-left  (v=0 is the atlas top)
-        Vec3 p[4] = {C - f.rt * hw + f.up * hh, C + f.rt * hw + f.up * hh,
+        Vector3f p[4] = {C - f.rt * hw + f.up * hh, C + f.rt * hw + f.up * hh,
                      C + f.rt * hw - f.up * hh, C - f.rt * hw - f.up * hh};
         float uv[4][2] = {{u0, 0}, {u1, 0}, {u1, 1}, {u0, 1}};
         uint32_t base = static_cast<uint32_t>(verts.size());
@@ -302,9 +302,9 @@ int main(int argc, char** argv) {
         c.primary = true;
         world.emplace<ecs::Camera>(cam, c);
         ecs::CameraManipulator manip;
-        manip.target      = math::Vec3(0.0f, 0.0f, 0.0f);
+        manip.target      = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
         manip.distance    = 7.0f;
-        manip.orientation = math::quatAxisAngle(math::Vec3(1, 0, 0), -0.3f);  // tilt down slightly
+        manip.orientation = math::quatAxisAngle(Eigen::Vector3f(1, 0, 0), -0.3f);  // tilt down slightly
         world.emplace<ecs::CameraManipulator>(cam, manip);
     }
 
@@ -581,15 +581,15 @@ int main(int argc, char** argv) {
             SDL_Log("Mesh: failed to load '%s'", path.c_str());
             return;
         }
-        math::Vec3 mn(mv[0].position[0], mv[0].position[1], mv[0].position[2]);
-        math::Vec3 mx = mn;
+        Eigen::Vector3f mn(mv[0].position[0], mv[0].position[1], mv[0].position[2]);
+        Eigen::Vector3f mx = mn;
         for (const auto& v : mv) {
-            math::Vec3 p(v.position[0], v.position[1], v.position[2]);
+            Eigen::Vector3f p(v.position[0], v.position[1], v.position[2]);
             mn = mn.cwiseMin(p);
             mx = mx.cwiseMax(p);
         }
-        math::Vec3 center = (mn + mx) * 0.5f;
-        math::Vec3 size   = mx - mn;
+        Eigen::Vector3f center = (mn + mx) * 0.5f;
+        Eigen::Vector3f size   = mx - mn;
         float      ext    = (std::max)({size.x(), size.y(), size.z()});
         float      sf     = ext > 1e-6f ? 3.0f / ext : 1.0f;  // fit to ~3 world units
         for (auto& v : mv) {                                  // recenter on origin
@@ -611,7 +611,7 @@ int main(int argc, char** argv) {
 
         auto e = world.create();
         ecs::Transform t;
-        t.scale = math::Vec3(sf, sf, sf);
+        t.scale = Eigen::Vector3f(sf, sf, sf);
         world.emplace<ecs::Transform>(e, t);
         ecs::Renderable r;
         r.mesh      = mesh;
@@ -650,6 +650,7 @@ int main(int argc, char** argv) {
     };
 
     SDL_Log("appOrange: running. File > Open... loads a mesh (OBJ/STL).");
+    SDL_Log("appOrange: Tab = drawing mode (none/solid/wire/wire+solid/point).");
     SDL_Log("appOrange: ESC or close the window to quit.");
     app.run(onUpdate);  // onUpdate + spinSystem + renderSystem run each frame
     return 0;

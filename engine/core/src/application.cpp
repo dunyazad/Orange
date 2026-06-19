@@ -2,6 +2,8 @@
 
 #include <SDL3/SDL.h>
 
+#include "orange/core/draw_mode.h"
+#include "orange/core/modes.h"
 #include "orange/core/screenshot.h"
 #include "orange/ecs/systems.h"
 
@@ -81,6 +83,23 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                 case SDL_EVENT_KEY_DOWN:
                     if (e.key.key == SDLK_ESCAPE) running_ = false;
                     if (e.key.scancode == SDL_SCANCODE_C) capture_ = true;  // screenshot
+                    if (e.key.scancode == SDL_SCANCODE_TAB) {               // cycle draw mode
+                        auto& ctx = world_.ctx();
+                        if (!ctx.contains<DrawModeState>()) ctx.emplace<DrawModeState>();
+                        auto& dm = ctx.get<DrawModeState>();
+                        dm.mode = static_cast<DrawMode>(
+                            (static_cast<uint32_t>(dm.mode) + 1) %
+                            static_cast<uint32_t>(DrawMode::Count));
+                        SDL_Log("Application: draw mode = %s", to_string(dm.mode));
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_M) {                 // cycle processing mode
+                        auto& ctx = world_.ctx();
+                        if (!ctx.contains<modes::ModeState>()) ctx.emplace<modes::ModeState>();
+                        auto& ms = ctx.get<modes::ModeState>();
+                        ms.index = (ms.index + 1) % modes::modeCount();
+                        ms.generation++;
+                        SDL_Log("Application: processing mode = %s", modes::modeName(ms.index));
+                    }
                     break;
                 case SDL_EVENT_MOUSE_MOTION: {
                     // SDL reports mouse in logical points; the render viewport
@@ -135,6 +154,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         ecs::cameraManipulatorSystem(world_, input_, dt);
         ecs::pickingSystem(world_, input_, window_.width(), window_.height());
         ecs::spinSystem(world_, dt);
+        ecs::processingModeSystem(world_);  // emits the active mode's debug geometry
         ecs::renderSystem(world_, *plugin_->renderer(), window_.width(),
                           window_.height());
 

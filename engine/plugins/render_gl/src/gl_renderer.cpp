@@ -30,8 +30,10 @@ const char* kFragmentShader = R"(#version 330 core
 in vec3 vColor;
 in vec2 vUV;
 uniform sampler2D uTex;
+uniform vec4 uForceColor;  // .a > 0 => draw this solid color (wireframe-over-solid edges)
 out vec4 FragColor;
 void main() {
+    if (uForceColor.a > 0.0) { FragColor = vec4(uForceColor.rgb, 1.0); return; }
     FragColor = texture(uTex, vUV) * vec4(vColor, 1.0);
 }
 )";
@@ -223,11 +225,13 @@ bool GLRenderer::buildProgram() {
         return false;
     }
 
-    uViewProj_ = glGetUniformLocation(program_, "uViewProj");
-    uModel_    = glGetUniformLocation(program_, "uModel");
-    uTex_      = glGetUniformLocation(program_, "uTex");
+    uViewProj_   = glGetUniformLocation(program_, "uViewProj");
+    uModel_      = glGetUniformLocation(program_, "uModel");
+    uTex_        = glGetUniformLocation(program_, "uTex");
+    uForceColor_ = glGetUniformLocation(program_, "uForceColor");
     glUseProgram(program_);
     glUniform1i(uTex_, 0);  // sampler uses texture unit 0
+    glUniform4f(uForceColor_, 0.0f, 0.0f, 0.0f, 0.0f);  // disabled by default
     return true;
 }
 
@@ -442,11 +446,49 @@ void GLRenderer::submit(const render::DrawItem& item) {
 
     glUniformMatrix4fv(uModel_, 1, GL_FALSE, item.model);
     glBindVertexArray(mesh.vao);
-    if (mesh.indexed)
-        glDrawElements(GL_TRIANGLES, mesh.count, GL_UNSIGNED_INT, nullptr);
-    else
-        glDrawArrays(GL_TRIANGLES, 0, mesh.count);
+
+    // One geometry draw; the polygon mode is set per drawing mode below.
+    auto draw = [&]() {
+        if (mesh.indexed)
+            glDrawElements(GL_TRIANGLES, mesh.count, GL_UNSIGNED_INT, nullptr);
+        else
+            glDrawArrays(GL_TRIANGLES, 0, mesh.count);
+    };
+
+    // Drawing modes mirror Helium's Renderable::DrawImplementation.
+    switch (drawMode_) {
+        case 1:  // Solid
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            draw();
+            break;
+        case 2:  // WireFrame
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+            draw();
+            break;
+        case 3:  // WireFrameOverSolid: shaded fill (pushed back) + black edges on top
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(1.0f, 1.0f);
+            draw();
+            glDisable(GL_POLYGON_OFFSET_FILL);
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+            glUniform4f(uForceColor_, 0.0f, 0.0f, 0.0f, 1.0f);  // edges in solid black
+            draw();
+            glUniform4f(uForceColor_, 0.0f, 0.0f, 0.0f, 0.0f);  // back to vertex color
+            break;
+        case 4:  // Point
+            glPolygonMode(GL_FRONT_AND_BACK, GL_POINT);
+            glPointSize(3.0f);
+            draw();
+            glPointSize(1.0f);
+            break;
+        default:  // 0 = None: draw nothing
+            break;
+    }
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);  // restore for non-scene passes
 }
+
+void GLRenderer::setDrawMode(uint32_t mode) { drawMode_ = mode; }
 
 void GLRenderer::beginOverlay(const render::OverlayContext& ov) {
     // GL viewport/scissor use a bottom-left origin; flip the top-left rect.

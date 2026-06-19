@@ -21,15 +21,51 @@ app core never links GL/VK/SDL directly — it talks only to the abstract
 See `README.md` for the full architecture, the resource/buffer model, the axis
 gizmo (ViewCube), and the controls.
 
+## Geometry / IO / debug toolkit (ported from the Elements/Helium engine)
+
+CPU, Eigen-backed, CUDA-free utilities that live in `orange_core` (headers under
+`orange/core/`, sources under `engine/core/src/{geometry,io}/`):
+
+- **`orange::geometry`** — `Morton3D` (Z-order keys), `Ray`/`AABB`
+  (`geometry.h`), `SparseGrid` (hash grid; kNN + radius queries),
+  `SparseDataBlock` (8³-block TSDF fused from an oriented point cloud via
+  `fromPointsData`), and `generateMesh()` / `pointsToMesh()` — a dual-contouring
+  surface extractor (the **points-in → mesh-out** pipeline). `std::execution::par`
+  parallel; `marching_cubes_tables.h` holds the classic Bourke tables.
+- **`orange::io`** — `serialization.h`: multi-format mesh/point-cloud read+write
+  (XYZ/OFF/STL/OBJ/PLY/PTS/ALP/CSV) via `HSerializable`. `reconstructMeshFromFile()`
+  bridges a loaded point cloud into `pointsToMesh`. (appOrange's `mesh_io.h` is the
+  separate, render-facing OBJ/STL/PLY *loader* that fills `render::Vertex`.)
+- **`orange::color`** — `color.h`: named colors, HSV↔RGB, heatmap, maximin
+  contrasting palettes.
+- **`orange::debug`** — `debug_draw.h`: immediate-mode `DebugDraw` singleton
+  (`addLine/addBox/addWireBox/addSphere/addTriangle`). The renderSystem uploads
+  the accumulated triangles as one dynamic non-indexed mesh each frame, then
+  clears. Since the renderer has no line primitive, lines/wire boxes are emitted
+  as thin triangle tubes.
+- **Third-party:** `robin_hood` (header-only hash map) vendored under
+  `engine/third_party/` (used by `SparseGrid`).
+
 ## Layout
 
 ```
-engine/render_api/   interface-only C-ABI contract (header library) — no GL/VK/SDL
-engine/core/         platform layer + ECS (components, systems, app loop, window)
-plugins/render_gl/   OpenGL 3.3 backend plugin
-plugins/render_vk/   Vulkan backend plugin (built only if a Vulkan SDK is found)
-app/appOrange/       demo app: three spinning cubes via ECS (also hosts font/UI impl)
+engine/                  the reusable engine (CMake: add_subdirectory(engine))
+  render_api/            interface-only C-ABI contract (header library) — no GL/VK/SDL
+  core/                  platform layer + ECS (components, systems, app loop, window)
+  plugins/render_gl/     OpenGL 3.3 backend plugin
+  plugins/render_vk/     Vulkan backend plugin (built only if a Vulkan SDK is found)
+  cmake/OrangeApp.cmake  orange_add_app() — the entry point every app uses
+app/appOrange/           demo app: three spinning cubes via ECS (also hosts font/UI impl)
 ```
+
+**Engine / app split.** The top-level CMake is a thin superbuild: it fetches deps,
+then `add_subdirectory(engine)` (core + render plugins) and one `add_subdirectory`
+per app. The engine never depends on any app, so multiple apps can sit on one
+engine. An app is a thin consumer — `orange_add_app(<name> SOURCES ...)` links
+`orange::core` + SDL3, builds the render plugins alongside it, and (on Windows)
+copies SDL3.dll next to the exe. Apps talk only to `orange::core`, never GL/VK/SDL.
+To add an app: new `app/<name>/` with a one-line `orange_add_app()` + an
+`add_subdirectory(app/<name>)` in the root.
 
 ## Build & run
 
@@ -65,12 +101,22 @@ cmake --build D:/Library/Orange/build --config Debug
 
 ## Key facts to keep in mind
 
-- **Plugin ABI is v8.** Changing the C contract means bumping
+- **Plugin ABI is v10.** Changing the C contract means bumping
   `ORANGE_PLUGIN_ABI_VERSION` and updating both backends. v6 added
   `IRenderer::setVsync(bool)` (GL flips the swap interval; VK recreates the
   swapchain with a FIFO / immediate-mailbox present mode). v7 added
   `IRenderer::drawGrid()`. v8 made it `drawGrid(int upAxis)` (1 = Y up, 2 = Z up)
-  — the axis arg only recolors the in-plane depth line, not the grid plane.
+  — the axis arg only recolors the in-plane depth line, not the grid plane. v9
+  added `IRenderer::setDrawMode(uint32_t)`. v10 redefined it to **Helium's
+  Renderable drawing modes** (0 = none, 1 = solid, 2 = wireframe, 3 =
+  wireframe-over-solid, 4 = point): GL mirrors Helium's `DrawImplementation`
+  (`glPolygonMode` + `glPointSize` + `glPolygonOffset` for the over-solid pass);
+  VK binds the matching fill/line/point pipeline (needs the `fillModeNonSolid` +
+  `largePoints` device features; the fill pipeline carries a small depth bias so
+  the over-solid edges sit on top, and mode 3 double-draws). **Tab** cycles the
+  modes — handled in `Application` (writes `core::DrawModeState` into the registry
+  ctx); the `renderSystem` applies it to scene meshes only, resetting to solid
+  before the debug geometry, grid and overlays.
 - **Infinite grid:** `renderSystem` calls `IRenderer::drawGrid(upAxis)` after the
   scene submits (before the gizmo overlay). Each backend renders a vertex-less
   full-screen pass (GL: inline shader + empty VAO; VK: a second pipeline +
@@ -95,18 +141,20 @@ cmake --build D:/Library/Orange/build --config Debug
   type-safe `core::Buffer<T>` (VertexBuffer/IndexBuffer/UniformBuffer) in
   `engine/core/include/orange/core/buffer.h` that wraps it with RAII. App code
   uses the template layer.
-- **Vulkan shaders:** `plugins/render_vk/shaders/*.{vert,frag}` are compiled to
+- **Vulkan shaders:** `engine/plugins/render_vk/shaders/*.{vert,frag}` are compiled to
   SPIR-V headers in `src/generated/` (CMake regenerates on change via the Vulkan
   SDK's glsl compiler). GL→VK clip-space correction (Y flip + depth 0..1) is
   applied so both backends show the identical scene.
-- **Math is Eigen-backed.** `orange/core/math.h` aliases `Vec3/Vec4/Mat4/Quat`
-  to `Eigen::Vector3f/Vector4f/Matrix4f/Quaternionf` (column-major, GL convention)
-  and keeps thin graphics helpers (`perspective`/`ortho`/`lookAt`/`quatAxisAngle`/
-  `toMat4`/...). Eigen is fetched via FetchContent (find_package first). The build
-  defines `EIGEN_MAX_ALIGN_BYTES=0` so Eigen members are safe inside EnTT pools.
-  Interop with the render ABI's `float[16]`/`float[3]` is via `.data()`. Use
-  `.x()/.y()/.z()` (methods), not `.x`, and construct with `Vec3(a,b,c)` /
-  `Quat::Identity()` (the default Eigen ctor leaves values uninitialized).
+- **Math is Eigen-backed.** Code uses the Eigen types directly —
+  `Eigen::Vector3f/Vector4f/Matrix4f/Quaternionf` (column-major, GL convention);
+  there are no `Vec3`/`Mat4`/... type aliases. `orange/core/math.h` keeps thin
+  graphics helpers in `namespace orange::math` (`perspective`/`ortho`/`lookAt`/
+  `quatAxisAngle`/`toMat4`/...). Eigen is fetched via FetchContent (find_package
+  first). The build defines `EIGEN_MAX_ALIGN_BYTES=0` so Eigen members are safe
+  inside EnTT pools. Interop with the render ABI's `float[16]`/`float[3]` is via
+  `.data()`. Use `.x()/.y()/.z()` (methods), not `.x`, and construct with
+  `Eigen::Vector3f(a,b,c)` / `Eigen::Quaternionf::Identity()` (the default Eigen
+  ctor leaves values uninitialized).
 - **No gimbal lock:** `Transform::orientation` is a unit quaternion; the camera
   is a quaternion arcball trackball (`CameraManipulator`). Any camera controller
   is just a system that writes a `Transform`.
@@ -114,6 +162,19 @@ cmake --build D:/Library/Orange/build --config Debug
   **left-click picks** the nearest `Renderable` via `pickingSystem` (builds a
   world ray from the camera and ray-tests each entity's local AABB; the hit gets
   `Renderable::selected`). UI widgets set `Input::captured` to suppress picking.
+  **Tab** cycles the scene drawing mode (Helium's set: none / solid / wireframe /
+  wireframe-over-solid / point); **M** cycles the point-cloud processing mode;
+  **C** screenshots; **Esc** quits.
+- **Processing modes (`orange::modes`):** the Orange take on Hydrogen's "apps" —
+  selectable point-cloud operations that run on a `modes::ModeInput` (stored in
+  the registry ctx) and emit a visualization via the debug-draw accumulator.
+  `processingModeSystem` runs the active mode (`modes::ModeState` ctx) only when
+  the selection changes (cached), re-emitting each frame. The four ported,
+  CUDA/Helium-free modes: **Clustering** (SparseGrid radius + union-find),
+  **Morphology** (voxel erode + largest connected component), **SDF Filter**
+  (UDF splat + box blur + iso-surface resample), **Reconstruct** (TSDF →
+  `pointsToMesh`). appOrange feeds a deterministic sample cloud; **M** cycles.
+  (Adding a mode = one function + an entry in `kModes` in `modes.cpp`.)
 - **Text/UI:** gizmo labels and FPS/controls widgets are rasterized with
   stb_truetype (loads `C:/Windows/Fonts/malgun.ttf` on Windows) into RGBA atlases
   drawn as textured overlay quads via `IRenderer::beginOverlay`. Overlay layers

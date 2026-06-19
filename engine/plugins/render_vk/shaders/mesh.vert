@@ -17,4 +17,5 @@ void main() {
     vColor = aColor;
     vUV = aUV;
     gl_Position = pc.viewProj * pc.model * vec4(aPos, 1.0);
+    gl_PointSize = 3.0;  // used when the point-mode pipeline is bound
 }

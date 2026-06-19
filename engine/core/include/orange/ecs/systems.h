@@ -46,6 +46,12 @@ void menuBarInputSystem(entt::registry& world, core::Input& input,
 void pickingSystem(entt::registry& world, const core::Input& input,
                    uint32_t viewportW, uint32_t viewportH);
 
+// Runs the active point-cloud processing mode (modes::ModeState in ctx) on the
+// input cloud (modes::ModeInput in ctx) and emits its visualization into the
+// debug-draw accumulator. Recomputes only when the selected mode changes; no-op
+// if no ModeInput is present. Call before renderSystem.
+void processingModeSystem(entt::registry& world);
+
 // Gathers the primary camera + all (Transform, MeshRenderer) entities and
 // issues draw calls through the renderer. This is the ECS -> render bridge.
 void renderSystem(entt::registry& world, render::IRenderer& renderer,

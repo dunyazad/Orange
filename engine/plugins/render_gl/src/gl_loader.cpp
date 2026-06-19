@@ -44,10 +44,14 @@ PFN_glTexParameteri           glTexParameteri           = nullptr;
 PFN_glActiveTexture           glActiveTexture           = nullptr;
 PFN_glDeleteTextures          glDeleteTextures          = nullptr;
 PFN_glUniform1i               glUniform1i               = nullptr;
+PFN_glUniform4f               glUniform4f               = nullptr;
 PFN_glBlendFunc               glBlendFunc               = nullptr;
 PFN_glReadPixels              glReadPixels              = nullptr;
 PFN_glReadBuffer              glReadBuffer              = nullptr;
 PFN_glPixelStorei             glPixelStorei             = nullptr;
+PFN_glPolygonMode             glPolygonMode             = nullptr;
+PFN_glPointSize               glPointSize               = nullptr;
+PFN_glPolygonOffset           glPolygonOffset           = nullptr;
 
 namespace orange::gl {
 
@@ -109,10 +113,14 @@ bool loadGLFunctions() {
     ORANGE_LOAD(glActiveTexture);
     ORANGE_LOAD(glDeleteTextures);
     ORANGE_LOAD(glUniform1i);
+    ORANGE_LOAD(glUniform4f);
     ORANGE_LOAD(glBlendFunc);
     ORANGE_LOAD(glReadPixels);
     ORANGE_LOAD(glReadBuffer);
     ORANGE_LOAD(glPixelStorei);
+    ORANGE_LOAD(glPolygonMode);
+    ORANGE_LOAD(glPointSize);
+    ORANGE_LOAD(glPolygonOffset);
     return g_ok;
 }
 

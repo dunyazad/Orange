@@ -46,6 +46,7 @@ public:
 
     void resize(uint32_t width, uint32_t height) override;
     void setVsync(bool enabled) override;
+    void setDrawMode(uint32_t mode) override;
     bool readPixels(std::vector<uint8_t>& out, uint32_t& w, uint32_t& h) override;
 
     render::Backend backend() const override { return render::Backend::OpenGL; }
@@ -55,11 +56,13 @@ private:
     SDL_Window*  window_  = nullptr;
     void*        context_ = nullptr;  // SDL_GLContext
     unsigned int program_ = 0;
-    int          uViewProj_ = -1;
-    int          uModel_    = -1;
-    int          uTex_      = -1;
+    int          uViewProj_   = -1;
+    int          uModel_      = -1;
+    int          uTex_        = -1;
+    int          uForceColor_ = -1;  // wireframe-over-solid edge color override
     uint32_t     width_  = 0;
     uint32_t     height_ = 0;
+    uint32_t     drawMode_ = 0;  // 0 = fill, 1 = wireframe (see setDrawMode)
 
     // Infinite-grid pass: a vertex-less full-screen shader + an empty VAO.
     unsigned int gridProgram_ = 0;

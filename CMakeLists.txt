@@ -32,26 +32,24 @@ option(ORANGE_BUILD_VK "Build the Vulkan render plugin (auto if SDK found)" ON)
 # ---------------------------------------------------------------------------
 include(cmake/dependencies.cmake)
 
+# Treat our sources as UTF-8 on MSVC. Without this, MSVC assumes the system code
+# page (e.g. 949 on Korean Windows) and warns C4819 on third-party headers (EnTT)
+# that contain UTF-8 characters. Applied here so it covers the engine + apps but
+# not the FetchContent dependency builds above.
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 # ---------------------------------------------------------------------------
 # Targets
+#
+# Two layers: the engine (reusable core + render plugins), then the apps that
+# sit on top of it. Adding a new app is a new add_subdirectory below + a thin
+# orange_add_app() in that subdir -- the engine never changes.
 # ---------------------------------------------------------------------------
-add_subdirectory(engine/render_api)   # interface-only contract
-add_subdirectory(engine/core)         # platform + ECS
+add_subdirectory(engine)              # the reusable engine (core + render plugins)
 
-if(ORANGE_BUILD_GL)
-    add_subdirectory(plugins/render_gl)
-endif()
-
-if(ORANGE_BUILD_VK)
-    find_package(Vulkan QUIET)
-    if(Vulkan_FOUND)
-        message(STATUS "Orange: Vulkan found (${Vulkan_VERSION}) -> building render_vk plugin")
-        add_subdirectory(plugins/render_vk)
-    else()
-        message(STATUS "Orange: Vulkan SDK not found -> skipping render_vk plugin")
-    endif()
-endif()
-
+# Apps built on the engine. Add more here, each a thin orange_add_app().
 add_subdirectory(app/appOrange)
 
 message(STATUS "Orange: output dir = ${ORANGE_BIN_DIR}")

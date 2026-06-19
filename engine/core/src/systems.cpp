@@ -5,10 +5,101 @@
 #include <cstdio>
 #include <cstring>
 
+#include "orange/core/debug_draw.h"
+#include "orange/core/draw_mode.h"
 #include "orange/core/math.h"
+#include "orange/core/modes.h"
 #include "orange/ecs/components.h"
 
 namespace orange::ecs {
+
+namespace {
+// Persistent GPU resources for immediate-mode debug drawing. Raw handles (like
+// the overlay widgets) so the registry's teardown never outlives the renderer.
+struct DebugMeshState {
+    render::BufferHandle vbo  = render::kInvalidBuffer;
+    render::MeshHandle   mesh = render::kInvalidMesh;
+    size_t               capacity = 0;  // vertices (multiple of 3)
+};
+
+// Uploads everything accumulated via debug::DebugDraw this frame as one dynamic
+// non-indexed mesh, then clears the accumulator. Grows the buffer on demand and
+// pads the unused tail with degenerate (zero-area) triangles.
+void drawDebugGeometry(entt::registry& world, render::IRenderer& renderer,
+                       const Eigen::Matrix4f& worldMatrix) {
+    auto& dd = debug::DebugDraw::instance();
+    const auto& verts = dd.vertices();
+    if (verts.empty()) return;
+
+    if (!world.ctx().contains<DebugMeshState>()) world.ctx().emplace<DebugMeshState>();
+    auto& st = world.ctx().get<DebugMeshState>();
+
+    if (verts.size() > st.capacity) {
+        if (st.mesh != render::kInvalidMesh) renderer.destroyMesh(st.mesh);
+        if (st.vbo != render::kInvalidBuffer) renderer.destroyBuffer(st.vbo);
+        size_t cap = 3;
+        while (cap < verts.size()) cap *= 2;
+        cap = ((cap + 2) / 3) * 3;  // keep triangle-aligned
+
+        std::vector<render::Vertex> init(cap);  // zero => degenerate
+        render::BufferDesc bd;
+        bd.type  = render::BufferType::Vertex;
+        bd.usage = render::BufferUsage::Dynamic;
+        bd.data  = init.data();
+        bd.size  = cap * sizeof(render::Vertex);
+        st.vbo = renderer.createBuffer(bd);
+        st.capacity = cap;
+
+        render::MeshDesc md;
+        md.vertexBuffer = st.vbo;
+        md.indexBuffer  = render::kInvalidBuffer;
+        md.layout       = render::Vertex::layout();
+        md.vertexCount  = static_cast<uint32_t>(cap);
+        st.mesh = renderer.createMesh(md);
+    }
+
+    std::vector<render::Vertex> buf(st.capacity, render::Vertex{});
+    std::copy(verts.begin(), verts.end(), buf.begin());
+    renderer.updateBuffer(st.vbo, buf.data(), buf.size() * sizeof(render::Vertex));
+
+    render::DrawItem item;
+    item.mesh = st.mesh;
+    std::memcpy(item.model, worldMatrix.data(), sizeof(item.model));
+    renderer.submit(item);
+
+    dd.clear();
+}
+
+// Cached debug geometry for the active processing mode (recomputed only when the
+// mode selection changes), stored in the registry ctx.
+struct ModeCache {
+    uint64_t generation = 0;
+    std::vector<render::Vertex> verts;
+};
+} // namespace
+
+// Runs the active processing mode on the input point cloud (both in the registry
+// ctx), caching its debug geometry and re-emitting it each frame so the heavy
+// computation only happens when the selected mode changes.
+void processingModeSystem(entt::registry& world) {
+    if (!world.ctx().contains<modes::ModeInput>()) return;
+    const auto& input = world.ctx().get<modes::ModeInput>();
+
+    modes::ModeState state;
+    if (world.ctx().contains<modes::ModeState>()) state = world.ctx().get<modes::ModeState>();
+
+    if (!world.ctx().contains<ModeCache>()) world.ctx().emplace<ModeCache>();
+    auto& cache = world.ctx().get<ModeCache>();
+
+    if (cache.generation != state.generation) {
+        debug::DebugDraw tmp;
+        modes::runMode(state.index, input, tmp);
+        cache.verts = tmp.vertices();
+        cache.generation = state.generation;
+    }
+
+    debug::DebugDraw::instance().addRaw(cache.verts);
+}
 
 namespace {
 float clampf(float v, float lo, float hi) {
@@ -32,11 +123,11 @@ constexpr int   kHlVerts        = kHlQuads * 4; // = 48
 // logical +Z maps to render +Y (vertical). Applied to ALL scene content + the
 // gizmo cube so toggling genuinely re-expresses the world's coordinate frame
 // (the camera and the horizontal ground stay put -- it is not a view spin).
-math::Quat worldUpQuat(bool zUp) {
-    return zUp ? math::quatAxisAngle(math::Vec3(1, 0, 0), -kHalfPi)
-               : math::Quat::Identity();
+Eigen::Quaternionf worldUpQuat(bool zUp) {
+    return zUp ? math::quatAxisAngle(Eigen::Vector3f(1, 0, 0), -kHalfPi)
+               : Eigen::Quaternionf::Identity();
 }
-math::Mat4 worldUpMatrix(bool zUp) { return math::toMat4(worldUpQuat(zUp)); }
+Eigen::Matrix4f worldUpMatrix(bool zUp) { return math::toMat4(worldUpQuat(zUp)); }
 
 // The single gizmo's up-axis flag (true => Z up), or false if there is none.
 bool worldZUp(entt::registry& world) {
@@ -59,7 +150,7 @@ GizmoRect gizmoRect(const AxisGizmo& g, uint32_t W, uint32_t H) {
 }
 
 // Ray vs. axis-aligned box [-1,1]^3. Returns the entry hit point.
-bool intersectUnitBox(math::Vec3 o, math::Vec3 dir, math::Vec3& hit) {
+bool intersectUnitBox(Eigen::Vector3f o, Eigen::Vector3f dir, Eigen::Vector3f& hit) {
     float O[3] = {o.x(), o.y(), o.z()};
     float D[3] = {dir.x(), dir.y(), dir.z()};
     float tmin = -1e30f, tmax = 1e30f;
@@ -82,7 +173,7 @@ bool intersectUnitBox(math::Vec3 o, math::Vec3 dir, math::Vec3& hit) {
 
 // Ray vs. axis-aligned box [bmin, bmax]. On hit, returns true and writes the
 // entry distance along `dir` (or the exit distance if the origin is inside).
-bool intersectAABB(math::Vec3 o, math::Vec3 dir, math::Vec3 bmin, math::Vec3 bmax,
+bool intersectAABB(Eigen::Vector3f o, Eigen::Vector3f dir, Eigen::Vector3f bmin, Eigen::Vector3f bmax,
                    float& tHit) {
     float O[3] = {o.x(), o.y(), o.z()};
     float D[3] = {dir.x(), dir.y(), dir.z()};
@@ -108,10 +199,10 @@ bool intersectAABB(math::Vec3 o, math::Vec3 dir, math::Vec3 bmin, math::Vec3 bma
 // Classify a hit point on the cube into a direction triple in {-1,0,1}^3:
 // one nonzero => face, two => edge, three => corner. The triple is the world
 // view direction to snap the camera to.
-math::Vec3 classifyDir(math::Vec3 hit) {
+Eigen::Vector3f classifyDir(Eigen::Vector3f hit) {
     const float k = kGizmoEdge;
     auto zone = [&](float c) { return c > k ? 1.0f : (c < -k ? -1.0f : 0.0f); };
-    math::Vec3 d(zone(hit.x()), zone(hit.y()), zone(hit.z()));
+    Eigen::Vector3f d(zone(hit.x()), zone(hit.y()), zone(hit.z()));
     if (d.x() == 0 && d.y() == 0 && d.z() == 0) {  // dead-center: snap to dominant axis
         float ax = std::fabs(hit.x()), ay = std::fabs(hit.y()), az = std::fabs(hit.z());
         if (ax >= ay && ax >= az)      d.x() = hit.x() > 0 ? 1.0f : -1.0f;
@@ -123,21 +214,21 @@ math::Vec3 classifyDir(math::Vec3 hit) {
 
 // Ray-pick the gizmo cube under cursor (mx,my). Returns the picked region's
 // direction triple, or false if the cursor misses the cube.
-bool pickGizmo(const math::Quat& camOrient, const GizmoRect& r, float mx, float my,
-               bool zUp, math::Vec3& outDir) {
+bool pickGizmo(const Eigen::Quaternionf& camOrient, const GizmoRect& r, float mx, float my,
+               bool zUp, Eigen::Vector3f& outDir) {
     if (mx < r.x || mx > r.x + r.w || my < r.y || my > r.y + r.h) return false;
     float ndcX = (mx - r.x) / r.w * 2.0f - 1.0f;
     float ndcY = 1.0f - (my - r.y) / r.h * 2.0f;
     // Pick ray into the cube's local space. The cube model is
     // conjugate(camera) * Mworld, so undo the camera then the world up-axis basis
     // to land in the cube's (logical-axis) local frame.
-    math::Vec3 lo = math::rotate(
-        camOrient, math::Vec3(ndcX * kGizmoOrthoHalf, ndcY * kGizmoOrthoHalf, kGizmoEyeZ));
-    math::Vec3 ld = math::rotate(camOrient, math::Vec3(0, 0, -1));
-    math::Quat mwInv = math::conjugate(worldUpQuat(zUp));
+    Eigen::Vector3f lo = math::rotate(
+        camOrient, Eigen::Vector3f(ndcX * kGizmoOrthoHalf, ndcY * kGizmoOrthoHalf, kGizmoEyeZ));
+    Eigen::Vector3f ld = math::rotate(camOrient, Eigen::Vector3f(0, 0, -1));
+    Eigen::Quaternionf mwInv = math::conjugate(worldUpQuat(zUp));
     lo = math::rotate(mwInv, lo);
     ld = math::rotate(mwInv, ld);
-    math::Vec3 hit;
+    Eigen::Vector3f hit;
     if (!intersectUnitBox(lo, ld, hit)) return false;
     outDir = classifyDir(hit);
     return true;
@@ -156,20 +247,20 @@ int pickRing(const GizmoRect& r, float mx, float my) {
 }
 
 // The 90-degree camera rotation a ring sector applies (about local axes).
-math::Quat ringDelta(int sector) {
+Eigen::Quaternionf ringDelta(int sector) {
     switch (sector) {
-        case 0: return math::quatAxisAngle(math::Vec3(0, 1, 0), -kHalfPi);  // right
-        case 2: return math::quatAxisAngle(math::Vec3(0, 1, 0),  kHalfPi);  // left
-        case 1: return math::quatAxisAngle(math::Vec3(1, 0, 0),  kHalfPi);  // top
-        case 3: return math::quatAxisAngle(math::Vec3(1, 0, 0), -kHalfPi);  // bottom
+        case 0: return math::quatAxisAngle(Eigen::Vector3f(0, 1, 0), -kHalfPi);  // right
+        case 2: return math::quatAxisAngle(Eigen::Vector3f(0, 1, 0),  kHalfPi);  // left
+        case 1: return math::quatAxisAngle(Eigen::Vector3f(1, 0, 0),  kHalfPi);  // top
+        case 3: return math::quatAxisAngle(Eigen::Vector3f(1, 0, 0), -kHalfPi);  // bottom
     }
-    return math::Quat::Identity();
+    return Eigen::Quaternionf::Identity();
 }
 
-void setComp(math::Vec3& v, int a, float val) { v[a] = val; }
-float getComp(const math::Vec3& v, int a) { return v[a]; }
+void setComp(Eigen::Vector3f& v, int a, float val) { v[a] = val; }
+float getComp(const Eigen::Vector3f& v, int a) { return v[a]; }
 
-void emitQuad(render::Vertex* out, int& q, const math::Vec3 c[4], const float col[3]) {
+void emitQuad(render::Vertex* out, int& q, const Eigen::Vector3f c[4], const float col[3]) {
     if (q >= kHlQuads) return;
     for (int i = 0; i < 4; ++i)
         out[q * 4 + i] = {{c[i].x(), c[i].y(), c[i].z()}, {col[0], col[1], col[2]}};
@@ -183,7 +274,7 @@ void padDegenerate(render::Vertex* out, int q) {
 // With kGizmoEdge = 0.78 the center face cell is large and the edge/corner cells
 // are thin borders -- they tile the face with no gaps and connect at shared
 // edges, and exactly match the clickable regions (same kGizmoEdge).
-void buildCubeHighlight(math::Vec3 d, const float col[3], render::Vertex out[kHlVerts]) {
+void buildCubeHighlight(Eigen::Vector3f d, const float col[3], render::Vertex out[kHlVerts]) {
     const float k = kGizmoEdge, eps = 0.013f;
     int q = 0;
     for (int a = 0; a < 3; ++a) {
@@ -202,11 +293,11 @@ void buildCubeHighlight(math::Vec3 d, const float col[3], render::Vertex out[kHl
         range(getComp(d, b), blo, bhi);
         range(getComp(d, c), clo, chi);
         auto mk = [&](float bv, float cv) {
-            math::Vec3 v;
+            Eigen::Vector3f v;
             setComp(v, a, faceCoord); setComp(v, b, bv); setComp(v, c, cv);
             return v;
         };
-        math::Vec3 cor[4] = {mk(blo, clo), mk(bhi, clo), mk(bhi, chi), mk(blo, chi)};
+        Eigen::Vector3f cor[4] = {mk(blo, clo), mk(bhi, clo), mk(bhi, chi), mk(blo, chi)};
         emitQuad(out, q, cor, col);
     }
     padDegenerate(out, q);
@@ -220,11 +311,11 @@ void buildRingHighlight(int sector, const float col[3], render::Vertex out[kHlVe
     for (int s = 0; s < kHlQuads; ++s) {
         float t0 = a0 + kHalfPi * s / kHlQuads;
         float t1 = a0 + kHalfPi * (s + 1) / kHlQuads;
-        math::Vec3 cor[4] = {
-            math::Vec3(std::cos(t0) * kRingInner, std::sin(t0) * kRingInner, zf),
-            math::Vec3(std::cos(t0) * kRingOuter, std::sin(t0) * kRingOuter, zf),
-            math::Vec3(std::cos(t1) * kRingOuter, std::sin(t1) * kRingOuter, zf),
-            math::Vec3(std::cos(t1) * kRingInner, std::sin(t1) * kRingInner, zf),
+        Eigen::Vector3f cor[4] = {
+            Eigen::Vector3f(std::cos(t0) * kRingInner, std::sin(t0) * kRingInner, zf),
+            Eigen::Vector3f(std::cos(t0) * kRingOuter, std::sin(t0) * kRingOuter, zf),
+            Eigen::Vector3f(std::cos(t1) * kRingOuter, std::sin(t1) * kRingOuter, zf),
+            Eigen::Vector3f(std::cos(t1) * kRingInner, std::sin(t1) * kRingInner, zf),
         };
         emitQuad(out, q, cor, col);
     }
@@ -600,10 +691,10 @@ void spinSystem(entt::registry& world, float dt) {
         auto& t = view.get<Transform>(entity);
         auto& s = view.get<Spin>(entity);
         // Integrate angular velocity as a rigid rotation (no Euler drift/lock).
-        math::Vec3 w = s.axisRadiansPerSec;
+        Eigen::Vector3f w = s.axisRadiansPerSec;
         float speed = std::sqrt(math::dot(w, w));
         if (speed > 1e-8f) {
-            math::Quat dq = math::quatAxisAngle(w, speed * dt);
+            Eigen::Quaternionf dq = math::quatAxisAngle(w, speed * dt);
             t.orientation = math::normalize(t.orientation * dq);
         }
     }
@@ -627,10 +718,10 @@ void cameraManipulatorSystem(entt::registry& world, const core::Input& input,
                    (input.mouseDeltaX != 0.0f || input.mouseDeltaY != 0.0f)) {
             // Orbit: right-drag tumbles about the camera's OWN x/y axes and
             // composes on the local side -- a true trackball, no gimbal lock.
-            math::Quat dYaw =
-                math::quatAxisAngle(math::Vec3(0, 1, 0), -input.mouseDeltaX * m.rotateSpeed);
-            math::Quat dPitch =
-                math::quatAxisAngle(math::Vec3(1, 0, 0), -input.mouseDeltaY * m.rotateSpeed);
+            Eigen::Quaternionf dYaw =
+                math::quatAxisAngle(Eigen::Vector3f(0, 1, 0), -input.mouseDeltaX * m.rotateSpeed);
+            Eigen::Quaternionf dPitch =
+                math::quatAxisAngle(Eigen::Vector3f(1, 0, 0), -input.mouseDeltaY * m.rotateSpeed);
             m.orientation = math::normalize(m.orientation * dYaw * dPitch);
         }
 
@@ -643,15 +734,15 @@ void cameraManipulatorSystem(entt::registry& world, const core::Input& input,
         // Pan: middle-drag slides the target across the camera plane.
         // (Right-drag is orbit; left-click is picking.)
         if (input.buttonMiddle) {
-            math::Vec3 right = math::rotate(m.orientation, math::Vec3(1, 0, 0));
-            math::Vec3 up    = math::rotate(m.orientation, math::Vec3(0, 1, 0));
+            Eigen::Vector3f right = math::rotate(m.orientation, Eigen::Vector3f(1, 0, 0));
+            Eigen::Vector3f up    = math::rotate(m.orientation, Eigen::Vector3f(0, 1, 0));
             float k = m.panSpeed * m.distance;
             m.target = m.target - right * (input.mouseDeltaX * k) +
                        up * (input.mouseDeltaY * k);
         }
 
         // Place the camera on the orbit sphere; eye sits along the local +Z.
-        math::Vec3 offset = math::rotate(m.orientation, math::Vec3(0, 0, 1));
+        Eigen::Vector3f offset = math::rotate(m.orientation, Eigen::Vector3f(0, 0, 1));
         t.position    = m.target + offset * m.distance;
         t.orientation = m.orientation;
     }
@@ -719,11 +810,11 @@ void pickingSystem(entt::registry& world, const core::Input& input,
     float ndcY = 1.0f - 2.0f * input.mousePosY / H;  // screen y-down -> ndc y-up
     float aspect = W / H;
 
-    math::Vec3 right   = math::rotate(camT->orientation, math::Vec3(1, 0, 0));
-    math::Vec3 up      = math::rotate(camT->orientation, math::Vec3(0, 1, 0));
-    math::Vec3 forward = math::rotate(camT->orientation, math::Vec3(0, 0, -1));
+    Eigen::Vector3f right   = math::rotate(camT->orientation, Eigen::Vector3f(1, 0, 0));
+    Eigen::Vector3f up      = math::rotate(camT->orientation, Eigen::Vector3f(0, 1, 0));
+    Eigen::Vector3f forward = math::rotate(camT->orientation, Eigen::Vector3f(0, 0, -1));
 
-    math::Vec3 rayO, rayD;
+    Eigen::Vector3f rayO, rayD;
     if (cam->mode == ProjectionMode::Orthographic) {
         float s = cam->orthoSize;
         rayO = camT->position + right * (ndcX * aspect * s) + up * (ndcY * s);
@@ -737,7 +828,7 @@ void pickingSystem(entt::registry& world, const core::Input& input,
 
     // Content is rendered as Mworld * T*R*S, so undo the world up-axis basis on
     // the ray before the per-entity inverse(T*R*S) below.
-    math::Quat mwInv = math::conjugate(worldUpQuat(worldZUp(world)));
+    Eigen::Quaternionf mwInv = math::conjugate(worldUpQuat(worldZUp(world)));
     rayO = math::rotate(mwInv, rayO);
     rayD = math::rotate(mwInv, rayD);
 
@@ -752,10 +843,10 @@ void pickingSystem(entt::registry& world, const core::Input& input,
 
         // Transform the ray into the entity's local space: inverse(T*R*S) =
         // S^-1 * R^-1 * T^-1. Scale is applied component-wise.
-        math::Vec3 lo = math::rotate(math::conjugate(t.orientation),
+        Eigen::Vector3f lo = math::rotate(math::conjugate(t.orientation),
                                      rayO - t.position);
-        math::Vec3 ld = math::rotate(math::conjugate(t.orientation), rayD);
-        math::Vec3 inv(t.scale.x() != 0 ? 1.0f / t.scale.x() : 0.0f,
+        Eigen::Vector3f ld = math::rotate(math::conjugate(t.orientation), rayD);
+        Eigen::Vector3f inv(t.scale.x() != 0 ? 1.0f / t.scale.x() : 0.0f,
                        t.scale.y() != 0 ? 1.0f / t.scale.y() : 0.0f,
                        t.scale.z() != 0 ? 1.0f / t.scale.z() : 0.0f);
         lo = lo.cwiseProduct(inv);
@@ -811,7 +902,7 @@ void axisGizmoInputSystem(entt::registry& world, core::Input& input,
     }
 
     // Hover: cube first (it sits in front of the ring), then the ring.
-    math::Vec3 dir;
+    Eigen::Vector3f dir;
     if (pickGizmo(manip->orientation, r, input.mousePosX, input.mousePosY, gizmo->zUp, dir)) {
         gizmo->hoverPart = GizmoPart::Cube;
         gizmo->hoverDir  = dir;
@@ -827,7 +918,7 @@ void axisGizmoInputSystem(entt::registry& world, core::Input& input,
 
     // Click: snap the camera and flash the region.
     if (input.leftClicked && gizmo->hoverPart != GizmoPart::None) {
-        math::Quat target;
+        Eigen::Quaternionf target;
         if (gizmo->hoverPart == GizmoPart::Cube)
             // hoverDir is a logical axis; map it through the up-axis basis to the
             // render direction the camera should look down.
@@ -996,9 +1087,9 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     frame.width  = viewportW;
     frame.height = viewportH;
 
-    math::Mat4 view = math::Mat4::Identity();
-    math::Mat4 proj = math::Mat4::Identity();
-    math::Quat camOrient = math::Quat::Identity();  // captured for the gizmo overlay
+    Eigen::Matrix4f view = Eigen::Matrix4f::Identity();
+    Eigen::Matrix4f proj = Eigen::Matrix4f::Identity();
+    Eigen::Quaternionf camOrient = Eigen::Quaternionf::Identity();  // captured for the gizmo overlay
     const Camera* primaryCam = nullptr;  // captured for the controls panel
 
     auto cams = world.view<Transform, Camera>();
@@ -1020,8 +1111,8 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         }
         // Derive view from the camera Transform's orientation, so any camera
         // controller (e.g. CameraManipulator) just writes the Transform.
-        math::Vec3 forward = math::rotate(ct.orientation, math::Vec3(0, 0, -1));
-        math::Vec3 up      = math::rotate(ct.orientation, math::Vec3(0, 1, 0));
+        Eigen::Vector3f forward = math::rotate(ct.orientation, Eigen::Vector3f(0, 0, -1));
+        Eigen::Vector3f up      = math::rotate(ct.orientation, Eigen::Vector3f(0, 1, 0));
         view = math::lookAt(ct.position, ct.position + forward, up);
         camOrient = ct.orientation;
         break;
@@ -1035,7 +1126,15 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
 
     // World up-axis basis: prepended to every model so the scene's coordinate
     // frame (not the camera) changes when the gizmo toggles Y/Z up.
-    const math::Mat4 Mworld = worldUpMatrix(worldZUp(world));
+    const Eigen::Matrix4f Mworld = worldUpMatrix(worldZUp(world));
+
+    // Apply the scene draw mode (Tab cycles Helium's drawing modes) to the
+    // drawables only; reset to solid afterwards so debug geometry, grid and
+    // overlays stay filled.
+    uint32_t drawMode = static_cast<uint32_t>(core::DrawMode::Solid);
+    if (world.ctx().contains<core::DrawModeState>())
+        drawMode = static_cast<uint32_t>(world.ctx().get<core::DrawModeState>().mode);
+    renderer.setDrawMode(drawMode);
 
     auto drawables = world.view<Transform, Renderable>();
     for (auto entity : drawables) {
@@ -1047,7 +1146,7 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         item.mesh = r.mesh;
         // Selected entities pop slightly larger as a pick highlight (the render
         // ABI carries no per-item tint, so scale stands in for it).
-        math::Mat4 model = r.selected
+        Eigen::Matrix4f model = r.selected
                                ? math::translate(t.position) *
                                      math::toMat4(t.orientation) *
                                      math::scale(t.scale * 1.15f)
@@ -1056,6 +1155,10 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);
     }
+    renderer.setDrawMode(static_cast<uint32_t>(core::DrawMode::Solid));  // scene only: rest stays solid
+
+    // --- Immediate-mode debug geometry (world space, behind the grid) --
+    drawDebugGeometry(world, renderer, Mworld);
 
     // --- Infinite ground grid (depth-tested against the scene) ---------
     // The grid is always the horizontal ground; the up-axis toggle re-expresses
@@ -1074,19 +1177,19 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::OverlayContext ov;
         ov.x = r.x; ov.y = r.y; ov.width = r.w; ov.height = r.h;
         ov.clearDepth = true;
-        math::Mat4 ovView = math::lookAt(math::Vec3(0, 0, kGizmoEyeZ), math::Vec3(0, 0, 0),
-                                         math::Vec3(0, 1, 0));
-        math::Mat4 ovProj = math::ortho(-kGizmoOrthoHalf, kGizmoOrthoHalf,
+        Eigen::Matrix4f ovView = math::lookAt(Eigen::Vector3f(0, 0, kGizmoEyeZ), Eigen::Vector3f(0, 0, 0),
+                                         Eigen::Vector3f(0, 1, 0));
+        Eigen::Matrix4f ovProj = math::ortho(-kGizmoOrthoHalf, kGizmoOrthoHalf,
                                         -kGizmoOrthoHalf, kGizmoOrthoHalf, 0.1f, 100.0f);
         std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
         std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
         renderer.beginOverlay(ov);
 
-        math::Mat4 identity = math::Mat4::Identity();
+        Eigen::Matrix4f identity = Eigen::Matrix4f::Identity();
         // Cube model = inverse(camera orientation) * world up-axis basis: shows the
         // logical world axes (Y or Z up) as the camera sees them. The ring is
         // screen-aligned (identity model).
-        math::Mat4 cubeModel =
+        Eigen::Matrix4f cubeModel =
             math::toMat4(math::conjugate(camOrient)) * worldUpMatrix(gizmo.zUp);
         render::DrawItem item;
 
@@ -1150,8 +1253,8 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::OverlayContext ov;
         ov.x = br.x; ov.y = br.y; ov.width = br.w; ov.height = br.h;
         ov.clearDepth = true;
-        math::Mat4 ovView = math::Mat4::Identity();
-        math::Mat4 ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
         std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
         std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
         renderer.beginOverlay(ov);
@@ -1159,7 +1262,7 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::DrawItem item;
         item.mesh    = g.upBtnMesh;
         item.texture = g.uiAtlas;
-        math::Mat4 model = math::Mat4::Identity();
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);
         break;
@@ -1188,8 +1291,8 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::OverlayContext ov;
         ov.x = wgt.x; ov.y = wgt.y; ov.width = wgt.w; ov.height = wgt.h;
         ov.clearDepth = true;
-        math::Mat4 ovView = math::Mat4::Identity();
-        math::Mat4 ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
         std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
         std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
         renderer.beginOverlay(ov);
@@ -1197,7 +1300,7 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::DrawItem item;
         item.mesh    = wgt.mesh;
         item.texture = wgt.atlas;  // glyph atlas (white cell backs the solid parts)
-        math::Mat4 model = math::Mat4::Identity();
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);
         break;
@@ -1216,8 +1319,8 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::OverlayContext ov;
         ov.x = cc.x; ov.y = cc.y; ov.width = cc.w; ov.height = cc.h;
         ov.clearDepth = true;
-        math::Mat4 ovView = math::Mat4::Identity();
-        math::Mat4 ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
         std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
         std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
         renderer.beginOverlay(ov);
@@ -1225,7 +1328,7 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::DrawItem item;
         item.mesh    = cc.mesh;
         item.texture = cc.atlas;
-        math::Mat4 model = math::Mat4::Identity();
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);
         break;
@@ -1252,8 +1355,8 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         ov.width = static_cast<int>(viewportW);
         ov.height = static_cast<int>(overlayH);
         ov.clearDepth = true;
-        math::Mat4 ovView = math::Mat4::Identity();
-        math::Mat4 ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
         std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
         std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
         renderer.beginOverlay(ov);
@@ -1261,7 +1364,7 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::DrawItem item;
         item.mesh    = mb.mesh;
         item.texture = mb.atlas;
-        math::Mat4 model = math::Mat4::Identity();
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);
         break;

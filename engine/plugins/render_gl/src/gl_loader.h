@@ -58,6 +58,11 @@ typedef void           GLvoid;
 #define GL_ONE_MINUS_SRC_ALPHA  0x0303
 #define GL_FRONT                0x0404
 #define GL_BACK                 0x0405
+#define GL_FRONT_AND_BACK       0x0408
+#define GL_POINT                0x1B00
+#define GL_LINE                 0x1B01
+#define GL_FILL                 0x1B02
+#define GL_POLYGON_OFFSET_FILL  0x8037
 #define GL_PACK_ALIGNMENT       0x0D05
 
 // Windows GL calls use __stdcall; everything else is cdecl.
@@ -109,10 +114,14 @@ typedef void   (ORANGE_GLAPI* PFN_glTexParameteri)(GLenum, GLenum, GLint);
 typedef void   (ORANGE_GLAPI* PFN_glActiveTexture)(GLenum);
 typedef void   (ORANGE_GLAPI* PFN_glDeleteTextures)(GLsizei, const GLuint*);
 typedef void   (ORANGE_GLAPI* PFN_glUniform1i)(GLint, GLint);
+typedef void   (ORANGE_GLAPI* PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void   (ORANGE_GLAPI* PFN_glBlendFunc)(GLenum, GLenum);
 typedef void   (ORANGE_GLAPI* PFN_glReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
 typedef void   (ORANGE_GLAPI* PFN_glReadBuffer)(GLenum);
 typedef void   (ORANGE_GLAPI* PFN_glPixelStorei)(GLenum, GLint);
+typedef void   (ORANGE_GLAPI* PFN_glPolygonMode)(GLenum, GLenum);
+typedef void   (ORANGE_GLAPI* PFN_glPointSize)(GLfloat);
+typedef void   (ORANGE_GLAPI* PFN_glPolygonOffset)(GLfloat, GLfloat);
 
 // --- Function pointers (defined in gl_loader.cpp) --------------------------
 extern PFN_glGenVertexArrays         glGenVertexArrays;
@@ -156,10 +165,14 @@ extern PFN_glTexParameteri           glTexParameteri;
 extern PFN_glActiveTexture           glActiveTexture;
 extern PFN_glDeleteTextures          glDeleteTextures;
 extern PFN_glUniform1i               glUniform1i;
+extern PFN_glUniform4f               glUniform4f;
 extern PFN_glBlendFunc               glBlendFunc;
 extern PFN_glReadPixels              glReadPixels;
 extern PFN_glReadBuffer              glReadBuffer;
 extern PFN_glPixelStorei             glPixelStorei;
+extern PFN_glPolygonMode             glPolygonMode;
+extern PFN_glPointSize               glPointSize;
+extern PFN_glPolygonOffset           glPolygonOffset;
 
 namespace orange::gl {
 // Resolve all entry points. Requires a current GL context. Returns false if

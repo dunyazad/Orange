@@ -12,7 +12,7 @@
 // next to the app and load it.
 // ---------------------------------------------------------------------------
 
-#define ORANGE_PLUGIN_ABI_VERSION 8u
+#define ORANGE_PLUGIN_ABI_VERSION 10u
 
 // Symbol names the host looks up via the dynamic loader.
 #define ORANGE_PLUGIN_SYM_INFO    "orangeRenderPluginInfo"

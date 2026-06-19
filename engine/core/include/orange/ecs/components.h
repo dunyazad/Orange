@@ -11,11 +11,11 @@
 namespace orange::ecs {
 
 struct Transform {
-    math::Vec3 position   = math::Vec3::Zero();
-    math::Quat orientation = math::Quat::Identity();  // unit quaternion (no gimbal lock)
-    math::Vec3 scale      = math::Vec3::Ones();
+    Eigen::Vector3f position   = Eigen::Vector3f::Zero();
+    Eigen::Quaternionf orientation = Eigen::Quaternionf::Identity();  // unit quaternion (no gimbal lock)
+    Eigen::Vector3f scale      = Eigen::Vector3f::Ones();
 
-    math::Mat4 matrix() const {
+    Eigen::Matrix4f matrix() const {
         return math::translate(position) * math::toMat4(orientation) *
                math::scale(scale);
     }
@@ -32,8 +32,8 @@ struct Renderable {
     render::MeshHandle mesh    = render::kInvalidMesh;
     bool               visible = true;
 
-    math::Vec3 boundsMin = math::Vec3(-0.5f, -0.5f, -0.5f);
-    math::Vec3 boundsMax = math::Vec3( 0.5f,  0.5f,  0.5f);
+    Eigen::Vector3f boundsMin = Eigen::Vector3f(-0.5f, -0.5f, -0.5f);
+    Eigen::Vector3f boundsMax = Eigen::Vector3f( 0.5f,  0.5f,  0.5f);
     bool       selected = false;  // set by pickingSystem on left-click
 };
 
@@ -58,9 +58,9 @@ struct Camera {
 //   middle-drag -> pan (move target)
 // (Left-click is reserved for picking; see pickingSystem.)
 struct CameraManipulator {
-    math::Vec3 target   = math::Vec3::Zero();  // pivot the camera orbits around
+    Eigen::Vector3f target   = Eigen::Vector3f::Zero();  // pivot the camera orbits around
     float      distance = 6.0f;        // camera distance from target
-    math::Quat orientation = math::Quat::Identity();  // camera orientation (identity => +Z)
+    Eigen::Quaternionf orientation = Eigen::Quaternionf::Identity();  // camera orientation (identity => +Z)
 
     float rotateSpeed = 0.006f;
     float zoomSpeed   = 0.6f;
@@ -72,8 +72,8 @@ struct CameraManipulator {
     // Smooth snap animation (driven by the axis gizmo). While animating, manual
     // orbit is suspended and `orientation` is slerped from animFrom to animTo.
     bool       animating    = false;
-    math::Quat animFrom = math::Quat::Identity();
-    math::Quat animTo   = math::Quat::Identity();
+    Eigen::Quaternionf animFrom = Eigen::Quaternionf::Identity();
+    Eigen::Quaternionf animTo   = Eigen::Quaternionf::Identity();
     float      animTime     = 0.0f;
     float      animDuration = 0.45f;
 };
@@ -115,12 +115,12 @@ struct AxisGizmo {
 
     // Runtime state, updated each frame by axisGizmoInputSystem.
     GizmoPart  hoverPart   = GizmoPart::None;
-    math::Vec3 hoverDir = math::Vec3::Zero();  // cube region (face/edge/corner) under cursor
+    Eigen::Vector3f hoverDir = Eigen::Vector3f::Zero();  // cube region (face/edge/corner) under cursor
     int        hoverSector = -1;   // ring sector 0..3 (right/top/left/bottom)
 
     float      flash       = 0.0f; // click feedback timer (seconds remaining)
     GizmoPart  flashPart   = GizmoPart::None;
-    math::Vec3 flashDir = math::Vec3::Zero();
+    Eigen::Vector3f flashDir = Eigen::Vector3f::Zero();
     int        flashSector = -1;
 };
 
@@ -214,7 +214,7 @@ struct MenuBar {
 
 // Demo behavior: continuous rotation, consumed by SpinSystem.
 struct Spin {
-    math::Vec3 axisRadiansPerSec = math::Vec3(0.0f, 1.0f, 0.0f);
+    Eigen::Vector3f axisRadiansPerSec = Eigen::Vector3f(0.0f, 1.0f, 0.0f);
 };
 
 } // namespace orange::ecs

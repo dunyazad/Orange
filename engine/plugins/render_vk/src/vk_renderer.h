@@ -63,6 +63,7 @@ public:
 
     void resize(uint32_t width, uint32_t height) override;
     void setVsync(bool enabled) override;
+    void setDrawMode(uint32_t mode) override;
     bool readPixels(std::vector<uint8_t>& out, uint32_t& w, uint32_t& h) override;
 
     render::Backend backend() const override { return render::Backend::Vulkan; }
@@ -96,7 +97,10 @@ private:
     // Graphics pipeline for mesh rendering (built lazily from the first mesh's
     // vertex layout; all appOrange meshes share the same layout).
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
-    VkPipeline       pipeline_       = VK_NULL_HANDLE;
+    VkPipeline       pipeline_       = VK_NULL_HANDLE;  // solid (fill, slight depth bias)
+    VkPipeline       pipelineWireframe_ = VK_NULL_HANDLE;  // line polygon mode
+    VkPipeline       pipelinePoint_     = VK_NULL_HANDLE;  // point polygon mode
+    uint32_t         drawMode_ = 1;  // Helium DrawingMode (0=none..4=point)
 
     // Infinite-grid pipeline: a vertex-less full-screen pass (own layout with a
     // 128-byte push constant = viewProj + invViewProj, vertex + fragment stages).

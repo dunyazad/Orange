@@ -171,12 +171,19 @@ bool VkRenderer::createDevice() {
 
     const char* deviceExt[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
+    // fillModeNonSolid: VK_POLYGON_MODE_LINE/POINT (wireframe + point draw modes).
+    // largePoints: gl_PointSize > 1 in the point-mode pipeline.
+    VkPhysicalDeviceFeatures features{};
+    features.fillModeNonSolid = VK_TRUE;
+    features.largePoints = VK_TRUE;
+
     VkDeviceCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     ci.queueCreateInfoCount = 1;
     ci.pQueueCreateInfos = &qci;
     ci.enabledExtensionCount = 1;
     ci.ppEnabledExtensionNames = deviceExt;
+    ci.pEnabledFeatures = &features;
 
     VK_CHECK(vkCreateDevice(physical_, &ci, nullptr, &device_));
     vkGetDeviceQueue(device_, queueFamily_, 0, &queue_);
@@ -497,6 +504,11 @@ bool VkRenderer::createPipeline(const render::VertexLayout& layout) {
     rs.cullMode = VK_CULL_MODE_NONE;  // matches the GL path (depth-sorted, no cull)
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rs.lineWidth = 1.0f;
+    // Solid fill is biased slightly back so wireframe-over-solid edges sit on top
+    // (the GL path uses glPolygonOffset for the same effect).
+    rs.depthBiasEnable = VK_TRUE;
+    rs.depthBiasConstantFactor = 1.0f;
+    rs.depthBiasSlopeFactor = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo ms{};
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
@@ -529,18 +541,22 @@ bool VkRenderer::createPipeline(const render::VertexLayout& layout) {
     dyn.dynamicStateCount = 2;
     dyn.pDynamicStates = dynStates;
 
-    // Push constants: viewProj (64) + model (64) = 128 bytes, vertex stage.
-    VkPushConstantRange pcr{};
-    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    pcr.offset = 0;
-    pcr.size = 128;
+    // Push constants: viewProj (64) + model (64) = 128 bytes (vertex stage), plus
+    // a vec4 force-color at offset 128 (fragment stage) for wireframe-over-solid.
+    VkPushConstantRange pcr[2]{};
+    pcr[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcr[0].offset = 0;
+    pcr[0].size = 128;
+    pcr[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr[1].offset = 128;
+    pcr[1].size = 16;
 
     VkPipelineLayoutCreateInfo plci{};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &descLayout_;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges = &pcr;
+    plci.pushConstantRangeCount = 2;
+    plci.pPushConstantRanges = pcr;
     VK_CHECK(vkCreatePipelineLayout(device_, &plci, nullptr, &pipelineLayout_));
 
     VkGraphicsPipelineCreateInfo pci{};
@@ -561,6 +577,28 @@ bool VkRenderer::createPipeline(const render::VertexLayout& layout) {
 
     VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci,
                                            nullptr, &pipeline_);
+
+    // Sibling pipelines identical except for the polygon mode -- line (wireframe)
+    // and point. The host binds the matching one per Helium drawing mode (Tab).
+    // These don't need the solid pipeline's depth bias.
+    if (r == VK_SUCCESS) {
+        rs.depthBiasEnable = VK_FALSE;
+        rs.polygonMode = VK_POLYGON_MODE_LINE;
+        VkResult rw = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci,
+                                                nullptr, &pipelineWireframe_);
+        if (rw != VK_SUCCESS) {
+            SDL_Log("VkRenderer: wireframe pipeline creation failed (%d)", (int)rw);
+            pipelineWireframe_ = VK_NULL_HANDLE;  // fall back to solid
+        }
+        rs.polygonMode = VK_POLYGON_MODE_POINT;
+        VkResult rp = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci,
+                                                nullptr, &pipelinePoint_);
+        if (rp != VK_SUCCESS) {
+            SDL_Log("VkRenderer: point pipeline creation failed (%d)", (int)rp);
+            pipelinePoint_ = VK_NULL_HANDLE;  // fall back to solid
+        }
+    }
+
     vkDestroyShaderModule(device_, vs, nullptr);
     vkDestroyShaderModule(device_, fs, nullptr);
     if (r != VK_SUCCESS) {
@@ -1125,6 +1163,7 @@ void VkRenderer::beginFrame(const render::FrameContext& frame) {
 
 void VkRenderer::submit(const render::DrawItem& item) {
     if (!frameActive_ || pipeline_ == VK_NULL_HANDLE) return;
+    if (drawMode_ == 0) return;  // None: draw nothing
 
     auto meshIt = meshes_.find(item.mesh);
     if (meshIt == meshes_.end()) return;
@@ -1135,27 +1174,50 @@ void VkRenderer::submit(const render::DrawItem& item) {
 
     VkCommandBuffer cmd = commandBuffers_[currentFrame_];
 
-    // Bind the draw's texture (or the white fallback).
+    // Common per-draw state (shared by every pipeline / drawing mode).
     VkDescriptorSet set = whiteSet_;
     auto tIt = textures_.find(item.texture);
     if (tIt != textures_.end()) set = tIt->second.set;
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0,
                             1, &set, 0, nullptr);
-
-    // Per-draw model matrix at push-constant offset 64 (after viewProj).
-    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 64, 64,
-                       item.model);
-
+    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 64, 64, item.model);
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vbIt->second.buffer, &offset);
-
+    const VkBufferObject* ib = nullptr;
     if (mesh.indexed) {
         auto ibIt = buffers_.find(mesh.indexBuffer);
         if (ibIt == buffers_.end()) return;
-        vkCmdBindIndexBuffer(cmd, ibIt->second.buffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
-    } else {
-        vkCmdDraw(cmd, mesh.vertexCount, 1, 0, 0);
+        ib = &ibIt->second;
+        vkCmdBindIndexBuffer(cmd, ib->buffer, 0, VK_INDEX_TYPE_UINT32);
+    }
+
+    auto drawWith = [&](VkPipeline pipe, bool blackEdges) {
+        float forceColor[4] = {0.0f, 0.0f, 0.0f, blackEdges ? 1.0f : 0.0f};
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 128, 16,
+                           forceColor);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          pipe != VK_NULL_HANDLE ? pipe : pipeline_);
+        if (mesh.indexed)
+            vkCmdDrawIndexed(cmd, mesh.indexCount, 1, 0, 0, 0);
+        else
+            vkCmdDraw(cmd, mesh.vertexCount, 1, 0, 0);
+    };
+
+    // Helium drawing modes (see IRenderer::setDrawMode).
+    switch (drawMode_) {
+        case 2:  // WireFrame
+            drawWith(pipelineWireframe_, false);
+            break;
+        case 3:  // WireFrameOverSolid: biased fill, then black edges on top
+            drawWith(pipeline_, false);
+            drawWith(pipelineWireframe_, true);
+            break;
+        case 4:  // Point
+            drawWith(pipelinePoint_, false);
+            break;
+        default:  // 1 = Solid
+            drawWith(pipeline_, false);
+            break;
     }
 }
 
@@ -1251,6 +1313,8 @@ void VkRenderer::setVsync(bool enabled) {
     needsResize_ = true;
 }
 
+void VkRenderer::setDrawMode(uint32_t mode) { drawMode_ = mode; }
+
 bool VkRenderer::readPixels(std::vector<uint8_t>&, uint32_t&, uint32_t&) {
     // TODO: copy the last swapchain image to a host-visible buffer. Screenshot
     // is currently OpenGL-only.
@@ -1265,6 +1329,10 @@ void VkRenderer::shutdown() {
     if (gridLayout_)     vkDestroyPipelineLayout(device_, gridLayout_, nullptr);
     gridPipeline_ = VK_NULL_HANDLE;
     gridLayout_   = VK_NULL_HANDLE;
+    if (pipelinePoint_)     vkDestroyPipeline(device_, pipelinePoint_, nullptr);
+    pipelinePoint_ = VK_NULL_HANDLE;
+    if (pipelineWireframe_) vkDestroyPipeline(device_, pipelineWireframe_, nullptr);
+    pipelineWireframe_ = VK_NULL_HANDLE;
     if (pipeline_)       vkDestroyPipeline(device_, pipeline_, nullptr);
     if (pipelineLayout_) vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
     pipeline_ = VK_NULL_HANDLE;
