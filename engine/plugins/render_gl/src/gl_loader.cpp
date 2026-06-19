@@ -44,6 +44,7 @@ PFN_glTexParameteri           glTexParameteri           = nullptr;
 PFN_glActiveTexture           glActiveTexture           = nullptr;
 PFN_glDeleteTextures          glDeleteTextures          = nullptr;
 PFN_glUniform1i               glUniform1i               = nullptr;
+PFN_glUniform1f               glUniform1f               = nullptr;
 PFN_glUniform4f               glUniform4f               = nullptr;
 PFN_glBlendFunc               glBlendFunc               = nullptr;
 PFN_glReadPixels              glReadPixels              = nullptr;
@@ -118,6 +119,7 @@ bool loadGLFunctions() {
     ORANGE_LOAD(glActiveTexture);
     ORANGE_LOAD(glDeleteTextures);
     ORANGE_LOAD(glUniform1i);
+    ORANGE_LOAD(glUniform1f);
     ORANGE_LOAD(glUniform4f);
     ORANGE_LOAD(glBlendFunc);
     ORANGE_LOAD(glReadPixels);

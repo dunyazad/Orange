@@ -101,12 +101,14 @@ cmake --build D:/Library/Orange/build --config Debug
 
 ## Key facts to keep in mind
 
-- **Plugin ABI is v13** (v13 added `MeshDesc::topology`: `Triangles` or `Points`;
+- **Plugin ABI is v14.** v13 added `MeshDesc::topology` (`Triangles` or `Points`);
   a `Points` mesh is drawn as **sphere-imposter point sprites** — real GL_POINTS /
   VK POINT_LIST with a fragment shader that rounds + shades each sprite via
   `gl_PointCoord`, not instanced spheres. Faceless PLYs load as such point clouds;
-  their selection shows a bounding-box wireframe, not the stencil silhouette).
-  Changing the C contract means bumping
+  their selection shows a bounding-box wireframe, not the stencil silhouette. v14
+  added `IRenderer::setPointSize(float)` (the `+`/`-` keys resize point sprites;
+  GL drives `gl_PointSize` via a `uPointSize` uniform, VK via a vertex push
+  constant at offset 144). Changing the C contract means bumping
   `ORANGE_PLUGIN_ABI_VERSION` and updating both backends. v6 added
   `IRenderer::setVsync(bool)` (GL flips the swap interval; VK recreates the
   swapchain with a FIFO / immediate-mailbox present mode). v7 added

@@ -910,6 +910,29 @@ void pickingSystem(entt::registry& world, const core::Input& input,
         lo = lo.cwiseProduct(inv);
         ld = ld.cwiseProduct(inv);
 
+        // Point cloud: pick by screen-space proximity to an actual point sprite, so
+        // clicking visibly empty space (even inside the AABB) selects nothing. A
+        // point is hit when it projects within ~a sprite radius of the cursor; the
+        // allowed world perpendicular scales with depth, so the test is a constant
+        // number of pixels regardless of zoom. Resolved entirely here.
+        if (const PickGeometry* pg = world.try_get<PickGeometry>(e); pg && r.pointCloud) {
+            const Eigen::Matrix4f toWorld = Mworld * t.matrix();
+            const float pixelRadius = 6.0f;  // about the rendered point-sprite size
+            const bool  ortho = (cam->mode == ProjectionMode::Orthographic);
+            const float kAng  = ortho ? 0.0f
+                : 2.0f * std::tan(cam->fovYDegrees * 3.14159265f / 180.0f * 0.5f) / H * pixelRadius;
+            const float orthoThr = ortho ? (2.0f * cam->orthoSize / H * pixelRadius) : 0.0f;
+            for (const Eigen::Vector3f& pl : pg->positions) {
+                Eigen::Vector4f pw = toWorld * Eigen::Vector4f(pl.x(), pl.y(), pl.z(), 1.0f);
+                Eigen::Vector3f rel(pw.x() - rayOW.x(), pw.y() - rayOW.y(), pw.z() - rayOW.z());
+                float tw = rel.dot(rayDW);
+                if (tw <= 0.0f || tw >= bestT) continue;
+                float perp = (rel - rayDW * tw).norm();
+                if (perp < (ortho ? orthoThr : kAng * tw)) { bestT = tw; best = e; }
+            }
+            continue;
+        }
+
         // Accurate triangle pick when CPU geometry is available, else the AABB.
         float tLocal = 0.0f;
         bool hit = false;

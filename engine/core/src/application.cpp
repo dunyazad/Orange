@@ -88,9 +88,13 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                     if (e.key.scancode == SDL_SCANCODE_C) capture_ = true;  // screenshot
                     if (e.key.scancode == SDL_SCANCODE_TAB) {  // cycle each selected mesh's draw mode
                         auto v = world_.view<ecs::Renderable>();
+                        // With a single mesh, Tab applies to it without an explicit
+                        // selection (there's nothing else it could mean).
+                        size_t count = 0;
+                        for (auto ent : v) { (void)ent; ++count; }
                         for (auto ent : v) {
                             auto& r = v.get<ecs::Renderable>(ent);
-                            if (!r.selected) continue;
+                            if (!r.selected && count != 1) continue;
                             r.drawMode = static_cast<DrawMode>(
                                 (static_cast<uint32_t>(r.drawMode) + 1) %
                                 static_cast<uint32_t>(DrawMode::Count));
@@ -121,6 +125,18 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                         for (auto ent : dead) world_.destroy(ent);
                         if (!dead.empty())
                             SDL_Log("Application: deleted %zu mesh(es)", dead.size());
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_EQUALS ||
+                        e.key.scancode == SDL_SCANCODE_KP_PLUS) {  // grow point sprites
+                        pointSize_ = pointSize_ + 1.0f > 64.0f ? 64.0f : pointSize_ + 1.0f;
+                        plugin_->renderer()->setPointSize(pointSize_);
+                        SDL_Log("Application: point size = %.0f", pointSize_);
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_MINUS ||
+                        e.key.scancode == SDL_SCANCODE_KP_MINUS) {  // shrink point sprites
+                        pointSize_ = pointSize_ - 1.0f < 1.0f ? 1.0f : pointSize_ - 1.0f;
+                        plugin_->renderer()->setPointSize(pointSize_);
+                        SDL_Log("Application: point size = %.0f", pointSize_);
                     }
                     if (e.key.scancode == SDL_SCANCODE_H) {
                         // Unhide all: reveal meshes hidden by the None draw mode so

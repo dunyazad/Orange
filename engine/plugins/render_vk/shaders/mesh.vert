@@ -4,10 +4,11 @@ layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aColor;
 layout(location = 2) in vec2 aUV;
 
-// 128 bytes = the guaranteed minimum push-constant size (two mat4).
+// viewProj+model (128); fragment force-color occupies offset 128; point size at 144.
 layout(push_constant) uniform Push {
     mat4 viewProj;  // already includes the Vulkan clip-space correction
     mat4 model;
+    layout(offset = 144) float pointSize;
 } pc;
 
 layout(location = 0) out vec3 vColor;
@@ -17,5 +18,5 @@ void main() {
     vColor = aColor;
     vUV = aUV;
     gl_Position = pc.viewProj * pc.model * vec4(aPos, 1.0);
-    gl_PointSize = 6.0;  // used by the point-mode / point-cloud pipelines
+    gl_PointSize = pc.pointSize;  // used by the point-cloud pipeline
 }

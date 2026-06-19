@@ -48,6 +48,7 @@ public:
     void resize(uint32_t width, uint32_t height) override;
     void setVsync(bool enabled) override;
     void setDrawMode(uint32_t mode) override;
+    void setPointSize(float pixels) override;
     bool readPixels(std::vector<uint8_t>& out, uint32_t& w, uint32_t& h) override;
 
     render::Backend backend() const override { return render::Backend::OpenGL; }
@@ -62,6 +63,8 @@ private:
     int          uTex_        = -1;
     int          uForceColor_ = -1;  // wireframe-over-solid edge color override
     int          uPointMode_  = -1;  // sphere-imposter point rendering
+    int          uPointSize_  = -1;  // point-sprite pixel diameter
+    float        pointSize_   = 6.0f;
     uint32_t     width_  = 0;
     uint32_t     height_ = 0;
     uint32_t     drawMode_ = 0;  // 0 = fill, 1 = wireframe (see setDrawMode)

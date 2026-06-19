@@ -74,6 +74,11 @@ public:
     // it does not affect drawGrid() or overlay passes.
     virtual void setDrawMode(uint32_t mode) = 0;
 
+    // Sets the pixel diameter of point-cloud sprites (the sphere-imposter points).
+    // Affects only meshes created with PrimitiveTopology::Points; ignored by
+    // triangle meshes. Both backends drive gl_PointSize from this.
+    virtual void setPointSize(float pixels) = 0;
+
     // Capture --------------------------------------------------------------
     // Reads the last presented frame into `out` as top-left-origin RGBA8.
     // Returns false if unsupported. Call after endFrame().

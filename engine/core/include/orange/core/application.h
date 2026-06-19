@@ -51,6 +51,7 @@ private:
     Input                         input_;
     bool                          running_ = false;
     bool                          capture_ = false;  // 'C' pressed -> screenshot
+    float                         pointSize_ = 6.0f; // point-cloud sprite size (+/- keys)
 
     static std::string defaultPluginName(render::Backend backend);
     static std::string executableDir();

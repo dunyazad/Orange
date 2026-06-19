@@ -17,13 +17,14 @@ layout(location = 1) in vec3 aColor;
 layout(location = 2) in vec2 aUV;
 uniform mat4 uViewProj;
 uniform mat4 uModel;
+uniform float uPointSize;  // pixel diameter for point-cloud sprites
 out vec3 vColor;
 out vec2 vUV;
 void main() {
     vColor = aColor;
     vUV = aUV;
     gl_Position = uViewProj * uModel * vec4(aPos, 1.0);
-    gl_PointSize = 6.0;  // used only for point-cloud (sphere-imposter) draws
+    gl_PointSize = uPointSize;  // used only for point-cloud (sphere-imposter) draws
 }
 )";
 
@@ -241,10 +242,12 @@ bool GLRenderer::buildProgram() {
     uTex_        = glGetUniformLocation(program_, "uTex");
     uForceColor_ = glGetUniformLocation(program_, "uForceColor");
     uPointMode_  = glGetUniformLocation(program_, "uPointMode");
+    uPointSize_  = glGetUniformLocation(program_, "uPointSize");
     glUseProgram(program_);
     glUniform1i(uTex_, 0);  // sampler uses texture unit 0
     glUniform4f(uForceColor_, 0.0f, 0.0f, 0.0f, 0.0f);  // disabled by default
     glUniform1i(uPointMode_, 0);
+    glUniform1f(uPointSize_, pointSize_);
     return true;
 }
 
@@ -475,6 +478,7 @@ void GLRenderer::submit(const render::DrawItem& item) {
     if (mesh.points) {
         glEnable(GL_PROGRAM_POINT_SIZE);
         glUniform1i(uPointMode_, 1);
+        glUniform1f(uPointSize_, pointSize_);
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         glDrawArrays(GL_POINTS, 0, mesh.count);
         glUniform1i(uPointMode_, 0);
@@ -552,6 +556,11 @@ void GLRenderer::submit(const render::DrawItem& item) {
 }
 
 void GLRenderer::setDrawMode(uint32_t mode) { drawMode_ = mode; }
+
+void GLRenderer::setPointSize(float pixels) {
+    pointSize_ = pixels < 1.0f ? 1.0f : (pixels > 64.0f ? 64.0f : pixels);
+    if (program_) { glUseProgram(program_); glUniform1f(uPointSize_, pointSize_); }
+}
 
 void GLRenderer::beginOverlay(const render::OverlayContext& ov) {
     // GL viewport/scissor use a bottom-left origin; flip the top-left rect.

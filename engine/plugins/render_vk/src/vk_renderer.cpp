@@ -545,21 +545,25 @@ bool VkRenderer::createPipeline(const render::VertexLayout& layout) {
     dyn.dynamicStateCount = 2;
     dyn.pDynamicStates = dynStates;
 
-    // Push constants: viewProj (64) + model (64) = 128 bytes (vertex stage), plus
-    // a vec4 force-color at offset 128 (fragment stage) for wireframe-over-solid.
-    VkPushConstantRange pcr[2]{};
+    // Push constants: viewProj (64) + model (64) = 128 bytes (vertex stage); a
+    // vec4 force-color at offset 128 (fragment stage) for wireframe-over-solid;
+    // and a float point size at offset 144 (vertex stage) for point-cloud sprites.
+    VkPushConstantRange pcr[3]{};
     pcr[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pcr[0].offset = 0;
     pcr[0].size = 128;
     pcr[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     pcr[1].offset = 128;
     pcr[1].size = 16;
+    pcr[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcr[2].offset = 144;
+    pcr[2].size = 4;
 
     VkPipelineLayoutCreateInfo plci{};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &descLayout_;
-    plci.pushConstantRangeCount = 2;
+    plci.pushConstantRangeCount = 3;
     plci.pPushConstantRanges = pcr;
     VK_CHECK(vkCreatePipelineLayout(device_, &plci, nullptr, &pipelineLayout_));
 
@@ -1286,6 +1290,8 @@ void VkRenderer::submit(const render::DrawItem& item) {
 
     // Point cloud -> sphere-imposter point sprites (independent of the draw modes).
     if (mesh.points) {
+        vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 144, 4,
+                           &pointSize_);
         drawWith(pipelinePoints_, kNoForce);
         return;
     }
@@ -1421,6 +1427,10 @@ void VkRenderer::setVsync(bool enabled) {
 }
 
 void VkRenderer::setDrawMode(uint32_t mode) { drawMode_ = mode; }
+
+void VkRenderer::setPointSize(float pixels) {
+    pointSize_ = pixels < 1.0f ? 1.0f : (pixels > 64.0f ? 64.0f : pixels);
+}
 
 bool VkRenderer::readPixels(std::vector<uint8_t>&, uint32_t&, uint32_t&) {
     // TODO: copy the last swapchain image to a host-visible buffer. Screenshot

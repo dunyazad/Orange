@@ -634,15 +634,15 @@ int main(int argc, char** argv) {
         if (isPoints) r.pointCloud = true;  // drawn as point sprites; box-wireframe selection
         world.emplace<ecs::Renderable>(e, r);
 
-        // Accurate triangle picking for real meshes; point clouds fall back to AABB.
-        if (!isPoints) {
-            ecs::PickGeometry pick;
-            pick.positions.reserve(mv.size());
-            for (const auto& v : mv)
-                pick.positions.emplace_back(v.position[0], v.position[1], v.position[2]);
-            pick.indices = mi;
-            world.emplace<ecs::PickGeometry>(e, std::move(pick));
-        }
+        // CPU geometry for accurate picking: triangles for real meshes, or the raw
+        // point positions for a point cloud (picked by proximity, so empty space
+        // inside the AABB doesn't select). indices stays empty for a point cloud.
+        ecs::PickGeometry pick;
+        pick.positions.reserve(mv.size());
+        for (const auto& v : mv)
+            pick.positions.emplace_back(v.position[0], v.position[1], v.position[2]);
+        if (!isPoints) pick.indices = mi;
+        world.emplace<ecs::PickGeometry>(e, std::move(pick));
 
         if (isPoints)
             SDL_Log("Mesh: loaded '%s' (%zu points)", path.c_str(), mv.size());
@@ -680,7 +680,8 @@ int main(int argc, char** argv) {
 
     SDL_Log("appOrange: running. File > Open... loads a mesh (OBJ/STL).");
     SDL_Log("appOrange: click selects (Ctrl+click toggles, Ctrl+A all on-screen, empty clears, "
-            "Delete removes); Tab cycles the selection's drawing mode (H reveals None-hidden meshes).");
+            "Delete removes); Tab cycles the selection's drawing mode (H reveals None-hidden meshes); "
+            "+/- resize point-cloud sprites.");
     SDL_Log("appOrange: ESC or close the window to quit.");
     app.run(onUpdate);  // onUpdate + spinSystem + renderSystem run each frame
     return 0;
