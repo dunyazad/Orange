@@ -49,6 +49,9 @@ public:
     void setVsync(bool enabled) override;
     void setDrawMode(uint32_t mode) override;
     void setPointSize(float pixels) override;
+    void setLighting(bool enabled) override;
+    void setCrossSection(bool enabled, const float plane[4]) override;
+    void setColorMode(uint32_t mode) override;
     bool readPixels(std::vector<uint8_t>& out, uint32_t& w, uint32_t& h) override;
 
     render::Backend backend() const override { return render::Backend::OpenGL; }
@@ -64,7 +67,13 @@ private:
     int          uForceColor_ = -1;  // wireframe-over-solid edge color override
     int          uPointMode_  = -1;  // sphere-imposter point rendering
     int          uPointSize_  = -1;  // point-sprite pixel diameter
+    int          uLighting_   = -1;  // 1 => shade point sprites; 0 => flat color
+    int          uClipPlane_  = -1;  // cross-section: discard dot(world,n)+d > 0
+    int          uColorMode_  = -1;  // 0 default / 1 height / 2 position / 3 grayscale
     float        pointSize_   = 6.0f;
+    bool         lighting_    = true;  // point-sprite diffuse shading on/off (`)
+    float        clipPlane_[4] = {0, 0, 0, 0};  // (nx,ny,nz,d); zero normal = off
+    uint32_t     colorMode_   = 0;  // scene coloring mode (Shift+` cycles)
     uint32_t     width_  = 0;
     uint32_t     height_ = 0;
     uint32_t     drawMode_ = 0;  // 0 = fill, 1 = wireframe (see setDrawMode)

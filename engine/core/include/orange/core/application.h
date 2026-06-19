@@ -52,6 +52,8 @@ private:
     bool                          running_ = false;
     bool                          capture_ = false;  // 'C' pressed -> screenshot
     float                         pointSize_ = 6.0f; // point-cloud sprite size (+/- keys)
+    bool                          lighting_  = true; // point-sprite shading (` toggles)
+    uint32_t                      colorMode_ = 3;    // scene coloring (3 = grayscale default; Shift+` cycles)
 
     static std::string defaultPluginName(render::Backend backend);
     static std::string executableDir();

@@ -20,10 +20,13 @@ uniform mat4 uModel;
 uniform float uPointSize;  // pixel diameter for point-cloud sprites
 out vec3 vColor;
 out vec2 vUV;
+out vec3 vWorld;           // world-space position for cross-section clipping
 void main() {
     vColor = aColor;
     vUV = aUV;
-    gl_Position = uViewProj * uModel * vec4(aPos, 1.0);
+    vec4 world = uModel * vec4(aPos, 1.0);
+    vWorld = world.xyz;
+    gl_Position = uViewProj * world;
     gl_PointSize = uPointSize;  // used only for point-cloud (sphere-imposter) draws
 }
 )";
@@ -31,22 +34,53 @@ void main() {
 const char* kFragmentShader = R"(#version 330 core
 in vec3 vColor;
 in vec2 vUV;
+in vec3 vWorld;
 uniform sampler2D uTex;
 uniform vec4 uForceColor;  // .a > 0 => draw this solid color (wireframe-over-solid edges)
 uniform int  uPointMode;   // 1 => render the point sprite as a shaded sphere imposter
+uniform int  uLighting;    // 1 => shade point sprites with diffuse; 0 => flat color
+uniform vec4 uClipPlane;   // cross-section (nx,ny,nz,d); zero normal = disabled
+uniform int  uColorMode;   // 0 default / 1 height / 2 position / 3 grayscale
 out vec4 FragColor;
+vec3 jet(float t) {        // compact blue->cyan->green->yellow->red ramp
+    t = clamp(t, 0.0, 1.0);
+    return clamp(vec3(1.5 - abs(4.0 * t - 3.0),
+                      1.5 - abs(4.0 * t - 2.0),
+                      1.5 - abs(4.0 * t - 1.0)), 0.0, 1.0);
+}
+vec3 colorFor(vec3 c, vec3 w) {   // remap the base color by the active mode
+    if (uColorMode == 1) return jet(w.y * 0.15 + 0.5);              // height (world Y)
+    if (uColorMode == 2) return clamp(w * 0.15 + 0.5, 0.0, 1.0);    // position XYZ
+    if (uColorMode == 3) return vec3(dot(c, vec3(0.299, 0.587, 0.114)));  // grayscale
+    return c;
+}
 void main() {
+    // Cross-section: discard fragments on the positive side of the world plane.
+    if (dot(uClipPlane.xyz, uClipPlane.xyz) > 0.0 &&
+        dot(vWorld, uClipPlane.xyz) + uClipPlane.w > 0.0) discard;
     if (uForceColor.a > 0.0) { FragColor = vec4(uForceColor.rgb, 1.0); return; }
+    vec3 base = colorFor(vColor, vWorld);
     if (uPointMode == 1) {
         vec2 d = gl_PointCoord * 2.0 - 1.0;  // [-1,1] across the sprite
         float r2 = dot(d, d);
         if (r2 > 1.0) discard;               // round, not square
         vec3 N = vec3(d.x, -d.y, sqrt(1.0 - r2));            // sphere normal
-        float diff = max(dot(N, normalize(vec3(0.4, 0.7, 0.6))), 0.0) * 0.75 + 0.25;
-        FragColor = vec4(vColor * diff, 1.0);
+        float diff = uLighting == 1
+            ? max(dot(N, normalize(vec3(0.4, 0.7, 0.6))), 0.0) * 0.75 + 0.25
+            : 1.0;                                           // unlit: flat color
+        FragColor = vec4(base * diff, 1.0);
         return;
     }
-    FragColor = texture(uTex, vUV) * vec4(vColor, 1.0);
+    vec4 texc = texture(uTex, vUV) * vec4(base, 1.0);  // keep alpha (glyph coverage)
+    vec3 col = texc.rgb;
+    if (uLighting == 1) {
+        // Triangle meshes carry no normals, so derive a flat face normal from the
+        // screen-space derivatives of the world position and shade it diffusely.
+        vec3 N = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
+        float diff = max(abs(dot(N, normalize(vec3(0.4, 0.7, 0.6)))), 0.0) * 0.7 + 0.3;
+        col *= diff;
+    }
+    FragColor = vec4(col, texc.a);
 }
 )";
 
@@ -243,11 +277,17 @@ bool GLRenderer::buildProgram() {
     uForceColor_ = glGetUniformLocation(program_, "uForceColor");
     uPointMode_  = glGetUniformLocation(program_, "uPointMode");
     uPointSize_  = glGetUniformLocation(program_, "uPointSize");
+    uLighting_   = glGetUniformLocation(program_, "uLighting");
+    uClipPlane_  = glGetUniformLocation(program_, "uClipPlane");
+    uColorMode_  = glGetUniformLocation(program_, "uColorMode");
     glUseProgram(program_);
     glUniform1i(uTex_, 0);  // sampler uses texture unit 0
     glUniform4f(uForceColor_, 0.0f, 0.0f, 0.0f, 0.0f);  // disabled by default
     glUniform1i(uPointMode_, 0);
     glUniform1f(uPointSize_, pointSize_);
+    glUniform1i(uLighting_, lighting_ ? 1 : 0);
+    glUniform4f(uClipPlane_, 0.0f, 0.0f, 0.0f, 0.0f);  // cross-section off
+    glUniform1i(uColorMode_, static_cast<int>(colorMode_));
     return true;
 }
 
@@ -439,6 +479,9 @@ void GLRenderer::beginFrame(const render::FrameContext& frame) {
 
     glUseProgram(program_);
     glUniformMatrix4fv(uViewProj_, 1, GL_FALSE, viewProj_);
+    glUniform4f(uClipPlane_, clipPlane_[0], clipPlane_[1], clipPlane_[2], clipPlane_[3]);
+    glUniform1i(uColorMode_, static_cast<int>(colorMode_));  // scene coloring
+    glUniform1i(uLighting_, lighting_ ? 1 : 0);              // scene lighting
 }
 
 void GLRenderer::drawGrid(int upAxis) {
@@ -562,6 +605,28 @@ void GLRenderer::setPointSize(float pixels) {
     if (program_) { glUseProgram(program_); glUniform1f(uPointSize_, pointSize_); }
 }
 
+void GLRenderer::setLighting(bool enabled) {
+    lighting_ = enabled;
+    if (program_) { glUseProgram(program_); glUniform1i(uLighting_, lighting_ ? 1 : 0); }
+}
+
+void GLRenderer::setCrossSection(bool enabled, const float plane[4]) {
+    if (enabled && plane) {
+        for (int i = 0; i < 4; ++i) clipPlane_[i] = plane[i];
+    } else {
+        clipPlane_[0] = clipPlane_[1] = clipPlane_[2] = clipPlane_[3] = 0.0f;  // off
+    }
+    if (program_) {
+        glUseProgram(program_);
+        glUniform4f(uClipPlane_, clipPlane_[0], clipPlane_[1], clipPlane_[2], clipPlane_[3]);
+    }
+}
+
+void GLRenderer::setColorMode(uint32_t mode) {
+    colorMode_ = mode;
+    if (program_) { glUseProgram(program_); glUniform1i(uColorMode_, static_cast<int>(colorMode_)); }
+}
+
 void GLRenderer::beginOverlay(const render::OverlayContext& ov) {
     // GL viewport/scissor use a bottom-left origin; flip the top-left rect.
     GLint gy = static_cast<GLint>(height_) - ov.y - ov.height;
@@ -585,6 +650,9 @@ void GLRenderer::beginOverlay(const render::OverlayContext& ov) {
         }
     glUseProgram(program_);
     glUniformMatrix4fv(uViewProj_, 1, GL_FALSE, viewProj_);
+    glUniform4f(uClipPlane_, 0.0f, 0.0f, 0.0f, 0.0f);  // never clip overlay quads
+    glUniform1i(uColorMode_, 0);                       // overlays keep their UI colors
+    glUniform1i(uLighting_, 0);                        // overlays are never shaded
 }
 
 void GLRenderer::endFrame() {

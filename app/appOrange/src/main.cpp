@@ -14,9 +14,11 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define STB_TRUETYPE_IMPLEMENTATION
@@ -261,6 +263,25 @@ void SDLCALL onFilePicked(void* userdata, const char* const* filelist, int /*fil
     res->busy.store(false);
 }
 
+// A single background mesh-load in flight. The worker thread parses the file
+// (the slow part) into CPU arrays and reports progress via `percent`; the main
+// thread polls `done`, then does the GPU upload + entity spawn (which must stay
+// on the render thread). Only the worker touches the result vectors until it
+// sets `done` (release), after which the main thread owns them -- so no lock is
+// needed on `verts`/`indices`.
+struct LoadJob {
+    std::thread                 worker;
+    std::atomic<int>            percent{0};      // 0..100, written by the worker
+    std::atomic<bool>           done{false};     // worker finished (success or fail)
+    std::atomic<bool>           ok{false};       // load succeeded
+    std::string                 path;            // source file (for logging/status)
+    std::vector<render::Vertex> verts;           // result (valid when done && ok)
+    std::vector<uint32_t>       indices;
+    bool                        active = false;  // main-thread only: a job exists
+
+    ~LoadJob() { if (worker.joinable()) worker.join(); }
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -305,6 +326,10 @@ int main(int argc, char** argv) {
         manip.target      = Eigen::Vector3f(0.0f, 0.0f, 0.0f);
         manip.distance    = 7.0f;
         manip.orientation = math::quatAxisAngle(Eigen::Vector3f(1, 0, 0), -0.3f);  // tilt down slightly
+        // Home pose restored by the R key.
+        manip.homeTarget      = manip.target;
+        manip.homeDistance    = manip.distance;
+        manip.homeOrientation = manip.orientation;
         world.emplace<ecs::CameraManipulator>(cam, manip);
     }
 
@@ -519,6 +544,33 @@ int main(int argc, char** argv) {
         world.emplace<ecs::CameraControls>(e, cc);
     }
 
+    // Cross-section panel (clip-plane slider), under the camera controls.
+    const int kCsQ = 64, kCsV = kCsQ * 4;  // must match kCsQuads in systems.cpp
+    const std::vector<render::Vertex> csInit(kCsV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
+    std::vector<uint32_t> csIdx;
+    for (uint32_t q = 0; q < static_cast<uint32_t>(kCsQ); ++q) {
+        uint32_t b = q * 4;
+        csIdx.insert(csIdx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+    }
+    core::VertexBuffer<render::Vertex> csVbo(*app.renderer(), csInit,
+                                             render::BufferUsage::Dynamic);
+    core::IndexBuffer                  csIbo(*app.renderer(), csIdx);
+    render::MeshDesc csMeshDesc;
+    csMeshDesc.vertexBuffer = csVbo.handle();
+    csMeshDesc.indexBuffer  = csIbo.handle();
+    csMeshDesc.layout       = render::Vertex::layout();
+    csMeshDesc.vertexCount  = static_cast<uint32_t>(kCsV);
+    csMeshDesc.indexCount   = static_cast<uint32_t>(kCsQ * 6);
+    {
+        auto e = world.create();
+        ecs::CrossSection cs;
+        cs.font  = &uiFont;
+        cs.atlas = uiFont.texture;
+        cs.mesh  = app.renderer()->createMesh(csMeshDesc);
+        cs.vbo   = csVbo.handle();
+        world.emplace<ecs::CrossSection>(e, cs);
+    }
+
     // Top menu bar (File > Open...). Dynamic vertex buffer rewritten each frame.
     const int kMenuQ = 64, kMenuV = kMenuQ * 4;  // must match kMenuQuads in systems.cpp
     const std::vector<render::Vertex> menuInit(kMenuV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
@@ -580,12 +632,13 @@ int main(int argc, char** argv) {
         {"All files", "*"},
     };
 
-    // Parses a mesh file, centers + uniform-scales it to fit, uploads GPU buffers,
-    // and spawns a (Transform, Renderable) entity that renderSystem picks up.
-    auto spawnMesh = [&](const std::string& path) {
-        std::vector<render::Vertex> mv;
-        std::vector<uint32_t>       mi;
-        if (!meshio::loadMeshFile(path, mv, mi) || mv.empty()) {
+    // Takes the CPU mesh produced by the background loader, centers +
+    // uniform-scales it to fit, uploads GPU buffers, and spawns a
+    // (Transform, Renderable) entity that renderSystem picks up. Runs on the main
+    // (render) thread because GPU resource creation is context-affine.
+    auto finalizeMesh = [&](const std::string& path, std::vector<render::Vertex>& mv,
+                            std::vector<uint32_t>& mi) {
+        if (mv.empty()) {
             SDL_Log("Mesh: failed to load '%s'", path.c_str());
             return;
         }
@@ -651,22 +704,24 @@ int main(int argc, char** argv) {
                     mi.size() / 3);
     };
 
-    auto onUpdate = [&](entt::registry& w, float /*dt*/) {
+    LoadJob loadJob;
+    float   statusHold = 0.0f;  // seconds to keep the final "Loaded/Failed" message
+
+    auto onUpdate = [&](entt::registry& w, float dt) {
+        ecs::MenuBar* mb = nullptr;
+        auto          mbv = w.view<ecs::MenuBar>();
+        for (auto e : mbv) { mb = &mbv.get<ecs::MenuBar>(e); break; }
+
         // Menu raised a request? Open the native dialog (unless one is already up).
-        auto mbv = w.view<ecs::MenuBar>();
-        for (auto e : mbv) {
-            auto& mb = mbv.get<ecs::MenuBar>(e);
-            if (mb.requestOpenFile) {
-                mb.requestOpenFile = false;
-                if (!fileDrop.busy.exchange(true)) {
-                    SDL_ShowOpenFileDialog(onFilePicked, &fileDrop, app.window().handle(),
-                                           kMeshFilters, 2, nullptr, /*allow_many=*/false);
-                }
+        if (mb && mb->requestOpenFile) {
+            mb->requestOpenFile = false;
+            if (!fileDrop.busy.exchange(true)) {
+                SDL_ShowOpenFileDialog(onFilePicked, &fileDrop, app.window().handle(),
+                                       kMeshFilters, 2, nullptr, /*allow_many=*/false);
             }
-            break;
         }
         // Drain whatever the dialog callback handed back (it runs on a platform
-        // thread), then load it on the main thread.
+        // thread). Only one load runs at a time -- a pick while busy is dropped.
         std::string path;
         {
             std::lock_guard<std::mutex> lk(fileDrop.mtx);
@@ -675,7 +730,49 @@ int main(int argc, char** argv) {
                 fileDrop.paths.clear();
             }
         }
-        if (!path.empty()) spawnMesh(path);
+        if (!path.empty() && !loadJob.active) {
+            loadJob.active = true;
+            loadJob.path   = path;
+            loadJob.percent.store(0);
+            loadJob.done.store(false);
+            loadJob.ok.store(false);
+            loadJob.verts.clear();
+            loadJob.indices.clear();
+            // Parse the file off the main thread, reporting progress into `percent`.
+            loadJob.worker = std::thread([job = &loadJob] {
+                std::vector<render::Vertex> v;
+                std::vector<uint32_t>       i;
+                bool ok = meshio::loadMeshFile(
+                              job->path, v, i,
+                              [job](float p) {
+                                  job->percent.store(static_cast<int>(p * 100.0f + 0.5f));
+                              }) &&
+                          !v.empty();
+                if (ok) { job->verts = std::move(v); job->indices = std::move(i); }
+                job->percent.store(100);
+                job->ok.store(ok);
+                job->done.store(true);  // publish last; main thread now owns the result
+            });
+        }
+
+        // Drive status text + finalize a finished load on the main thread.
+        if (loadJob.active) {
+            if (!loadJob.done.load()) {
+                if (mb) mb->statusText = "Loading " + std::to_string(loadJob.percent.load()) + "%";
+            } else {
+                loadJob.worker.join();
+                bool ok = loadJob.ok.load();
+                if (ok) finalizeMesh(loadJob.path, loadJob.verts, loadJob.indices);
+                loadJob.verts.clear();   loadJob.verts.shrink_to_fit();
+                loadJob.indices.clear(); loadJob.indices.shrink_to_fit();
+                loadJob.active = false;
+                statusHold     = ok ? 1.0f : 3.0f;  // linger on the final message
+                if (mb) mb->statusText = ok ? "Loaded 100%" : "Load failed";
+            }
+        } else if (statusHold > 0.0f) {
+            statusHold -= dt;
+            if (statusHold <= 0.0f && mb) mb->statusText.clear();
+        }
     };
 
     SDL_Log("appOrange: running. File > Open... loads a mesh (OBJ/STL).");

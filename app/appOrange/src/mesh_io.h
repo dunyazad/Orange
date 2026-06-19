@@ -9,8 +9,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
 #include <sstream>
 #include <string>
@@ -19,6 +21,11 @@
 #include "orange/render/types.h"
 
 namespace orange::meshio {
+
+// Optional progress sink: called with a fraction in [0,1] as a load proceeds.
+// May be empty. Loaders throttle calls to once per whole-percent change so a
+// background thread updating an atomic stays cheap even for millions of points.
+using ProgressFn = std::function<void(float)>;
 
 struct V3 { float x, y, z; };
 
@@ -40,6 +47,19 @@ inline render::Vertex vert(const V3& p, const V3& n) {
 // Builds an indexed mesh from positions + triangle indices, giving each vertex
 // the area-weighted average of its incident face normals (mapped to color).
 // Triangles with out-of-range indices are skipped. Shared by the OBJ/PLY loaders.
+// Reports `p` (0..1) through `cb` only when the whole-percent value changes, so
+// per-element calls from a tight parse loop stay cheap. `cb` may be empty.
+struct Throttle {
+    const ProgressFn& cb;
+    int last = -1;
+    explicit Throttle(const ProgressFn& c) : cb(c) {}
+    void operator()(float p) {
+        if (!cb) return;
+        int pc = static_cast<int>(p * 100.0f);
+        if (pc != last) { last = pc; cb(p); }
+    }
+};
+
 inline bool buildIndexed(const std::vector<V3>& pos, std::vector<uint32_t>& tris,
                          std::vector<render::Vertex>& outV, std::vector<uint32_t>& outI) {
     if (pos.empty() || tris.empty()) return false;
@@ -61,19 +81,30 @@ inline bool buildIndexed(const std::vector<V3>& pos, std::vector<uint32_t>& tris
 // triplets accepted, only the position index is used). Per-vertex normals are
 // area-weighted averages of the incident faces.
 inline bool loadObj(const char* path, std::vector<render::Vertex>& outV,
-                    std::vector<uint32_t>& outI) {
+                    std::vector<uint32_t>& outI, const ProgressFn& progress = {}) {
     std::ifstream f(path);
     if (!f) return false;
+    f.seekg(0, std::ios::end);
+    std::streamoff total = f.tellg();      // file size (bytes) for progress
+    f.seekg(0, std::ios::beg);
+    Throttle report(progress);
 
     std::vector<V3>       pos;
     std::vector<uint32_t> tris;
     std::string           line;
+    std::streamoff        read = 0;
     while (std::getline(f, line)) {
+        read += static_cast<std::streamoff>(line.size()) + 1;  // +1 ~ newline
+        if (total > 0) report(0.95f * static_cast<float>(read) / static_cast<float>(total));
         if (line.size() < 2) continue;
         if (line[0] == 'v' && line[1] == ' ') {
-            V3 p{};
-            if (std::sscanf(line.c_str() + 2, "%f %f %f", &p.x, &p.y, &p.z) == 3)
-                pos.push_back(p);
+            const char* s = line.c_str() + 2;
+            char*       e = nullptr;
+            V3          p{};
+            p.x = std::strtof(s, &e); if (e == s) continue; s = e;
+            p.y = std::strtof(s, &e); if (e == s) continue; s = e;
+            p.z = std::strtof(s, &e); if (e == s) continue;
+            pos.push_back(p);
         } else if (line[0] == 'f' && line[1] == ' ') {
             std::vector<int> idx;
             const char*      p = line.c_str() + 1;
@@ -92,7 +123,9 @@ inline bool loadObj(const char* path, std::vector<render::Vertex>& outV,
             }
         }
     }
-    return buildIndexed(pos, tris, outV, outI);
+    bool ok = buildIndexed(pos, tris, outV, outI);
+    if (progress) progress(1.0f);
+    return ok;
 }
 
 // --- STL -------------------------------------------------------------------
@@ -100,16 +133,18 @@ inline bool loadObj(const char* path, std::vector<render::Vertex>& outV,
 // (normal + 3 vertices + attribute). Vertices are not shared.
 inline bool loadStlBinary(const std::vector<uint8_t>& data,
                           std::vector<render::Vertex>& outV,
-                          std::vector<uint32_t>& outI) {
+                          std::vector<uint32_t>& outI, const ProgressFn& progress = {}) {
     if (data.size() < 84) return false;
     uint32_t n = 0;
     std::memcpy(&n, &data[80], 4);
     if (data.size() < 84 + static_cast<size_t>(n) * 50) return false;
 
+    Throttle report(progress);
     outV.reserve(static_cast<size_t>(n) * 3);
     outI.reserve(static_cast<size_t>(n) * 3);
     const uint8_t* p = &data[84];
     for (uint32_t i = 0; i < n; ++i) {
+        if (n > 0) report(static_cast<float>(i) / static_cast<float>(n));
         float fn[3], v[9];
         std::memcpy(fn, p, 12);
         std::memcpy(v, p + 12, 36);
@@ -124,15 +159,18 @@ inline bool loadStlBinary(const std::vector<uint8_t>& data,
         }
         p += 50;
     }
+    if (progress) progress(1.0f);
     return !outV.empty();
 }
 
 // ASCII STL: scans for "vertex x y z" triplets; every 3 makes a triangle.
 inline bool loadStlAscii(const std::string& text, std::vector<render::Vertex>& outV,
-                         std::vector<uint32_t>& outI) {
+                         std::vector<uint32_t>& outI, const ProgressFn& progress = {}) {
+    Throttle        report(progress);
     std::vector<V3> vs;
     size_t          pos = 0;
     while ((pos = text.find("vertex", pos)) != std::string::npos) {
+        if (!text.empty()) report(0.95f * static_cast<float>(pos) / static_cast<float>(text.size()));
         V3 p{};
         if (std::sscanf(text.c_str() + pos + 6, "%f %f %f", &p.x, &p.y, &p.z) == 3)
             vs.push_back(p);
@@ -146,11 +184,12 @@ inline bool loadStlAscii(const std::string& text, std::vector<render::Vertex>& o
             outV.push_back(vert(vs[i + k], nrm));
         }
     }
+    if (progress) progress(1.0f);
     return !outV.empty();
 }
 
 inline bool loadStl(const char* path, std::vector<render::Vertex>& outV,
-                    std::vector<uint32_t>& outI) {
+                    std::vector<uint32_t>& outI, const ProgressFn& progress = {}) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
     std::vector<uint8_t> data((std::istreambuf_iterator<char>(f)),
@@ -162,9 +201,9 @@ inline bool loadStl(const char* path, std::vector<render::Vertex>& outV,
         uint32_t n = 0;
         std::memcpy(&n, &data[80], 4);
         if (data.size() == 84 + static_cast<size_t>(n) * 50)
-            return loadStlBinary(data, outV, outI);
+            return loadStlBinary(data, outV, outI, progress);
     }
-    return loadStlAscii(std::string(data.begin(), data.end()), outV, outI);
+    return loadStlAscii(std::string(data.begin(), data.end()), outV, outI, progress);
 }
 
 // --- PLY -------------------------------------------------------------------
@@ -172,13 +211,28 @@ inline bool loadStl(const char* path, std::vector<render::Vertex>& outV,
 // properties are skipped. Supports ASCII and binary_little_endian. Normals are
 // computed (area-weighted), matching the other loaders.
 inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
-                    std::vector<uint32_t>& outI) {
+                    std::vector<uint32_t>& outI, const ProgressFn& progress = {}) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
+    Throttle report(progress);
+
+    // Slurp the whole file and parse from memory: a multi-million-point PLY does
+    // one read instead of tens of millions of per-value stream reads. A trailing
+    // NUL lets strtod/strtoll scan the ASCII body without overrunning the buffer.
+    std::vector<char> buf((std::istreambuf_iterator<char>(f)),
+                          std::istreambuf_iterator<char>());
+    if (buf.empty()) return false;
+    buf.push_back('\0');
+    const char* cur = buf.data();
+    const char* end = cur + buf.size() - 1;  // exclude the sentinel NUL
 
     auto headerLine = [&](std::string& s) -> bool {
-        if (!std::getline(f, s)) return false;
+        if (cur >= end) return false;
+        const char* nl = static_cast<const char*>(std::memchr(cur, '\n', end - cur));
+        const char* le = nl ? nl : end;
+        s.assign(cur, le);
         while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+        cur = nl ? nl + 1 : end;
         return true;
     };
     std::string line;
@@ -247,11 +301,13 @@ inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
     }
     if (vertexCount <= 0 || ix < 0 || iy < 0 || iz < 0 || fmt == BIN_BE) return false;
 
+    // Binary readers advance `cur` through the in-memory body (bounds-checked).
     auto readIntBin = [&](int kind, int size) -> long long {
-        unsigned char b[8] = {0};
-        f.read(reinterpret_cast<char*>(b), size);
+        if (cur + size > end) { cur = end; return 0; }
         unsigned long long u = 0;
-        for (int i = 0; i < size; ++i) u |= static_cast<unsigned long long>(b[i]) << (8 * i);
+        for (int i = 0; i < size; ++i)
+            u |= static_cast<unsigned long long>(static_cast<unsigned char>(cur[i])) << (8 * i);
+        cur += size;
         if (kind == 0 && size < 8) {  // signed: sign-extend
             unsigned long long sign = 1ULL << (size * 8 - 1);
             if (u & sign) return static_cast<long long>(u | (~0ULL << (size * 8)));
@@ -259,23 +315,44 @@ inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
         return static_cast<long long>(u);
     };
     auto readFloatBin = [&](int size) -> double {
-        unsigned char b[8] = {0};
-        f.read(reinterpret_cast<char*>(b), size);
-        if (size == 4) { float v; std::memcpy(&v, b, 4); return v; }
-        double v; std::memcpy(&v, b, 8); return v;
+        if (cur + size > end) { cur = end; return 0; }
+        double r;
+        if (size == 4) { float v; std::memcpy(&v, cur, 4); r = v; }
+        else           { double v; std::memcpy(&v, cur, 8); r = v; }
+        cur += size;
+        return r;
     };
     auto readVal = [&](const Prop& p) -> double {
         return p.kind == 2 ? readFloatBin(p.size)
                            : static_cast<double>(readIntBin(p.kind, p.size));
     };
+    // ASCII readers: strtod/strtoll straight off the buffer (no stream overhead).
+    auto asciiDouble = [&](double& out) -> bool {
+        char* e = nullptr;
+        out = std::strtod(cur, &e);
+        if (e == cur) return false;
+        cur = e;
+        return true;
+    };
+    auto asciiLong = [&](long long& out) -> bool {
+        char* e = nullptr;
+        out = std::strtoll(cur, &e, 10);
+        if (e == cur) return false;
+        cur = e;
+        return true;
+    };
 
     std::vector<V3> pos(vertexCount);
     std::vector<V3> nrm(vertexCount, V3{0, 0, 0});
     std::vector<V3> col(vertexCount, V3{-1, -1, -1});  // -1 => no color
-    for (int v = 0; v < vertexCount; ++v)
+    // Vertices are the bulk of a point cloud; reading them is 0..70% of progress.
+    // Sample progress every 16K points so the per-vertex inner loop stays tight.
+    for (int v = 0; v < vertexCount; ++v) {
+        if ((v & 0x3FFF) == 0)
+            report(0.70f * static_cast<float>(v) / static_cast<float>(vertexCount));
         for (size_t i = 0; i < vprops.size(); ++i) {
             double val;
-            if (fmt == ASCII) { if (!(f >> val)) return false; }
+            if (fmt == ASCII) { if (!asciiDouble(val)) return false; }
             else              val = readVal(vprops[i]);
             int ii = static_cast<int>(i);
             float fv = static_cast<float>(val);
@@ -289,6 +366,7 @@ inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
             else if (ii == ig) col[v].y = fv / 255.0f;
             else if (ii == ib) col[v].z = fv / 255.0f;
         }
+    }
 
     // No faces -> a point cloud: emit one (non-indexed) vertex per point, colored
     // by its PLY color if present, else by its normal. spawnMesh draws it as points.
@@ -302,19 +380,24 @@ inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
             }
         }
         outI.clear();
+        if (progress) progress(1.0f);
         return !outV.empty();
     }
 
-    std::vector<uint32_t> tris;
+    std::vector<uint32_t>  tris;
+    std::vector<long long> idx;  // reused per face (most are triangles)
     if (haveFace) {
+        tris.reserve(static_cast<size_t>(faceCount) * 3);
         for (int fc = 0; fc < faceCount; ++fc) {
+            if ((fc & 0x3FFF) == 0)
+                report(0.70f + 0.25f * static_cast<float>(fc) / static_cast<float>(faceCount));
             long long cnt;
-            if (fmt == ASCII) { if (!(f >> cnt)) break; }
+            if (fmt == ASCII) { if (!asciiLong(cnt)) break; }
             else              cnt = readIntBin(faceProp.countKind, faceProp.countSize);
             if (cnt < 0 || cnt > 255) break;  // sanity
-            std::vector<long long> idx(static_cast<size_t>(cnt));
+            idx.resize(static_cast<size_t>(cnt));
             for (long long k = 0; k < cnt; ++k) {
-                if (fmt == ASCII) { if (!(f >> idx[k])) return false; }
+                if (fmt == ASCII) { if (!asciiLong(idx[k])) return false; }
                 else              idx[k] = readIntBin(faceProp.kind, faceProp.size);
             }
             for (long long k = 1; k + 1 < cnt; ++k) {  // fan triangulation
@@ -324,21 +407,25 @@ inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
             }
         }
     }
-    return buildIndexed(pos, tris, outV, outI);
+    bool ok = buildIndexed(pos, tris, outV, outI);
+    if (progress) progress(1.0f);
+    return ok;
 }
 
 // Dispatches on the file extension (case-insensitive). Returns false on an
-// unknown extension or a parse failure.
+// unknown extension or a parse failure. `progress` (optional) is called with a
+// fraction in [0,1] as the load proceeds -- safe to drive a background-thread
+// atomic that the UI samples.
 inline bool loadMeshFile(const std::string& path, std::vector<render::Vertex>& outV,
-                         std::vector<uint32_t>& outI) {
+                         std::vector<uint32_t>& outI, const ProgressFn& progress = {}) {
     std::string ext;
     auto        dot = path.find_last_of('.');
     if (dot != std::string::npos)
         for (size_t i = dot + 1; i < path.size(); ++i)
             ext.push_back(static_cast<char>(std::tolower(path[i])));
-    if (ext == "obj") return loadObj(path.c_str(), outV, outI);
-    if (ext == "stl") return loadStl(path.c_str(), outV, outI);
-    if (ext == "ply") return loadPly(path.c_str(), outV, outI);
+    if (ext == "obj") return loadObj(path.c_str(), outV, outI, progress);
+    if (ext == "stl") return loadStl(path.c_str(), outV, outI, progress);
+    if (ext == "ply") return loadPly(path.c_str(), outV, outI, progress);
     return false;
 }
 

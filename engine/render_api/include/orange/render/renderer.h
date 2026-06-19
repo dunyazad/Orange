@@ -79,6 +79,31 @@ public:
     // triangle meshes. Both backends drive gl_PointSize from this.
     virtual void setPointSize(float pixels) = 0;
 
+    // Toggles per-fragment diffuse lighting on scene geometry. Point-cloud sprites
+    // shade via their sphere-imposter normal; triangle meshes (which carry no vertex
+    // normals) shade via a flat face normal derived from screen-space derivatives of
+    // the world position. When off, both draw as their flat (mode-mapped) color. The
+    // grid and overlays are never shaded. Both backends carry this as a shader flag
+    // (GL uniform / VK fragment push constant). Default: on.
+    virtual void setLighting(bool enabled) = 0;
+
+    // Cross-section clipping. When `enabled`, scene-mesh fragments on the positive
+    // side of the world-space plane `plane` = (nx, ny, nz, d) -- i.e. where
+    // dot(worldPos, (nx,ny,nz)) + d > 0 -- are discarded, revealing the cut
+    // interior. Applies to triangle meshes AND point clouds; the grid and overlays
+    // are never clipped. `plane` is in render-world space (after the model & up-axis
+    // basis). `enabled` = false (or a zero normal) disables clipping. Both backends
+    // carry this as a shader uniform / fragment push constant. Default: off.
+    virtual void setCrossSection(bool enabled, const float plane[4]) = 0;
+
+    // Selects how scene meshes are colored (Shift+` cycles it). The fragment shader
+    // derives the base color from this and the world position: 0 = default (vertex
+    // color), 1 = height (world Y -> jet heatmap), 2 = position (world XYZ -> RGB),
+    // 3 = grayscale (luminance of the vertex color). Applies to triangle meshes and
+    // point clouds; the grid and overlays always use mode 0. Both backends carry it
+    // as a shader uniform / fragment push constant. Default: 0.
+    virtual void setColorMode(uint32_t mode) = 0;
+
     // Capture --------------------------------------------------------------
     // Reads the last presented frame into `out` as top-left-origin RGBA8.
     // Returns false if unsupported. Call after endFrame().

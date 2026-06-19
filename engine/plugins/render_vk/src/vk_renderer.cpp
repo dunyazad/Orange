@@ -547,8 +547,11 @@ bool VkRenderer::createPipeline(const render::VertexLayout& layout) {
 
     // Push constants: viewProj (64) + model (64) = 128 bytes (vertex stage); a
     // vec4 force-color at offset 128 (fragment stage) for wireframe-over-solid;
-    // and a float point size at offset 144 (vertex stage) for point-cloud sprites.
-    VkPushConstantRange pcr[3]{};
+    // a float point size at offset 144 (vertex stage) for point-cloud sprites;
+    // an int lighting flag at offset 148 (fragment stage) for point shading; a vec4
+    // cross-section plane at offset 160 (fragment stage) for the cut view; and an
+    // int color mode at offset 176 (fragment stage).
+    VkPushConstantRange pcr[6]{};
     pcr[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pcr[0].offset = 0;
     pcr[0].size = 128;
@@ -558,12 +561,21 @@ bool VkRenderer::createPipeline(const render::VertexLayout& layout) {
     pcr[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     pcr[2].offset = 144;
     pcr[2].size = 4;
+    pcr[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr[3].offset = 148;
+    pcr[3].size = 4;
+    pcr[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr[4].offset = 160;
+    pcr[4].size = 16;
+    pcr[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr[5].offset = 176;
+    pcr[5].size = 4;
 
     VkPipelineLayoutCreateInfo plci{};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &descLayout_;
-    plci.pushConstantRangeCount = 3;
+    plci.pushConstantRangeCount = 6;
     plci.pPushConstantRanges = pcr;
     VK_CHECK(vkCreatePipelineLayout(device_, &plci, nullptr, &pipelineLayout_));
 
@@ -1243,6 +1255,7 @@ void VkRenderer::beginFrame(const render::FrameContext& frame) {
                            64, viewProj_);
     }
 
+    inOverlay_ = false;  // scene draws (until beginOverlay) may be cross-sectioned
     frameActive_ = true;
 }
 
@@ -1266,6 +1279,15 @@ void VkRenderer::submit(const render::DrawItem& item) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0,
                             1, &set, 0, nullptr);
     vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 64, 64, item.model);
+    // Cross-section plane + color mode (fragment stage). Overlay passes are never
+    // clipped and always use the default coloring.
+    const float kNoClip[4] = {0, 0, 0, 0};
+    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 160, 16,
+                       inOverlay_ ? kNoClip : clipPlane_);
+    const uint32_t cmode = inOverlay_ ? 0u : colorMode_;
+    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 176, 4, &cmode);
+    const int litFlag = (inOverlay_ || !lighting_) ? 0 : 1;  // scene only; overlays unshaded
+    vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 148, 4, &litFlag);
     VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vbIt->second.buffer, &offset);
     const VkBufferObject* ib = nullptr;
@@ -1289,6 +1311,7 @@ void VkRenderer::submit(const render::DrawItem& item) {
     const float kBlack[4]   = {0, 0, 0, 1};
 
     // Point cloud -> sphere-imposter point sprites (independent of the draw modes).
+    // The lighting flag (offset 148) is already pushed in the common section above.
     if (mesh.points) {
         vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 144, 4,
                            &pointSize_);
@@ -1336,6 +1359,7 @@ void VkRenderer::submit(const render::DrawItem& item) {
 
 void VkRenderer::beginOverlay(const render::OverlayContext& ov) {
     if (!frameActive_ || pipeline_ == VK_NULL_HANDLE) return;
+    inOverlay_ = true;  // overlay quads must never be cross-sectioned
     VkCommandBuffer cmd = commandBuffers_[currentFrame_];
 
     // Restrict to the overlay rect (Vulkan viewport/scissor are top-left origin).
@@ -1431,6 +1455,18 @@ void VkRenderer::setDrawMode(uint32_t mode) { drawMode_ = mode; }
 void VkRenderer::setPointSize(float pixels) {
     pointSize_ = pixels < 1.0f ? 1.0f : (pixels > 64.0f ? 64.0f : pixels);
 }
+
+void VkRenderer::setLighting(bool enabled) { lighting_ = enabled; }
+
+void VkRenderer::setCrossSection(bool enabled, const float plane[4]) {
+    if (enabled && plane) {
+        for (int i = 0; i < 4; ++i) clipPlane_[i] = plane[i];
+    } else {
+        clipPlane_[0] = clipPlane_[1] = clipPlane_[2] = clipPlane_[3] = 0.0f;  // off
+    }
+}
+
+void VkRenderer::setColorMode(uint32_t mode) { colorMode_ = mode; }
 
 bool VkRenderer::readPixels(std::vector<uint8_t>&, uint32_t&, uint32_t&) {
     // TODO: copy the last swapchain image to a host-visible buffer. Screenshot

@@ -101,14 +101,39 @@ cmake --build D:/Library/Orange/build --config Debug
 
 ## Key facts to keep in mind
 
-- **Plugin ABI is v14.** v13 added `MeshDesc::topology` (`Triangles` or `Points`);
+- **Plugin ABI is v17.** v17 added `IRenderer::setColorMode(uint32_t)` (Shift+`` ` ``
+  cycles it): scene meshes/point clouds recolor in the fragment shader from the
+  world position — 0 = original (vertex color), 1 = height (world Y → jet heatmap),
+  2 = position (world XYZ → RGB), 3 = grayscale (luminance). **appOrange starts in
+  grayscale (mode 3)** — `Application::colorMode_` defaults to 3 and is pushed at
+  `run()` start. The grid/overlays always use mode 0 (GL zeroes `uColorMode` in
+  `beginOverlay`; VK pushes 0 while `inOverlay_`). GL drives a `uColorMode` int
+  uniform, VK a fragment push constant at offset 176. `setLighting` now shades
+  triangle meshes too (flat normal from `dFdx/dFdy(worldPos)`), not just point
+  sprites; overlays stay unshaded (GL zeroes `uLighting` in `beginOverlay`, VK pushes
+  0 while `inOverlay_`). v16 added `IRenderer::setCrossSection(bool, const float plane[4])`:
+  a world-space clipping plane `(nx,ny,nz,d)` — scene-mesh fragments where
+  `dot(worldPos,n)+d > 0` are discarded, revealing a cut interior (applies to
+  triangle meshes AND point clouds; the grid/overlays are never clipped). Both
+  backends pass world position from the vertex stage to the fragment stage and
+  discard there: GL via a `uClipPlane` vec4 uniform (zeroed in `beginOverlay` so
+  overlays never clip), VK via a fragment push constant at offset 160 (pushed
+  per-draw as zero while `inOverlay_`). The host drives it from a `CrossSection`
+  component + slider panel (`crossSectionInputSystem`); `renderSystem` turns
+  (enabled, axis, flip, pos) into the plane and calls `setCrossSection` before the
+  scene submits. v13 added `MeshDesc::topology` (`Triangles` or `Points`);
   a `Points` mesh is drawn as **sphere-imposter point sprites** — real GL_POINTS /
   VK POINT_LIST with a fragment shader that rounds + shades each sprite via
   `gl_PointCoord`, not instanced spheres. Faceless PLYs load as such point clouds;
   their selection shows a bounding-box wireframe, not the stencil silhouette. v14
   added `IRenderer::setPointSize(float)` (the `+`/`-` keys resize point sprites;
   GL drives `gl_PointSize` via a `uPointSize` uniform, VK via a vertex push
-  constant at offset 144). Changing the C contract means bumping
+  constant at offset 144). v15 added `IRenderer::setLighting(bool)` (the `` ` ``
+  backtick key toggles it): the point sprite is the only lit primitive, so this
+  lights/unlits the sphere-imposter diffuse shading (off => flat vertex color);
+  triangle meshes are unlit (no normals) and the grid/overlays unaffected. GL
+  drives a `uLighting` int uniform, VK a fragment push constant at offset 148.
+  Changing the C contract means bumping
   `ORANGE_PLUGIN_ABI_VERSION` and updating both backends. v6 added
   `IRenderer::setVsync(bool)` (GL flips the swap interval; VK recreates the
   swapchain with a FIFO / immediate-mailbox present mode). v7 added
@@ -135,10 +160,13 @@ cmake --build D:/Library/Orange/build --config Debug
   uses a D24S8 depth-stencil attachment + stencil-write / stencil-test pipelines,
   clearing the stencil per mesh so multi-selection outlines don't clip. (The old
   inverted-hull version filled in on concave/thin meshes — stencil fixed that.)
-  Picking: plain click single-selects (empty click clears), **Ctrl+click toggles**
-  (multi-select), **Ctrl+A** selects all meshes *visible on screen*
-  (`entityVisibleOnScreen` frustum-tests each AABB, so off-screen meshes are never
-  bulk-selected), **Delete** destroys the selected entities.
+  Picking: plain click single-selects (empty click clears), **Ctrl+left-click
+  recenters** the camera on the picked point (`pickingSystem` computes the world
+  hit `rayOW + rayDW*bestT` and starts a `CameraManipulator` target-glide;
+  `cameraManipulatorSystem` eases `target` so the position follows — no selection
+  change), **Ctrl+A** selects all meshes *visible on screen* (`entityVisibleOnScreen`
+  frustum-tests each AABB, so off-screen meshes are never bulk-selected), **Delete**
+  destroys the selected entities.
 - **Infinite grid:** `renderSystem` calls `IRenderer::drawGrid(upAxis)` after the
   scene submits (before the gizmo overlay). Each backend renders a vertex-less
   full-screen pass (GL: inline shader + empty VAO; VK: a second pipeline +
@@ -186,13 +214,19 @@ cmake --build D:/Library/Orange/build --config Debug
   (CPU triangle soup), else its `Renderable` AABB; hits are compared by true world
   distance. Triangle picking means clicking through a concave model's gaps misses
   it and hits whatever is behind, instead of its bounding box stealing the click.
-  Plain click single-selects (empty click clears), **Ctrl+click**
-  toggles (multi-select), **Ctrl+A** selects all on-screen meshes, **Delete**
+  Plain click single-selects (empty click clears), **Ctrl+left-click** recenters
+  the camera on the picked point (animated target-glide, no selection change),
+  **Ctrl+A** selects all on-screen meshes, **Delete**
   removes the selection. `Input::captured` (set by UI widgets) suppresses picking.
   **Tab** cycles the *selected* meshes' drawing mode
   (Helium's set: none / solid / wireframe / wireframe-over-solid / point);
   selection shows as a silhouette outline. **M** cycles the point-cloud processing
-  mode; **C** screenshots; **Esc** quits.
+  mode; **`** (backtick) toggles point-sprite lighting (`IRenderer::setLighting`);
+  **Shift+`** cycles the scene coloring mode (`IRenderer::setColorMode`:
+  default/height/position/grayscale); **Space** toggles the ground grid
+  (`GridState` in registry ctx, read by `renderSystem`); **R** resets the camera to
+  its home pose (animated orientation + target + distance glide back to
+  `CameraManipulator::home*`); **C** screenshots; **Esc** quits.
 - **Processing modes (`orange::modes`):** the Orange take on Hydrogen's "apps" —
   selectable point-cloud operations that run on a `modes::ModeInput` (stored in
   the registry ctx) and emit a visualization via the debug-draw accumulator.

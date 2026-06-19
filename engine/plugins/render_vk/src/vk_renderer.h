@@ -66,6 +66,9 @@ public:
     void setVsync(bool enabled) override;
     void setDrawMode(uint32_t mode) override;
     void setPointSize(float pixels) override;
+    void setLighting(bool enabled) override;
+    void setCrossSection(bool enabled, const float plane[4]) override;
+    void setColorMode(uint32_t mode) override;
     bool readPixels(std::vector<uint8_t>& out, uint32_t& w, uint32_t& h) override;
 
     render::Backend backend() const override { return render::Backend::Vulkan; }
@@ -107,6 +110,10 @@ private:
     VkPipeline       pipelinePoints_      = VK_NULL_HANDLE;  // POINT_LIST sphere imposters
     uint32_t         drawMode_ = 1;  // Helium DrawingMode (0=none..4=point)
     float            pointSize_ = 6.0f;  // point-cloud sprite pixel diameter
+    bool             lighting_  = true;  // point-sprite diffuse shading on/off (`)
+    float            clipPlane_[4] = {0, 0, 0, 0};  // cross-section (nx,ny,nz,d); 0 = off
+    uint32_t         colorMode_ = 0;     // scene coloring mode (Shift+` cycles)
+    bool             inOverlay_ = false;  // overlay passes are never cross-sectioned/recolored
 
     // Infinite-grid pipeline: a vertex-less full-screen pass (own layout with a
     // 128-byte push constant = viewProj + invViewProj, vertex + fragment stages).

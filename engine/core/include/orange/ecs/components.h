@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "orange/core/draw_mode.h"
@@ -97,6 +98,24 @@ struct CameraManipulator {
     Eigen::Quaternionf animTo   = Eigen::Quaternionf::Identity();
     float      animTime     = 0.0f;
     float      animDuration = 0.45f;
+
+    // Smooth recenter animation (Ctrl+left-click on geometry): the orbit pivot
+    // `target` is eased from targetFrom to targetTo, so the camera position
+    // (target + offset) glides along with it. Independent of the orientation snap
+    // above; cancelled by a manual pan/zoom. `distance` is eased from distFrom to
+    // distTo over the same timeline (used by the R reset; held constant by the
+    // Ctrl+click recenter). Reuses animDuration for timing.
+    bool       targetAnimating = false;
+    Eigen::Vector3f targetFrom = Eigen::Vector3f::Zero();
+    Eigen::Vector3f targetTo   = Eigen::Vector3f::Zero();
+    float      targetAnimTime  = 0.0f;
+    float      distFrom = 6.0f, distTo = 6.0f;  // distance eased alongside target
+
+    // Home pose restored by the R key (set when the camera is created). The reset
+    // animates orientation + target + distance back to these.
+    Eigen::Vector3f homeTarget   = Eigen::Vector3f::Zero();
+    float           homeDistance = 6.0f;
+    Eigen::Quaternionf homeOrientation = Eigen::Quaternionf::Identity();
 };
 
 // A ViewCube-style axis gizmo drawn in a screen corner. It shows the world
@@ -203,9 +222,39 @@ struct CameraControls {
     render::BufferHandle  vbo  = render::kInvalidBuffer;
 };
 
+// Cross-section ("단면") panel: a slider that sweeps a world-aligned clipping
+// plane through the scene so you can see a cut interior. crossSectionInputSystem
+// handles the enable toggle / axis cycle / flip / slider drag; renderSystem turns
+// (enabled, axis, flip, pos) into a world plane and calls IRenderer::setCrossSection
+// before the scene submits. Positioned top-right, under the CameraControls panel.
+struct CrossSection {
+    bool  enabled = false;
+    int   axis    = 0;        // clip axis in render-world space (0=X, 1=Y, 2=Z)
+    bool  flip    = false;    // keep the +side instead of the -side of the plane
+    float pos     = 0.0f;     // plane position along the axis (world units)
+    float minPos  = -3.0f;    // slider range (content fits ~3 world units, centered)
+    float maxPos  =  3.0f;
+
+    int  w = 184, h = 96;     // panel size (px)
+    int  x = 0, y = 0;        // computed each frame (top-right, under the controls)
+    bool dragging = false;    // slider handle is being dragged
+
+    const core::Font*     font  = nullptr;  // shared text font
+    render::TextureHandle atlas = render::kInvalidTexture;
+    render::MeshHandle     mesh = render::kInvalidMesh;
+    render::BufferHandle   vbo  = render::kInvalidBuffer;
+};
+
+// View toggles stored in the registry context (registry::ctx), not on an entity.
+// `grid` is flipped by the Space key and read by renderSystem to show/hide the
+// infinite ground grid. Absent context => defaults (grid on).
+struct GridState {
+    bool visible = true;
+};
+
 // Height (px) of the top menu bar. The axis gizmo and camera-controls panel are
 // pushed down by this so they never overlap the bar. Shared by systems.cpp.
-inline constexpr int kMenuBarHeight = 28;
+inline constexpr int kMenuBarHeight = 46;
 
 // A classic top-of-window menu bar with a single "File" menu whose only item is
 // "Open...". menuBarInputSystem handles open/close + clicks and renderSystem
@@ -222,6 +271,11 @@ struct MenuBar {
     // Raised by menuBarInputSystem when "Open..." is clicked; the app clears it
     // once it has acted on it (one-shot edge flag, like FpsWidget::vsyncDirty).
     bool requestOpenFile = false;
+
+    // Right-aligned status text drawn in the bar (e.g. "Loading 42%"). The app
+    // sets it while a background load runs and clears it when finished. Empty =
+    // nothing drawn. ASCII only (the UI font bakes 32..126).
+    std::string statusText;
 
     // GPU resources (dynamic vertex buffer rewritten each frame).
     render::MeshHandle   mesh = render::kInvalidMesh;

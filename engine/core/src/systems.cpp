@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <execution>
+#include <vector>
 
 #include "orange/core/debug_draw.h"
 #include "orange/core/draw_mode.h"
@@ -625,12 +627,134 @@ void buildControlsGeometry(const CameraControls& cc, const Camera& cam,
     for (int i = q * 4; i < kCtrlVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
 
+// --- Cross-section panel ---------------------------------------------------
+constexpr int kCsQuads = 64;
+constexpr int kCsVerts = kCsQuads * 4;
+
+struct CsRects { CRect enable, axis, flip, track; };
+
+// Pixel rects for the panel widgets. The slider handle is derived from pos, so
+// only the track (groove) is stored; the input system maps clicks across it.
+CsRects crossSectionRects(const CrossSection& cs) {
+    CsRects r;
+    const float pad = 8.0f;
+    r.enable = {cs.x + cs.w - pad - 16.0f, cs.y + 6.0f, 16.0f, 16.0f};
+    r.axis   = {cs.x + pad, cs.y + 30.0f, 46.0f, 22.0f};
+    r.flip   = {cs.x + cs.w - pad - 52.0f, cs.y + 30.0f, 52.0f, 22.0f};
+    r.track  = {cs.x + 12.0f, cs.y + 72.0f, cs.w - 24.0f, 6.0f};
+    return r;
+}
+
+// Maps the plane position to the handle's center X (px) along the track.
+float crossSectionHandleX(const CrossSection& cs, const CRect& track) {
+    float span = cs.maxPos - cs.minPos;
+    float t    = span > 1e-6f ? (cs.pos - cs.minPos) / span : 0.5f;
+    t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    return track.x + t * track.w;
+}
+
+// Builds the cross-section panel: background, title + enable checkbox, axis and
+// flip buttons, a value readout, and the slider (groove + filled + handle).
+void buildCrossSectionGeometry(const CrossSection& cs, render::Vertex* out) {
+    const core::Font& f = *cs.font;
+    int q = 0;
+    const float wu = f.whiteU, wv = f.whiteV;
+    auto quad = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                    float u0, float v0, float u1, float v1, float z) {
+        if (q >= kCsQuads) return;
+        out[q * 4 + 0] = {{x0, y0, z}, {r, g, b}, {u0, v1}};
+        out[q * 4 + 1] = {{x1, y0, z}, {r, g, b}, {u1, v1}};
+        out[q * 4 + 2] = {{x1, y1, z}, {r, g, b}, {u1, v0}};
+        out[q * 4 + 3] = {{x0, y1, z}, {r, g, b}, {u0, v0}};
+        ++q;
+    };
+    auto solid = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                     float z) { quad(x0, y0, x1, y1, r, g, b, wu, wv, wu, wv, z); };
+    const float xs = static_cast<float>(cs.h) / static_cast<float>(cs.w);  // aspect fix
+    auto text = [&](const char* s, float penX, float baseY, float h, float r, float g,
+                    float b, float z) {
+        for (; *s; ++s) {
+            const core::Glyph& gl = f.glyph(*s);
+            if (gl.w > 0 && gl.h > 0) {
+                float x0 = penX + gl.xoff * h * xs, y1 = baseY - gl.yoff * h;
+                float x1 = x0 + gl.w * h * xs, y0 = y1 - gl.h * h;
+                quad(x0, y0, x1, y1, r, g, b, gl.u0, gl.v0, gl.u1, gl.v1, z);
+            }
+            penX += gl.advance * h * xs;
+        }
+    };
+    auto textW = [&](const char* s, float h) { return f.textWidth(s, h) * xs; };
+    // Normalize an absolute pixel rect into the panel's [0,1] (y-up) space.
+    auto toN = [&](const CRect& rr, float& x0, float& y0, float& x1, float& y1) {
+        x0 = (rr.x - cs.x) / cs.w;            x1 = (rr.x + rr.w - cs.x) / cs.w;
+        y1 = 1.0f - (rr.y - cs.y) / cs.h;     y0 = 1.0f - (rr.y + rr.h - cs.y) / cs.h;
+    };
+
+    solid(0, 0, 1, 1, 0.10f, 0.11f, 0.13f, 0.0f);  // panel background
+
+    CsRects R = crossSectionRects(cs);
+    float x0, y0, x1, y1;
+
+    // Title.
+    float th = 14.0f / cs.h;
+    text("Section", 10.0f / cs.w, 1.0f - 8.0f / cs.h - th, th, 0.85f, 0.88f, 0.92f, 0.6f);
+
+    // Enable checkbox (green tick when on).
+    toN(R.enable, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.70f, 0.74f, 0.80f, 0.5f);             // border
+    float ix = 2.0f / cs.w, iy = 2.0f / cs.h;
+    solid(x0 + ix, y0 + iy, x1 - ix, y1 - iy, 0.10f, 0.11f, 0.14f, 0.55f);  // well
+    if (cs.enabled)
+        solid(x0 + 2 * ix, y0 + 2 * iy, x1 - 2 * ix, y1 - 2 * iy, 0.25f, 0.85f, 0.45f, 0.6f);
+
+    // Axis button (X/Y/Z).
+    toN(R.axis, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.20f, 0.22f, 0.27f, 0.3f);
+    const char axisTxt[2] = {static_cast<char>('X' + cs.axis), '\0'};
+    float ah = (y1 - y0) * 0.62f;
+    text(axisTxt, (x0 + x1) * 0.5f - textW(axisTxt, ah) * 0.5f,
+         (y0 + y1) * 0.5f - ah * 0.35f, ah, 0.92f, 0.95f, 0.95f, 0.6f);
+
+    // Flip button (brighter when keeping the +side).
+    toN(R.flip, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, cs.flip ? 0.28f : 0.20f, cs.flip ? 0.34f : 0.22f,
+          cs.flip ? 0.44f : 0.27f, 0.3f);
+    float fh = (y1 - y0) * 0.5f;
+    text("Flip", (x0 + x1) * 0.5f - textW("Flip", fh) * 0.5f,
+         (y0 + y1) * 0.5f - fh * 0.35f, fh, 0.90f, 0.93f, 0.96f, 0.6f);
+
+    // Value readout (between the two buttons).
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%.2f", cs.pos);
+    float vh = 12.0f / cs.h;
+    float vMid = (R.axis.x + R.axis.w + R.flip.x) * 0.5f;  // pixel midpoint of the gap
+    text(buf, (vMid - cs.x) / cs.w - textW(buf, vh) * 0.5f,
+         1.0f - (R.axis.y + R.axis.h * 0.5f - cs.y) / cs.h - vh * 0.35f, vh,
+         0.80f, 0.84f, 0.90f, 0.6f);
+
+    // Slider: groove, filled portion up to the handle, then the handle itself.
+    float hx = crossSectionHandleX(cs, R.track);
+    toN(R.track, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.20f, 0.21f, 0.25f, 0.3f);                   // groove
+    float hxn = (hx - cs.x) / cs.w;
+    float fillCol = cs.enabled ? 1.0f : 0.4f;
+    solid(x0, y0, hxn, y1, 0.30f * fillCol, 0.55f * fillCol, 0.95f * fillCol, 0.35f);  // filled
+    // Handle (taller than the groove).
+    float hw = 5.0f / cs.w;
+    float hy0 = 1.0f - (R.track.y + R.track.h * 0.5f + 10.0f - cs.y) / cs.h;
+    float hy1 = 1.0f - (R.track.y + R.track.h * 0.5f - 10.0f - cs.y) / cs.h;
+    float hc = cs.enabled ? 0.95f : 0.5f;
+    solid(hxn - hw, hy0, hxn + hw, hy1, hc, hc, hc, 0.5f);
+
+    for (int i = q * 4; i < kCsVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
+}
+
 // --- Top menu bar ----------------------------------------------------------
 constexpr int   kMenuQuads = 64;            // must match kMenuQ in main.cpp
 constexpr int   kMenuVerts = kMenuQuads * 4;
-constexpr float kMenuFileW = 54.0f;         // width of the "File" hit area (px)
-constexpr float kMenuDropW = 170.0f;        // dropdown panel width (px)
-constexpr float kMenuItemH = 26.0f;         // dropdown item height (px)
+constexpr float kMenuFileW = 84.0f;         // width of the "File" hit area (px)
+constexpr float kMenuDropW = 240.0f;        // dropdown panel width (px)
+constexpr float kMenuItemH = 42.0f;         // dropdown item height (px)
 constexpr int   kMenuItems = 1;             // dropdown items ("Open...")
 
 // Builds the bar in normalized [0,1]^2 (y-up) over an overlay whose pixel size is
@@ -667,12 +791,20 @@ void buildMenuGeometry(const MenuBar& mb, render::Vertex* out, uint32_t viewport
     };
 
     const float txt[3] = {0.90f, 0.92f, 0.95f};
-    const float th = 15.0f;                              // text px height
+    const float th = 28.0f;                              // text px height (≈ FPS readout)
 
     solid(0, 0, W, barH, 0.16f, 0.17f, 0.20f, 0.0f);     // bar background
     if (mb.fileOpen)                                     // highlight "File" when open
         solid(0, 0, kMenuFileW, barH, 0.26f, 0.28f, 0.34f, 0.1f);
     text("File", 12.0f, (barH + th) * 0.5f - 2.0f, th, txt, 0.5f);
+
+    // Right-aligned status (e.g. "Loading 42%") shown while a background load runs.
+    if (!mb.statusText.empty()) {
+        const char* st = mb.statusText.c_str();
+        const float stw = f.textWidth(st, th);           // pixel width at height th
+        const float stCol[3] = {0.55f, 0.85f, 1.0f};
+        text(st, W - stw - 14.0f, (barH + th) * 0.5f - 2.0f, th, stCol, 0.5f);
+    }
 
     if (mb.fileOpen) {
         float dy0 = barH, dy1 = barH + kMenuItemH * kMenuItems;
@@ -728,6 +860,7 @@ void cameraManipulatorSystem(entt::registry& world, const core::Input& input,
 
         // Zoom: scroll wheel changes distance.
         if (input.wheel != 0.0f) {
+            m.targetAnimating = false;  // a manual zoom overrides a reset/recenter glide
             m.distance -= input.wheel * m.zoomSpeed;
             m.distance  = clampf(m.distance, m.minDistance, m.maxDistance);
         }
@@ -735,11 +868,24 @@ void cameraManipulatorSystem(entt::registry& world, const core::Input& input,
         // Pan: middle-drag slides the target across the camera plane.
         // (Right-drag is orbit; left-click is picking.)
         if (input.buttonMiddle) {
+            m.targetAnimating = false;  // a manual pan overrides a recenter glide
             Eigen::Vector3f right = math::rotate(m.orientation, Eigen::Vector3f(1, 0, 0));
             Eigen::Vector3f up    = math::rotate(m.orientation, Eigen::Vector3f(0, 1, 0));
             float k = m.panSpeed * m.distance;
             m.target = m.target - right * (input.mouseDeltaX * k) +
                        up * (input.mouseDeltaY * k);
+        }
+
+        // Recenter glide (Ctrl+left-click) / R reset: ease the orbit pivot and the
+        // distance. The position below follows automatically since it is
+        // target+distance based.
+        if (m.targetAnimating) {
+            m.targetAnimTime += dt;
+            float tt = m.animDuration > 0.0f ? m.targetAnimTime / m.animDuration : 1.0f;
+            if (tt >= 1.0f) { tt = 1.0f; m.targetAnimating = false; }
+            float e = tt * tt * (3.0f - 2.0f * tt);  // smoothstep ease
+            m.target   = m.targetFrom + (m.targetTo - m.targetFrom) * e;
+            m.distance = m.distFrom + (m.distTo - m.distFrom) * e;
         }
 
         // Place the camera on the orbit sphere; eye sits along the local +Z.
@@ -916,20 +1062,57 @@ void pickingSystem(entt::registry& world, const core::Input& input,
         // allowed world perpendicular scales with depth, so the test is a constant
         // number of pixels regardless of zoom. Resolved entirely here.
         if (const PickGeometry* pg = world.try_get<PickGeometry>(e); pg && r.pointCloud) {
+            // Broad-phase: if the local ray misses the (slightly inflated) AABB,
+            // no sprite can be near it -- skip the whole cloud. The margin covers
+            // border points whose sprite still overlaps a just-outside click.
+            Eigen::Vector3f margin =
+                (r.boundsMax - r.boundsMin).cwiseMax(Eigen::Vector3f(1, 1, 1)) * 0.05f;
+            float tAabb;
+            if (!intersectAABB(lo, ld, r.boundsMin - margin, r.boundsMax + margin, tAabb))
+                continue;
+
             const Eigen::Matrix4f toWorld = Mworld * t.matrix();
+            const float* M = toWorld.data();  // column-major; assume affine (row w = 0,0,0,1)
+            const float ox = rayOW.x(), oy = rayOW.y(), oz = rayOW.z();
+            const float dx = rayDW.x(), dy = rayDW.y(), dz = rayDW.z();
             const float pixelRadius = 6.0f;  // about the rendered point-sprite size
             const bool  ortho = (cam->mode == ProjectionMode::Orthographic);
             const float kAng  = ortho ? 0.0f
                 : 2.0f * std::tan(cam->fovYDegrees * 3.14159265f / 180.0f * 0.5f) / H * pixelRadius;
             const float orthoThr = ortho ? (2.0f * cam->orthoSize / H * pixelRadius) : 0.0f;
-            for (const Eigen::Vector3f& pl : pg->positions) {
-                Eigen::Vector4f pw = toWorld * Eigen::Vector4f(pl.x(), pl.y(), pl.z(), 1.0f);
-                Eigen::Vector3f rel(pw.x() - rayOW.x(), pw.y() - rayOW.y(), pw.z() - rayOW.z());
-                float tw = rel.dot(rayDW);
-                if (tw <= 0.0f || tw >= bestT) continue;
-                float perp = (rel - rayDW * tw).norm();
-                if (perp < (ortho ? orthoThr : kAng * tw)) { bestT = tw; best = e; }
-            }
+
+            // Nearest sprite along the ray. The point cloud can hold millions of
+            // points, so split it into chunks reduced in parallel; each chunk uses
+            // plain scalar math (no Eigen temporaries) to stay fast in Debug too.
+            const auto& P = pg->positions;
+            const size_t n = P.size();
+            const size_t kChunk = 16384;
+            const size_t chunks = (n + kChunk - 1) / kChunk;
+            const float upper = bestT;  // running cross-entity nearest (read-only here)
+            std::vector<float> chunkMin(chunks, upper);
+            std::vector<size_t> chunkIds(chunks);
+            for (size_t c = 0; c < chunks; ++c) chunkIds[c] = c;
+            std::for_each(std::execution::par, chunkIds.begin(), chunkIds.end(), [&](size_t c) {
+                const size_t begin = c * kChunk;
+                const size_t end = std::min(begin + kChunk, n);
+                float localMin = upper;
+                for (size_t i = begin; i < end; ++i) {
+                    const float x = P[i].x(), y = P[i].y(), z = P[i].z();
+                    const float wx = M[0] * x + M[4] * y + M[8] * z + M[12];
+                    const float wy = M[1] * x + M[5] * y + M[9] * z + M[13];
+                    const float wz = M[2] * x + M[6] * y + M[10] * z + M[14];
+                    const float rx = wx - ox, ry = wy - oy, rz = wz - oz;
+                    const float tw = rx * dx + ry * dy + rz * dz;
+                    if (tw <= 0.0f || tw >= localMin) continue;
+                    const float perp2 = (rx * rx + ry * ry + rz * rz) - tw * tw;
+                    const float thr = ortho ? orthoThr : kAng * tw;
+                    if (perp2 < thr * thr) localMin = tw;
+                }
+                chunkMin[c] = localMin;
+            });
+            float entMin = upper;
+            for (float v : chunkMin) entMin = std::min(entMin, v);
+            if (entMin < bestT) { bestT = entMin; best = e; }
             continue;
         }
 
@@ -967,11 +1150,22 @@ void pickingSystem(entt::registry& world, const core::Input& input,
     }
 
     if (input.ctrl) {
-        // Ctrl-click toggles the hit's selection and keeps the rest (multi-select);
-        // an empty Ctrl-click leaves the current selection untouched.
+        // Ctrl+left-click recenters the camera: glide the orbit pivot (and with it
+        // the camera position) to the picked point. Selection is left untouched; an
+        // empty Ctrl-click (no hit) does nothing.
         if (best != entt::null) {
-            auto& r = drawables.get<Renderable>(best);
-            r.selected = !r.selected;
+            const Eigen::Vector3f hit = rayOW + rayDW * bestT;  // render-world pick point
+            auto manips = world.view<Camera, CameraManipulator>();
+            for (auto e : manips) {
+                if (!manips.get<Camera>(e).primary) continue;
+                auto& m = manips.get<CameraManipulator>(e);
+                m.targetFrom      = m.target;
+                m.targetTo        = hit;
+                m.distFrom = m.distTo = m.distance;  // recenter keeps the zoom level
+                m.targetAnimTime  = 0.0f;
+                m.targetAnimating = true;
+                break;
+            }
         }
     } else {
         // Plain click single-selects: clear all, mark the hit (empty click clears).
@@ -1192,6 +1386,54 @@ void cameraControlsInputSystem(entt::registry& world, core::Input& input, float 
     }
 }
 
+void crossSectionInputSystem(entt::registry& world, core::Input& input,
+                             uint32_t viewportW, uint32_t viewportH) {
+    (void)viewportH;
+    CrossSection* cs = nullptr;
+    auto view = world.view<CrossSection>();
+    for (auto e : view) { cs = &view.get<CrossSection>(e); break; }
+    if (!cs) return;
+
+    // Position top-right, directly under the camera-controls panel.
+    int baseY = kMenuBarHeight + 14 + 150 + 10 + 76 + 10;
+    auto ccv = world.view<CameraControls>();
+    for (auto e : ccv) { const auto& cc = ccv.get<CameraControls>(e); baseY = cc.y + cc.h + 10; break; }
+    cs->x = static_cast<int>(viewportW) - cs->w - 14;
+    cs->y = baseY;
+    if (cs->x < 0) cs->x = 0;
+
+    float mx = input.mousePosX, my = input.mousePosY;
+    auto  hit = [&](const CRect& r) {
+        return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
+    };
+    CsRects R = crossSectionRects(*cs);
+    bool inPanel = mx >= cs->x && mx <= cs->x + cs->w && my >= cs->y && my <= cs->y + cs->h;
+
+    // Clicks on the buttons (single-shot). The slider drag is handled after.
+    if (input.leftClicked && hit(R.enable)) {
+        cs->enabled = !cs->enabled; input.captured = true; return;
+    }
+    if (input.leftClicked && hit(R.axis)) {
+        cs->axis = (cs->axis + 1) % 3; input.captured = true; return;
+    }
+    if (input.leftClicked && hit(R.flip)) {
+        cs->flip = !cs->flip; input.captured = true; return;
+    }
+
+    // Slider: grab anywhere in a band around the groove, then track the cursor.
+    CRect band = {R.track.x - 6.0f, cs->y + 58.0f, R.track.w + 12.0f, 30.0f};
+    if (input.leftClicked && hit(band)) cs->dragging = true;
+    if (!input.buttonLeft) cs->dragging = false;
+    if (cs->dragging) {
+        float t = R.track.w > 0.0f ? (mx - R.track.x) / R.track.w : 0.0f;
+        t = clampf(t, 0.0f, 1.0f);
+        cs->pos     = cs->minPos + t * (cs->maxPos - cs->minPos);
+        cs->enabled = true;  // moving the section turns it on
+        input.captured = true;
+    }
+    if (inPanel) input.captured = true;
+}
+
 void renderSystem(entt::registry& world, render::IRenderer& renderer,
                   uint32_t viewportW, uint32_t viewportH) {
     // --- Find the primary camera ---------------------------------------
@@ -1239,6 +1481,28 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     // World up-axis basis: prepended to every model so the scene's coordinate
     // frame (not the camera) changes when the gizmo toggles Y/Z up.
     const Eigen::Matrix4f Mworld = worldUpMatrix(worldZUp(world));
+
+    // Cross-section: turn (enabled, axis, flip, pos) into a render-world clip plane
+    // and hand it to the backend before the scene submits. Keep the half-space with
+    // coordinate <= pos (or >= pos when flipped); the opposite side is discarded.
+    {
+        bool  csEnabled = false;
+        float plane[4]  = {0, 0, 0, 0};
+        auto  csv = world.view<CrossSection>();
+        for (auto e : csv) {
+            const auto& cs = csv.get<CrossSection>(e);
+            if (cs.enabled) {
+                int   a = cs.axis < 0 ? 0 : (cs.axis > 2 ? 2 : cs.axis);
+                float s = cs.flip ? -1.0f : 1.0f;
+                plane[0] = plane[1] = plane[2] = 0.0f;
+                plane[a] = s;                          // normal along the chosen axis
+                plane[3] = cs.flip ? cs.pos : -cs.pos; // discard dot(world,n)+d > 0
+                csEnabled = true;
+            }
+            break;
+        }
+        renderer.setCrossSection(csEnabled, plane);
+    }
 
     // Each mesh carries its own drawing mode (Tab cycles it for the selection).
     // A selected mesh also gets a silhouette outline that reads as a thin border
@@ -1313,8 +1577,12 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     // --- Infinite ground grid (depth-tested against the scene) ---------
     // The grid is always the horizontal ground; the up-axis toggle re-expresses
     // content via Mworld. The axis arg only recolors the in-plane depth line
-    // (blue Z in Y-up, green Y in Z-up) to match the gizmo.
-    renderer.drawGrid(worldZUp(world) ? 2 : 1);
+    // (blue Z in Y-up, green Y in Z-up) to match the gizmo. Skipped when the Space
+    // toggle (GridState in ctx) has hidden it.
+    {
+        const auto* gs = world.ctx().find<GridState>();
+        if (!gs || gs->visible) renderer.drawGrid(worldZUp(world) ? 2 : 1);
+    }
 
     // --- Axis gizmo overlay (top-right corner) -------------------------
     auto gz = world.view<AxisGizmo>();
@@ -1478,6 +1746,34 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::DrawItem item;
         item.mesh    = cc.mesh;
         item.texture = cc.atlas;
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
+        std::memcpy(item.model, model.data(), sizeof(item.model));
+        renderer.submit(item);
+        break;
+    }
+
+    // --- Cross-section panel overlay ----------------------------------
+    auto csview = world.view<CrossSection>();
+    for (auto entity : csview) {
+        const auto& cs = csview.get<CrossSection>(entity);
+        if (!cs.font || cs.mesh == render::kInvalidMesh) break;
+
+        render::Vertex verts[kCsVerts];
+        buildCrossSectionGeometry(cs, verts);
+        renderer.updateBuffer(cs.vbo, verts, sizeof(verts));
+
+        render::OverlayContext ov;
+        ov.x = cs.x; ov.y = cs.y; ov.width = cs.w; ov.height = cs.h;
+        ov.clearDepth = true;
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+        std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+        renderer.beginOverlay(ov);
+
+        render::DrawItem item;
+        item.mesh    = cs.mesh;
+        item.texture = cs.atlas;
         Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);

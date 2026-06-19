@@ -71,6 +71,10 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
     if (!plugin_ || !plugin_->renderer()) return;
     running_ = true;
 
+    // Push the initial scene coloring (grayscale by default) so the first frame
+    // already reflects it; the renderer otherwise starts in mode 0 (original).
+    plugin_->renderer()->setColorMode(colorMode_);
+
     Uint64 last = SDL_GetPerformanceCounter();
     const double freq = static_cast<double>(SDL_GetPerformanceFrequency());
 
@@ -138,6 +142,40 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                         plugin_->renderer()->setPointSize(pointSize_);
                         SDL_Log("Application: point size = %.0f", pointSize_);
                     }
+                    if (e.key.scancode == SDL_SCANCODE_GRAVE) {
+                        if (e.key.mod & SDL_KMOD_SHIFT) {  // Shift+` cycles scene coloring
+                            colorMode_ = (colorMode_ + 1) % 4;  // default/height/position/gray
+                            plugin_->renderer()->setColorMode(colorMode_);
+                            static const char* kColorNames[4] = {"default", "height",
+                                                                 "position", "grayscale"};
+                            SDL_Log("Application: color mode = %s", kColorNames[colorMode_]);
+                        } else {                           // ` toggles point-sprite lighting
+                            lighting_ = !lighting_;
+                            plugin_->renderer()->setLighting(lighting_);
+                            SDL_Log("Application: lighting = %s", lighting_ ? "on" : "off");
+                        }
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_SPACE) {  // Space toggles the grid
+                        auto& ctx = world_.ctx();
+                        if (!ctx.contains<ecs::GridState>()) ctx.emplace<ecs::GridState>();
+                        auto& gs = ctx.get<ecs::GridState>();
+                        gs.visible = !gs.visible;
+                        SDL_Log("Application: grid = %s", gs.visible ? "on" : "off");
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_R) {  // R resets the camera to its home pose
+                        auto v = world_.view<ecs::Camera, ecs::CameraManipulator>();
+                        for (auto ent : v) {
+                            if (!v.get<ecs::Camera>(ent).primary) continue;
+                            auto& m = v.get<ecs::CameraManipulator>(ent);
+                            m.animFrom = m.orientation;  m.animTo = m.homeOrientation;
+                            m.animTime = 0.0f;           m.animating = true;
+                            m.targetFrom = m.target;     m.targetTo = m.homeTarget;
+                            m.distFrom = m.distance;     m.distTo = m.homeDistance;
+                            m.targetAnimTime = 0.0f;     m.targetAnimating = true;
+                            break;
+                        }
+                        SDL_Log("Application: camera reset");
+                    }
                     if (e.key.scancode == SDL_SCANCODE_H) {
                         // Unhide all: reveal meshes hidden by the None draw mode so
                         // they can be seen and selected again.
@@ -200,6 +238,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         ecs::menuBarInputSystem(world_, input_, window_.width(), window_.height());
         ecs::fpsWidgetInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::cameraControlsInputSystem(world_, input_, dt, window_.width(), window_.height());
+        ecs::crossSectionInputSystem(world_, input_, window_.width(), window_.height());
         ecs::axisGizmoInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::cameraManipulatorSystem(world_, input_, dt);
         ecs::pickingSystem(world_, input_, window_.width(), window_.height());

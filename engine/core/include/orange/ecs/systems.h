@@ -25,6 +25,12 @@ void fpsWidgetInputSystem(entt::registry& world, core::Input& input, float dt,
 void cameraControlsInputSystem(entt::registry& world, core::Input& input, float dt,
                                uint32_t viewportW, uint32_t viewportH);
 
+// Cross-section panel: positions it under the camera-controls panel and handles
+// the enable toggle, axis cycle (X/Y/Z), flip toggle, and slider drag that moves
+// the cut plane. Sets input.captured while the pointer is over the panel.
+void crossSectionInputSystem(entt::registry& world, core::Input& input,
+                             uint32_t viewportW, uint32_t viewportH);
+
 // Axis gizmo input: each frame, ray-picks the gizmo cube under the cursor to
 // update the hover region; on click, classifies the hit as face/edge/corner and
 // starts a smooth camera snap toward that view (plus a click-flash). Runs before
