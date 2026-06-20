@@ -74,6 +74,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
     // Push the initial scene coloring (grayscale by default) so the first frame
     // already reflects it; the renderer otherwise starts in mode 0 (original).
     plugin_->renderer()->setColorMode(colorMode_);
+    vsync_ = config_.vsync;
 
     Uint64 last = SDL_GetPerformanceCounter();
     const double freq = static_cast<double>(SDL_GetPerformanceFrequency());
@@ -236,6 +237,20 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
 
         if (onUpdate) onUpdate(world_, dt);
         ecs::menuBarInputSystem(world_, input_, window_.width(), window_.height());
+        // A menu click raised an action: dispatch it (mirrors the keys), then sync
+        // the menu checkmarks to the live state for this frame's draw.
+        {
+            auto mv = world_.view<ecs::MenuBar>();
+            for (auto e : mv) {
+                auto& mb = mv.get<ecs::MenuBar>(e);
+                if (mb.triggered != ecs::MenuAction::None) {
+                    applyMenuAction(static_cast<int>(mb.triggered));
+                    mb.triggered = ecs::MenuAction::None;
+                }
+                break;
+            }
+        }
+        syncMenu();
         ecs::fpsWidgetInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::cameraControlsInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::crossSectionInputSystem(world_, input_, window_.width(), window_.height());
@@ -252,6 +267,172 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
             saveScreenshot(*plugin_->renderer(), executableDir() + "orange_capture.png");
         }
     }
+}
+
+void Application::applyMenuAction(int action) {
+    using A = ecs::MenuAction;
+    auto* r = plugin_ ? plugin_->renderer() : nullptr;
+
+    // Set every selected mesh's draw mode (or the only mesh, if there's just one).
+    auto setDrawModeSel = [&](DrawMode dm) {
+        auto v = world_.view<ecs::Renderable>();
+        size_t count = 0;
+        for (auto ent : v) { (void)ent; ++count; }
+        for (auto ent : v) {
+            auto& rr = v.get<ecs::Renderable>(ent);
+            if (!rr.selected && count != 1) continue;
+            rr.drawMode = dm;
+        }
+    };
+    auto setColor = [&](uint32_t mode) {
+        colorMode_ = mode;
+        if (r) r->setColorMode(colorMode_);
+    };
+    auto setMode = [&](int idx) {
+        auto& ctx = world_.ctx();
+        if (!ctx.contains<modes::ModeState>()) ctx.emplace<modes::ModeState>();
+        auto& ms = ctx.get<modes::ModeState>();
+        ms.index = idx % modes::modeCount();
+        ms.generation++;
+    };
+
+    switch (static_cast<A>(action)) {
+        case A::OpenFile: {
+            auto mv = world_.view<ecs::MenuBar>();
+            for (auto e : mv) { mv.get<ecs::MenuBar>(e).requestOpenFile = true; break; }
+            break;
+        }
+        case A::Screenshot: capture_ = true; break;
+        case A::Quit:       running_ = false; break;
+
+        case A::ToggleGrid: {
+            auto& ctx = world_.ctx();
+            if (!ctx.contains<ecs::GridState>()) ctx.emplace<ecs::GridState>();
+            auto& gs = ctx.get<ecs::GridState>();
+            gs.visible = !gs.visible;
+            break;
+        }
+        case A::ResetCamera: {
+            auto v = world_.view<ecs::Camera, ecs::CameraManipulator>();
+            for (auto ent : v) {
+                if (!v.get<ecs::Camera>(ent).primary) continue;
+                auto& m = v.get<ecs::CameraManipulator>(ent);
+                m.animFrom = m.orientation;  m.animTo = m.homeOrientation;
+                m.animTime = 0.0f;           m.animating = true;
+                m.targetFrom = m.target;     m.targetTo = m.homeTarget;
+                m.distFrom = m.distance;     m.distTo = m.homeDistance;
+                m.targetAnimTime = 0.0f;     m.targetAnimating = true;
+                break;
+            }
+            break;
+        }
+        case A::ToggleUpAxis: {
+            auto v = world_.view<ecs::AxisGizmo>();
+            for (auto ent : v) { auto& g = v.get<ecs::AxisGizmo>(ent); g.zUp = !g.zUp; break; }
+            break;
+        }
+        case A::ToggleProjection: {
+            auto v = world_.view<ecs::Camera>();
+            for (auto ent : v) {
+                auto& c = v.get<ecs::Camera>(ent);
+                if (!c.primary) continue;
+                c.mode = (c.mode == ecs::ProjectionMode::Perspective)
+                             ? ecs::ProjectionMode::Orthographic
+                             : ecs::ProjectionMode::Perspective;
+                break;
+            }
+            break;
+        }
+        case A::ToggleLighting: lighting_ = !lighting_; if (r) r->setLighting(lighting_); break;
+        case A::ToggleVsync:    vsync_ = !vsync_;       if (r) r->setVsync(vsync_);       break;
+        case A::ToggleCrossSection: {
+            auto v = world_.view<ecs::CrossSection>();
+            for (auto ent : v) { auto& cs = v.get<ecs::CrossSection>(ent); cs.enabled = !cs.enabled; break; }
+            break;
+        }
+
+        case A::ColorOriginal: setColor(0); break;
+        case A::ColorHeight:   setColor(1); break;
+        case A::ColorPosition: setColor(2); break;
+        case A::ColorGray:     setColor(3); break;
+
+        case A::DrawNone:      setDrawModeSel(DrawMode::None);             break;
+        case A::DrawSolid:     setDrawModeSel(DrawMode::Solid);            break;
+        case A::DrawWireframe: setDrawModeSel(DrawMode::WireFrame);          break;
+        case A::DrawWireSolid: setDrawModeSel(DrawMode::WireFrameOverSolid); break;
+        case A::DrawPoint:     setDrawModeSel(DrawMode::Point);            break;
+
+        case A::SelectAll: {
+            auto v = world_.view<ecs::Renderable>();
+            for (auto ent : v)
+                if (ecs::entityVisibleOnScreen(world_, ent, window_.width(), window_.height()))
+                    v.get<ecs::Renderable>(ent).selected = true;
+            break;
+        }
+        case A::ClearSelection: {
+            auto v = world_.view<ecs::Renderable>();
+            for (auto ent : v) v.get<ecs::Renderable>(ent).selected = false;
+            break;
+        }
+        case A::DeleteSelected: {
+            std::vector<entt::entity> dead;
+            auto v = world_.view<ecs::Renderable>();
+            for (auto ent : v) if (v.get<ecs::Renderable>(ent).selected) dead.push_back(ent);
+            for (auto ent : dead) world_.destroy(ent);
+            break;
+        }
+        case A::UnhideAll: {
+            auto v = world_.view<ecs::Renderable>();
+            for (auto ent : v) {
+                auto& rr = v.get<ecs::Renderable>(ent);
+                if (rr.drawMode == DrawMode::None) rr.drawMode = DrawMode::Solid;
+            }
+            break;
+        }
+        case A::PointSizeUp:
+            pointSize_ = pointSize_ + 1.0f > 64.0f ? 64.0f : pointSize_ + 1.0f;
+            if (r) r->setPointSize(pointSize_);
+            break;
+        case A::PointSizeDown:
+            pointSize_ = pointSize_ - 1.0f < 1.0f ? 1.0f : pointSize_ - 1.0f;
+            if (r) r->setPointSize(pointSize_);
+            break;
+
+        case A::Mode0: setMode(0); break;
+        case A::Mode1: setMode(1); break;
+        case A::Mode2: setMode(2); break;
+        case A::Mode3: setMode(3); break;
+        case A::None:  break;
+    }
+}
+
+void Application::syncMenu() {
+    using A = ecs::MenuAction;
+    ecs::MenuBar* mb = nullptr;
+    auto mv = world_.view<ecs::MenuBar>();
+    for (auto e : mv) { mb = &mv.get<ecs::MenuBar>(e); break; }
+    if (!mb) return;
+
+    bool gridOn = true;
+    if (world_.ctx().contains<ecs::GridState>()) gridOn = world_.ctx().get<ecs::GridState>().visible;
+    bool csOn = false;
+    { auto v = world_.view<ecs::CrossSection>();
+      for (auto e : v) { csOn = v.get<ecs::CrossSection>(e).enabled; break; } }
+
+    for (auto& menu : mb->menus)
+        for (auto& it : menu.items) {
+            switch (it.action) {
+                case A::ToggleGrid:         it.checked = gridOn;          break;
+                case A::ToggleLighting:     it.checked = lighting_;       break;
+                case A::ToggleVsync:        it.checked = vsync_;          break;
+                case A::ToggleCrossSection: it.checked = csOn;            break;
+                case A::ColorOriginal:      it.checked = colorMode_ == 0; break;
+                case A::ColorHeight:        it.checked = colorMode_ == 1; break;
+                case A::ColorPosition:      it.checked = colorMode_ == 2; break;
+                case A::ColorGray:          it.checked = colorMode_ == 3; break;
+                default: break;
+            }
+        }
 }
 
 Application::~Application() {

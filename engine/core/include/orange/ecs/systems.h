@@ -1,8 +1,11 @@
 #pragma once
 
+#include <vector>
+
 #include <entt/entt.hpp>
 
 #include "orange/core/input.h"
+#include "orange/ecs/components.h"
 #include "orange/render/renderer.h"
 
 namespace orange::ecs {
@@ -44,6 +47,12 @@ void axisGizmoInputSystem(entt::registry& world, core::Input& input,
 // "Open..." is chosen. Runs first so it gets first crack at the click.
 void menuBarInputSystem(entt::registry& world, core::Input& input,
                         uint32_t viewportW, uint32_t viewportH);
+
+// Builds the default appOrange menu set (File / View / Render / Draw / Select /
+// Points / Help) wired to the MenuAction ids. Assign the result to
+// MenuBar::menus at setup. The titles/items map 1:1 to the keyboard shortcuts and
+// the dispatch in Application::applyMenuAction.
+std::vector<Menu> defaultAppMenus();
 
 // Picking: on a fresh left-click (not consumed by a UI widget), casts a ray
 // from the primary camera through the cursor, finds the nearest (Transform,

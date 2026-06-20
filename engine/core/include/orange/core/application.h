@@ -54,6 +54,12 @@ private:
     float                         pointSize_ = 6.0f; // point-cloud sprite size (+/- keys)
     bool                          lighting_  = true; // point-sprite shading (` toggles)
     uint32_t                      colorMode_ = 3;    // scene coloring (3 = grayscale default; Shift+` cycles)
+    bool                          vsync_     = true; // swap interval (menu toggles it)
+
+    // Dispatch a MenuBar action (mirrors the keyboard shortcuts); set checkmarks on
+    // the menu items from the live state before drawing. Both run each frame.
+    void applyMenuAction(int action);
+    void syncMenu();
 
     static std::string defaultPluginName(render::Backend backend);
     static std::string executableDir();

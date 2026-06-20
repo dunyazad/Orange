@@ -30,6 +30,7 @@
 #include "orange/core/console.h"
 #include "orange/core/math.h"
 #include "orange/ecs/components.h"
+#include "orange/ecs/systems.h"
 #include "orange/render/types.h"
 
 using namespace orange;
@@ -571,8 +572,8 @@ int main(int argc, char** argv) {
         world.emplace<ecs::CrossSection>(e, cs);
     }
 
-    // Top menu bar (File > Open...). Dynamic vertex buffer rewritten each frame.
-    const int kMenuQ = 64, kMenuV = kMenuQ * 4;  // must match kMenuQuads in systems.cpp
+    // Top menu bar (multi-menu). Dynamic vertex buffer rewritten each frame.
+    const int kMenuQ = 1024, kMenuV = kMenuQ * 4;  // must match kMenuQuads in systems.cpp
     const std::vector<render::Vertex> menuInit(kMenuV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
     std::vector<uint32_t> menuIdx;
     for (uint32_t q = 0; q < static_cast<uint32_t>(kMenuQ); ++q) {
@@ -595,6 +596,7 @@ int main(int argc, char** argv) {
         mb.vbo   = menuVbo.handle();
         mb.font  = &uiFont;
         mb.atlas = uiFont.texture;
+        mb.menus = ecs::defaultAppMenus();
         world.emplace<ecs::MenuBar>(e, mb);
     }
 

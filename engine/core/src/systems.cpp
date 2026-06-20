@@ -750,17 +750,69 @@ void buildCrossSectionGeometry(const CrossSection& cs, render::Vertex* out) {
 }
 
 // --- Top menu bar ----------------------------------------------------------
-constexpr int   kMenuQuads = 64;            // must match kMenuQ in main.cpp
+constexpr int   kMenuQuads = 1024;          // must match kMenuQ in main.cpp
 constexpr int   kMenuVerts = kMenuQuads * 4;
-constexpr float kMenuFileW = 84.0f;         // width of the "File" hit area (px)
-constexpr float kMenuDropW = 240.0f;        // dropdown panel width (px)
-constexpr float kMenuItemH = 42.0f;         // dropdown item height (px)
-constexpr int   kMenuItems = 1;             // dropdown items ("Open...")
+constexpr float kMenuTitlePad = 14.0f;      // l/r padding around a bar title (px)
+constexpr float kMenuItemH    = 38.0f;      // dropdown item row height (px)
+constexpr float kMenuSepH     = 11.0f;      // separator row height (px)
+constexpr float kMenuCheckW   = 24.0f;      // left gutter holding the check tick
+constexpr float kMenuPadX     = 14.0f;      // dropdown left/right padding
+constexpr float kMenuShortGap = 28.0f;      // gap between label and the shortcut
+constexpr float kMenuMinDropW = 190.0f;     // minimum dropdown width (px)
+constexpr float kMenuTextH    = 26.0f;      // dropdown/title text px height
+
+// Left edge (px) of menu title `i` and (via out_x1) its right edge. Titles are laid
+// out left to right, each `textWidth + 2*pad` wide. Identical maths in the builder
+// and the hit-test so they always agree.
+float menuTitleRect(const MenuBar& mb, const core::Font& f, float th, int i,
+                    float* out_x1) {
+    float x = 0.0f;
+    for (int k = 0; k < static_cast<int>(mb.menus.size()); ++k) {
+        float w = f.textWidth(mb.menus[k].title.c_str(), th) + 2.0f * kMenuTitlePad;
+        if (k == i) { if (out_x1) *out_x1 = x + w; return x; }
+        x += w;
+    }
+    if (out_x1) *out_x1 = x;
+    return x;
+}
+
+// Dropdown panel width for a menu: the widest item (check gutter + label + optional
+// shortcut), clamped to a minimum.
+float menuDropWidth(const Menu& m, const core::Font& f, float th) {
+    float w = kMenuMinDropW;
+    for (const auto& it : m.items) {
+        if (it.kind == MenuItem::Separator) continue;
+        float row = kMenuCheckW + f.textWidth(it.label.c_str(), th) + kMenuPadX;
+        if (!it.shortcut.empty())
+            row += kMenuShortGap + f.textWidth(it.shortcut.c_str(), th);
+        w = (std::max)(w, row);
+    }
+    return w;
+}
+
+// Total dropdown height (sum of row heights; separators are shorter).
+float menuDropHeight(const Menu& m) {
+    float h = 0.0f;
+    for (const auto& it : m.items) h += (it.kind == MenuItem::Separator ? kMenuSepH : kMenuItemH);
+    return h;
+}
+
+// Top edge (px, relative to the bar bottom) of item `i`, and its height via out_h.
+float menuItemTop(const Menu& m, int i, float* out_h) {
+    float y = 0.0f;
+    for (int k = 0; k < static_cast<int>(m.items.size()); ++k) {
+        float h = (m.items[k].kind == MenuItem::Separator ? kMenuSepH : kMenuItemH);
+        if (k == i) { if (out_h) *out_h = h; return y; }
+        y += h;
+    }
+    if (out_h) *out_h = 0.0f;
+    return y;
+}
 
 // Builds the bar in normalized [0,1]^2 (y-up) over an overlay whose pixel size is
 // viewportW x overlayH. Working in pixels and converting keeps the text crisp and
 // the layout identical to the hit-tests in menuBarInputSystem. overlayH grows to
-// include the dropdown while the File menu is open.
+// include the open dropdown.
 void buildMenuGeometry(const MenuBar& mb, render::Vertex* out, uint32_t viewportW,
                        float overlayH) {
     int q = 0;
@@ -790,13 +842,19 @@ void buildMenuGeometry(const MenuBar& mb, render::Vertex* out, uint32_t viewport
                    col, z, xs);
     };
 
-    const float txt[3] = {0.90f, 0.92f, 0.95f};
-    const float th = 28.0f;                              // text px height (≈ FPS readout)
+    const float txt[3]  = {0.90f, 0.92f, 0.95f};
+    const float dim[3]  = {0.60f, 0.63f, 0.70f};
+    const float th = kMenuTextH;
 
     solid(0, 0, W, barH, 0.16f, 0.17f, 0.20f, 0.0f);     // bar background
-    if (mb.fileOpen)                                     // highlight "File" when open
-        solid(0, 0, kMenuFileW, barH, 0.26f, 0.28f, 0.34f, 0.1f);
-    text("File", 12.0f, (barH + th) * 0.5f - 2.0f, th, txt, 0.5f);
+
+    // Top-level titles.
+    for (int i = 0; i < static_cast<int>(mb.menus.size()); ++i) {
+        float x1, x0 = menuTitleRect(mb, f, th, i, &x1);
+        if (i == mb.openMenu) solid(x0, 0, x1, barH, 0.26f, 0.28f, 0.34f, 0.1f);
+        text(mb.menus[i].title.c_str(), x0 + kMenuTitlePad,
+             (barH + th) * 0.5f - 2.0f, th, txt, 0.5f);
+    }
 
     // Right-aligned status (e.g. "Loading 42%") shown while a background load runs.
     if (!mb.statusText.empty()) {
@@ -806,12 +864,35 @@ void buildMenuGeometry(const MenuBar& mb, render::Vertex* out, uint32_t viewport
         text(st, W - stw - 14.0f, (barH + th) * 0.5f - 2.0f, th, stCol, 0.5f);
     }
 
-    if (mb.fileOpen) {
-        float dy0 = barH, dy1 = barH + kMenuItemH * kMenuItems;
-        solid(0, dy0, kMenuDropW, dy1, 0.13f, 0.14f, 0.17f, 0.2f);  // dropdown panel
-        if (mb.hoverItem == 0)                                       // hovered item
-            solid(0, dy0, kMenuDropW, dy0 + kMenuItemH, 0.24f, 0.30f, 0.42f, 0.25f);
-        text("Open...", 14.0f, dy0 + (kMenuItemH + th) * 0.5f - 2.0f, th, txt, 0.5f);
+    // Open dropdown.
+    if (mb.openMenu >= 0 && mb.openMenu < static_cast<int>(mb.menus.size())) {
+        const Menu& m = mb.menus[mb.openMenu];
+        float tx1, tx0 = menuTitleRect(mb, f, th, mb.openMenu, &tx1);
+        float dw = menuDropWidth(m, f, th);
+        float dx0 = clampf(tx0, 0.0f, (std::max)(0.0f, W - dw));  // keep on screen
+        float dh = menuDropHeight(m);
+        solid(dx0, barH, dx0 + dw, barH + dh, 0.13f, 0.14f, 0.17f, 0.2f);  // panel
+
+        for (int i = 0; i < static_cast<int>(m.items.size()); ++i) {
+            const MenuItem& it = m.items[i];
+            float ih, iy = barH + menuItemTop(m, i, &ih);
+            if (it.kind == MenuItem::Separator) {
+                solid(dx0 + kMenuPadX, iy + ih * 0.5f - 1.0f, dx0 + dw - kMenuPadX,
+                      iy + ih * 0.5f + 1.0f, 0.30f, 0.32f, 0.38f, 0.25f);
+                continue;
+            }
+            if (i == mb.hoverItem)
+                solid(dx0, iy, dx0 + dw, iy + ih, 0.24f, 0.30f, 0.42f, 0.25f);
+            float baseY = iy + (ih + th) * 0.5f - 2.0f;
+            if (it.kind == MenuItem::Check && it.checked)  // tick in the left gutter
+                solid(dx0 + 9.0f, iy + ih * 0.5f - 5.0f, dx0 + 19.0f,
+                      iy + ih * 0.5f + 5.0f, 0.55f, 0.85f, 1.0f, 0.3f);
+            text(it.label.c_str(), dx0 + kMenuCheckW, baseY, th, txt, 0.5f);
+            if (!it.shortcut.empty()) {
+                float sw = f.textWidth(it.shortcut.c_str(), th);
+                text(it.shortcut.c_str(), dx0 + dw - kMenuPadX - sw, baseY, th, dim, 0.5f);
+            }
+        }
     }
 
     for (int i = q * 4; i < kMenuVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
@@ -904,36 +985,129 @@ void menuBarInputSystem(entt::registry& world, core::Input& input,
     MenuBar* mb = nullptr;
     auto view = world.view<MenuBar>();
     for (auto e : view) { mb = &view.get<MenuBar>(e); break; }
-    if (!mb || !mb->visible) return;
+    if (!mb || !mb->visible || !mb->font) return;
 
+    const core::Font& f = *mb->font;
+    const float th   = kMenuTextH;
     const float barH = static_cast<float>(mb->height);
-    const float dropY0 = barH, dropY1 = barH + kMenuItemH * kMenuItems;
+    const float W    = static_cast<float>(viewportW);
     float mx = input.mousePosX, my = input.mousePosY;
+    const int nMenus = static_cast<int>(mb->menus.size());
 
-    bool onFile = mx >= 0.0f && mx < kMenuFileW && my >= 0.0f && my < barH;
-    bool inBar  = my >= 0.0f && my < barH;
-    bool inDrop = mb->fileOpen && mx >= 0.0f && mx < kMenuDropW && my >= dropY0 &&
-                  my < dropY1;
+    // Which title is the pointer over (-1 = none)?
+    int onTitle = -1;
+    if (my >= 0.0f && my < barH) {
+        for (int i = 0; i < nMenus; ++i) {
+            float x1, x0 = menuTitleRect(*mb, f, th, i, &x1);
+            if (mx >= x0 && mx < x1) { onTitle = i; break; }
+        }
+    }
+    bool inBar = my >= 0.0f && my < barH;
 
-    // Which dropdown item is hovered (only meaningful while open).
-    mb->hoverItem = inDrop ? static_cast<int>((my - dropY0) / kMenuItemH) : -1;
+    // Dropdown geometry of the open menu + which item the pointer is over.
+    bool inDrop = false;
+    mb->hoverItem = -1;
+    if (mb->openMenu >= 0 && mb->openMenu < nMenus) {
+        const Menu& m = mb->menus[mb->openMenu];
+        float tx1, tx0 = menuTitleRect(*mb, f, th, mb->openMenu, &tx1);
+        float dw  = menuDropWidth(m, f, th);
+        float dx0 = clampf(tx0, 0.0f, (std::max)(0.0f, W - dw));
+        float dh  = menuDropHeight(m);
+        if (mx >= dx0 && mx < dx0 + dw && my >= barH && my < barH + dh) {
+            inDrop = true;
+            float local = my - barH;
+            for (int i = 0; i < static_cast<int>(m.items.size()); ++i) {
+                float ih, iy = menuItemTop(m, i, &ih);
+                if (local >= iy && local < iy + ih) {
+                    if (m.items[i].kind != MenuItem::Separator) mb->hoverItem = i;
+                    break;
+                }
+            }
+        }
+    }
 
-    // The bar (and an open dropdown) own their pixels: suppress orbit/picking
-    // while the pointer is over them.
+    // Hovering a different title while a menu is open switches to it (classic UX).
+    if (mb->openMenu >= 0 && onTitle >= 0 && onTitle != mb->openMenu)
+        mb->openMenu = onTitle;
+
+    // The bar (and an open dropdown) own their pixels: suppress orbit/picking.
     if (inBar || inDrop) input.captured = true;
 
     if (input.leftClicked) {
-        if (onFile) {
-            mb->fileOpen   = !mb->fileOpen;   // toggle the menu
+        if (onTitle >= 0) {
+            mb->openMenu   = (mb->openMenu == onTitle) ? -1 : onTitle;  // toggle
             input.captured = true;
         } else if (inDrop) {
-            if (mb->hoverItem == 0) mb->requestOpenFile = true;  // "Open..."
-            mb->fileOpen   = false;
+            if (mb->hoverItem >= 0) {
+                const Menu& m = mb->menus[mb->openMenu];
+                mb->triggered = m.items[mb->hoverItem].action;  // dispatched by the app
+            }
+            mb->openMenu   = -1;
             input.captured = true;
         } else {
-            mb->fileOpen = false;             // click anywhere else closes it
+            mb->openMenu = -1;                // click elsewhere closes the menu
         }
     }
+}
+
+std::vector<Menu> defaultAppMenus() {
+    using A = MenuAction;
+    using K = MenuItem;
+    auto act   = [](const char* l, A a, const char* sc = "") {
+        return MenuItem{l, sc, a, K::Action, false};
+    };
+    auto chk   = [](const char* l, A a, const char* sc = "") {
+        return MenuItem{l, sc, a, K::Check, false};
+    };
+    auto sep   = []() { return MenuItem{"", "", A::None, K::Separator, false}; };
+
+    std::vector<Menu> menus;
+    menus.push_back({"File", {
+        act("Open...",    A::OpenFile),
+        act("Screenshot", A::Screenshot, "C"),
+        sep(),
+        act("Quit",       A::Quit, "Esc"),
+    }});
+    menus.push_back({"View", {
+        chk("Ground Grid",   A::ToggleGrid, "Space"),
+        act("Reset Camera",  A::ResetCamera, "R"),
+        sep(),
+        act("Z-Up / Y-Up",   A::ToggleUpAxis),
+        act("Perspective / Ortho", A::ToggleProjection),
+    }});
+    menus.push_back({"Render", {
+        chk("Lighting",      A::ToggleLighting, "`"),
+        chk("VSync",         A::ToggleVsync),
+        chk("Cross-Section", A::ToggleCrossSection),
+        sep(),
+        chk("Color: Original", A::ColorOriginal),
+        chk("Color: Height",   A::ColorHeight),
+        chk("Color: Position", A::ColorPosition),
+        chk("Color: Grayscale",A::ColorGray),
+    }});
+    menus.push_back({"Draw", {
+        act("Hidden (None)",       A::DrawNone),
+        act("Solid",               A::DrawSolid),
+        act("Wireframe",           A::DrawWireframe),
+        act("Wireframe + Solid",   A::DrawWireSolid),
+        act("Point",               A::DrawPoint),
+        sep(),
+        act("Point Size +",        A::PointSizeUp, "+"),
+        act("Point Size -",        A::PointSizeDown, "-"),
+    }});
+    menus.push_back({"Select", {
+        act("Select All On-Screen", A::SelectAll, "Ctrl+A"),
+        act("Clear Selection",      A::ClearSelection),
+        act("Delete Selected",      A::DeleteSelected, "Del"),
+        act("Unhide All",           A::UnhideAll, "H"),
+    }});
+    menus.push_back({"Points", {
+        act("Mode: Clustering",  A::Mode0),
+        act("Mode: Morphology",  A::Mode1),
+        act("Mode: SDF Filter",  A::Mode2),
+        act("Mode: Reconstruct", A::Mode3),
+    }});
+    return menus;
 }
 
 bool entityVisibleOnScreen(entt::registry& world, entt::entity e, uint32_t viewportW,
@@ -1848,9 +2022,11 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
             mb.vbo == render::kInvalidBuffer)
             break;
 
-        // Overlay grows downward to include the dropdown when the menu is open.
-        float overlayH = static_cast<float>(mb.height) +
-                         (mb.fileOpen ? kMenuItemH * kMenuItems : 0.0f);
+        // Overlay grows downward to include the dropdown when a menu is open.
+        float dropH = (mb.openMenu >= 0 && mb.openMenu < static_cast<int>(mb.menus.size()))
+                          ? menuDropHeight(mb.menus[mb.openMenu])
+                          : 0.0f;
+        float overlayH = static_cast<float>(mb.height) + dropH;
 
         render::Vertex verts[kMenuVerts];
         buildMenuGeometry(mb, verts, viewportW, overlayH);

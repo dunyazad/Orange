@@ -256,20 +256,58 @@ struct GridState {
 // pushed down by this so they never overlap the bar. Shared by systems.cpp.
 inline constexpr int kMenuBarHeight = 46;
 
-// A classic top-of-window menu bar with a single "File" menu whose only item is
-// "Open...". menuBarInputSystem handles open/close + clicks and renderSystem
-// draws it as an overlay. When "Open..." is chosen, requestOpenFile is raised
-// for the app to consume (e.g. show a native file dialog and load a mesh).
-// There is normally a single one in the world.
+// Action ids raised by a menu item click. menuBarInputSystem writes the chosen
+// item's `action` into MenuBar::triggered; Application::applyMenuAction consumes
+// it (mirroring the keyboard shortcuts), except MenuAction::OpenFile which sets
+// requestOpenFile for the app's native file dialog. Keep in sync with the menus
+// built by defaultAppMenus() and the dispatch in application.cpp.
+enum class MenuAction : int {
+    None = 0,
+    OpenFile, Screenshot, Quit,
+    ToggleGrid, ResetCamera, ToggleUpAxis, ToggleProjection,
+    ToggleLighting, ToggleVsync, ToggleCrossSection,
+    ColorOriginal, ColorHeight, ColorPosition, ColorGray,
+    DrawNone, DrawSolid, DrawWireframe, DrawWireSolid, DrawPoint,
+    SelectAll, DeleteSelected, ClearSelection, UnhideAll,
+    PointSizeUp, PointSizeDown,
+    Mode0, Mode1, Mode2, Mode3,
+};
+
+// One row in a dropdown. kind: Action = clickable command; Check = command that
+// also shows a tick when `checked`; Separator = a thin divider (no label/click).
+struct MenuItem {
+    enum Kind { Action, Check, Separator };
+    std::string label;
+    std::string shortcut;                 // right-aligned hint, e.g. "Tab" (optional)
+    MenuAction  action  = MenuAction::None;
+    Kind        kind    = Action;
+    bool        checked = false;          // tick state for Check items (synced by app)
+};
+
+// One top-level menu (a title in the bar + its dropdown items).
+struct Menu {
+    std::string           title;
+    std::vector<MenuItem> items;
+};
+
+// Top-of-window menu bar with any number of menus. menuBarInputSystem handles
+// open/close, hover and clicks; renderSystem draws it as an overlay. A clicked
+// item raises `triggered` for Application to dispatch. There is normally a single
+// MenuBar in the world.
 struct MenuBar {
     int  height  = kMenuBarHeight;  // bar height in px
     bool visible = true;
 
-    bool fileOpen  = false;  // is the File dropdown expanded?
-    int  hoverItem = -1;     // hovered dropdown item index (-1 = none)
+    std::vector<Menu> menus;        // populated by defaultAppMenus()
+    int  openMenu  = -1;            // index of the expanded menu (-1 = none)
+    int  hoverItem = -1;            // hovered dropdown item index (-1 = none)
 
-    // Raised by menuBarInputSystem when "Open..." is clicked; the app clears it
-    // once it has acted on it (one-shot edge flag, like FpsWidget::vsyncDirty).
+    // Action raised by the most recent item click; Application clears it after
+    // dispatch. MenuAction::None = nothing pending this frame.
+    MenuAction triggered = MenuAction::None;
+
+    // Raised when MenuAction::OpenFile is dispatched; the app clears it once it
+    // has shown the native dialog (one-shot edge flag).
     bool requestOpenFile = false;
 
     // Right-aligned status text drawn in the bar (e.g. "Loading 42%"). The app
