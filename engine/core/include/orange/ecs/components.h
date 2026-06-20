@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "orange/core/bvh.h"
 #include "orange/core/draw_mode.h"
 #include "orange/core/font.h"
 #include "orange/core/math.h"
@@ -57,6 +58,14 @@ struct Renderable {
 struct PickGeometry {
     std::vector<Eigen::Vector3f> positions;  // local-space vertex positions
     std::vector<uint32_t>        indices;    // triangle list (3 per face)
+};
+
+// Cached BVH over a PickGeometry's triangles, built lazily on first ray pick so
+// repeated picks of a large mesh are O(log n) instead of testing every triangle.
+// References the entity's PickGeometry buffers (stable while the component lives).
+struct PickBVH {
+    geometry::BVH bvh;
+    bool          built = false;
 };
 
 enum class ProjectionMode { Perspective = 0, Orthographic = 1 };
@@ -311,6 +320,25 @@ struct PointSizeState {
     float size = 6.0f;
 };
 
+// Spatial-structure overlay selector (ctx), set from the Spatial menu. renderSystem
+// builds the chosen structure for each *selected* entity's PickGeometry and draws
+// its node/cell boxes as a wireframe overlay. 0 = off, 1 = BVH, 2 = Octree, 3 = KD-tree.
+struct SpatialViz {
+    int kind = 0;
+};
+
+// Per-entity cached GPU wireframe of the current SpatialViz kind. Built once (into
+// a static mesh in the entity's local space) when the kind changes, then drawn
+// each frame with model = Mworld * Transform -- so a deep tree costs nothing per
+// frame (the old per-frame debug-draw rebuild was the bottleneck).
+struct SpatialVizCache {
+    int kind = -1;
+    render::MeshHandle   mesh = render::kInvalidMesh;
+    render::BufferHandle vbo  = render::kInvalidBuffer;
+    uint32_t             vertexCount = 0;
+    int boxCount = 0, inliers = 0, total = 0;  // diagnostics (shown in the menu bar)
+};
+
 // Height (px) of the top menu bar. The axis gizmo and camera-controls panel are
 // pushed down by this so they never overlap the bar. Shared by systems.cpp.
 inline constexpr int kMenuBarHeight = 46;
@@ -330,6 +358,8 @@ enum class MenuAction : int {
     SelectAll, DeleteSelected, ClearSelection, UnhideAll,
     PointSizeUp, PointSizeDown,
     Mode0, Mode1, Mode2, Mode3,
+    SpatialNone, SpatialBVH, SpatialOctree, SpatialKDTree,
+    SpatialGrid, SpatialLoose, SpatialBSP, SpatialRTree, SpatialBall,
 };
 
 // One row in a dropdown. kind: Action = clickable command; Check = command that

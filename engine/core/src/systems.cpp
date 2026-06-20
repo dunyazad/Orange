@@ -8,9 +8,17 @@
 #include <unordered_set>
 #include <vector>
 
+#include "orange/core/ball_tree.h"
+#include "orange/core/bsp.h"
+#include "orange/core/color.h"
 #include "orange/core/debug_draw.h"
 #include "orange/core/draw_mode.h"
 #include "orange/core/geometry.h"
+#include "orange/core/kdtree.h"
+#include "orange/core/loose_octree.h"
+#include "orange/core/octree.h"
+#include "orange/core/rtree.h"
+#include "orange/core/uniform_grid.h"
 #include "orange/core/math.h"
 #include "orange/core/modes.h"
 #include "orange/ecs/components.h"
@@ -696,8 +704,9 @@ void buildCrossSectionGeometry(const CrossSection& cs, render::Vertex* out) {
     CsRects R = crossSectionRects(cs);
     float x0, y0, x1, y1;
 
-    // Title.
-    float th = 14.0f / cs.h;
+    // Title. Match the camera-controls panel label size above (~20px: that panel's
+    // h=76, button 0.42 tall, text 0.64 of the button).
+    float th = 20.0f / cs.h;
     text("Section", 10.0f / cs.w, 1.0f - 8.0f / cs.h - th, th, 0.85f, 0.88f, 0.92f, 0.6f);
 
     // Enable checkbox (green tick when on).
@@ -712,7 +721,7 @@ void buildCrossSectionGeometry(const CrossSection& cs, render::Vertex* out) {
     toN(R.axis, x0, y0, x1, y1);
     solid(x0, y0, x1, y1, 0.20f, 0.22f, 0.27f, 0.3f);
     const char axisTxt[2] = {static_cast<char>('X' + cs.axis), '\0'};
-    float ah = (y1 - y0) * 0.62f;
+    float ah = (y1 - y0) * 0.72f;
     text(axisTxt, (x0 + x1) * 0.5f - textW(axisTxt, ah) * 0.5f,
          (y0 + y1) * 0.5f - ah * 0.35f, ah, 0.92f, 0.95f, 0.95f, 0.6f);
 
@@ -720,14 +729,14 @@ void buildCrossSectionGeometry(const CrossSection& cs, render::Vertex* out) {
     toN(R.flip, x0, y0, x1, y1);
     solid(x0, y0, x1, y1, cs.flip ? 0.28f : 0.20f, cs.flip ? 0.34f : 0.22f,
           cs.flip ? 0.44f : 0.27f, 0.3f);
-    float fh = (y1 - y0) * 0.5f;
+    float fh = (y1 - y0) * 0.72f;
     text("Flip", (x0 + x1) * 0.5f - textW("Flip", fh) * 0.5f,
          (y0 + y1) * 0.5f - fh * 0.35f, fh, 0.90f, 0.93f, 0.96f, 0.6f);
 
     // Value readout (between the two buttons).
     char buf[24];
     std::snprintf(buf, sizeof(buf), "%.2f", cs.pos);
-    float vh = 12.0f / cs.h;
+    float vh = 17.0f / cs.h;  // match the controls value (FOV) size above
     float vMid = (R.axis.x + R.axis.w + R.flip.x) * 0.5f;  // pixel midpoint of the gap
     text(buf, (vMid - cs.x) / cs.w - textW(buf, vh) * 0.5f,
          1.0f - (R.axis.y + R.axis.h * 0.5f - cs.y) / cs.h - vh * 0.35f, vh,
@@ -1205,6 +1214,17 @@ std::vector<Menu> defaultAppMenus() {
         act("Mode: SDF Filter",  A::Mode2),
         act("Mode: Reconstruct", A::Mode3),
     }});
+    menus.push_back({"Spatial", {
+        chk("Off",           A::SpatialNone),
+        chk("BVH",           A::SpatialBVH),
+        chk("Octree",        A::SpatialOctree),
+        chk("KD-Tree",       A::SpatialKDTree),
+        chk("Uniform Grid",  A::SpatialGrid),
+        chk("Loose Octree",  A::SpatialLoose),
+        chk("BSP",           A::SpatialBSP),
+        chk("R-Tree",        A::SpatialRTree),
+        chk("Ball Tree",     A::SpatialBall),
+    }});
     return menus;
 }
 
@@ -1658,19 +1678,12 @@ void pickingSystem(entt::registry& world, const core::Input& input,
 
         float tLocal = 0.0f;
         bool hit = false;
-        if (const PickGeometry* pg = world.try_get<PickGeometry>(e)) {
-            geometry::Ray ray(lo, ld);
-            float bestLocal = 1e30f;
-            for (size_t i = 0; i + 2 < pg->indices.size(); i += 3) {
-                const Eigen::Vector3f& a = pg->positions[pg->indices[i]];
-                const Eigen::Vector3f& b = pg->positions[pg->indices[i + 1]];
-                const Eigen::Vector3f& c = pg->positions[pg->indices[i + 2]];
-                float tt;
-                if (ray.intersectTriangle(a, b, c, tt) && tt >= 0.0f && tt < bestLocal) {
-                    bestLocal = tt; hit = true;
-                }
-            }
-            tLocal = bestLocal;
+        if (const PickGeometry* pg = world.try_get<PickGeometry>(e); pg && !pg->indices.empty()) {
+            // Accurate triangle pick accelerated by a lazily-built, cached BVH.
+            auto& accel = world.get_or_emplace<PickBVH>(e);
+            if (!accel.built) { accel.bvh.build(pg->positions, pg->indices); accel.built = true; }
+            float tl; int tri;
+            if (accel.bvh.nearestHit(geometry::Ray(lo, ld), tl, tri)) { tLocal = tl; hit = true; }
         } else {
             hit = intersectAABB(lo, ld, r.boundsMin, r.boundsMax, tLocal);
         }
@@ -1732,18 +1745,13 @@ void pickingSystem(entt::registry& world, const core::Input& input,
                        t.scale.y() != 0 ? 1.0f / t.scale.y() : 0.0f,
                        t.scale.z() != 0 ? 1.0f / t.scale.z() : 0.0f);
         lo = lo.cwiseProduct(inv); ld = ld.cwiseProduct(inv);
-        geometry::Ray ray(lo, ld);
         const size_t kNoFace = static_cast<size_t>(-1);
-        size_t hitFace = kNoFace; float bestLocal = 1e30f;
-        for (size_t i = 0; i + 2 < pg->indices.size(); i += 3) {
-            const auto& a = pg->positions[pg->indices[i]];
-            const auto& b = pg->positions[pg->indices[i + 1]];
-            const auto& c = pg->positions[pg->indices[i + 2]];
-            float tt;
-            if (ray.intersectTriangle(a, b, c, tt) && tt >= 0.0f && tt < bestLocal) {
-                bestLocal = tt; hitFace = i;
-            }
-        }
+        size_t hitFace = kNoFace;
+        auto& accel = world.get_or_emplace<PickBVH>(best);
+        if (!accel.built) { accel.bvh.build(pg->positions, pg->indices); accel.built = true; }
+        float tl; int tri;
+        if (accel.bvh.nearestHit(geometry::Ray(lo, ld), tl, tri))
+            hitFace = static_cast<size_t>(tri) * 3;
         if (hitFace == kNoFace) return;
         if (sm.target == SelTarget::Face) {
             toggleF(es, static_cast<uint32_t>(hitFace / 3), sub);
@@ -2255,6 +2263,136 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
                     dd.addTriangle(wp(pg.positions[pg.indices[i]]),
                                    wp(pg.positions[pg.indices[i + 1]]),
                                    wp(pg.positions[pg.indices[i + 2]]), hl);
+            }
+        }
+    }
+
+    // --- Spatial-structure overlay (BVH / Octree / KD-tree) ------------
+    // For each selected entity, build the chosen structure ONCE into a static GPU
+    // wireframe mesh (local space, per-level colored) and draw it each frame with
+    // model = Mworld * Transform. Rebuilding it per frame (the old debug-draw path)
+    // made deep trees < 1 fps; this makes the per-frame cost a single draw call.
+    {
+        int vizKind = 0;
+        if (world.ctx().contains<SpatialViz>()) vizKind = world.ctx().get<SpatialViz>().kind;
+        if (vizKind > 0) {
+            // BVH/Octree box count is bounded by node count, so go deep; a k-d tree
+            // has one node per point (2^depth cells), so cap it shallower.
+            const int kDepthTree = 18;   // BVH / Octree
+            const int kDepthKD   = 12;   // KD-tree
+            auto levelColor = [](int d) {
+                Eigen::Vector4f c = color::FromHSV(color::fract(d * 0.16f), 0.85f, 1.0f);
+                return Eigen::Vector3f(c.x(), c.y(), c.z());
+            };
+            auto sv = world.view<Transform, Renderable, PickGeometry>();
+            for (auto e : sv) {
+                const auto& r = sv.get<Renderable>(e);
+                if (!r.selected) continue;
+                const auto& pg = sv.get<PickGeometry>(e);
+                if (pg.positions.empty()) continue;
+                auto& cache = world.get_or_emplace<SpatialVizCache>(e);
+
+                if (cache.kind != vizKind) {  // (re)build the static wireframe mesh
+                    if (cache.mesh != render::kInvalidMesh) renderer.destroyMesh(cache.mesh);
+                    if (cache.vbo != render::kInvalidBuffer) renderer.destroyBuffer(cache.vbo);
+                    cache.mesh = render::kInvalidMesh; cache.vbo = render::kInvalidBuffer;
+                    cache.vertexCount = 0; cache.kind = vizKind;
+
+                    std::vector<geometry::AABB> boxes; std::vector<int> levels;
+                    // Ball tree visualizes spheres instead of boxes.
+                    std::vector<Eigen::Vector3f> sphC; std::vector<float> sphR; std::vector<int> sphL;
+
+                    // Build on ALL points so the whole model is covered. Robust bounds
+                    // are used only to size the line thickness and to cull a handful of
+                    // oversized cells (outlier points blow a few cells up to span the
+                    // scene); they do NOT filter the points fed to the structure.
+                    const std::vector<Eigen::Vector3f>& P = pg.positions;
+                    geometry::AABB rb = geometry::robustBounds(P, 0.001f);  // only extreme strays
+                    float md = (rb.max - rb.min).norm();
+                    geometry::AABB full; for (const auto& p : P) full.expand(p);
+
+                    if (vizKind == 1 && !pg.indices.empty()) {
+                        geometry::BVH b; b.build(P, pg.indices);
+                        b.nodeBoxesDepth(boxes, levels, kDepthTree);
+                    } else if (vizKind == 2) {
+                        geometry::Octree o; o.build(P, 64);
+                        o.nodeBoxesDepth(boxes, levels, kDepthTree);
+                    } else if (vizKind == 3) {
+                        geometry::KDTree k; k.build(P);
+                        k.cellBoxesDepth(full, boxes, levels, kDepthKD);
+                    } else if (vizKind == 4) {
+                        geometry::UniformGrid g; g.build(P, (md > 1e-6f ? md : 1.0f) / 40.0f);
+                        g.occupiedCellBoxes(boxes); levels.assign(boxes.size(), 0);
+                    } else if (vizKind == 5) {
+                        geometry::LooseOctree lo; lo.build(P, 64);
+                        lo.nodeBoxesDepth(boxes, levels, kDepthTree);
+                    } else if (vizKind == 6) {
+                        geometry::BSP bsp; bsp.build(P, 64);
+                        bsp.nodeBoxesDepth(boxes, levels, kDepthTree);
+                    } else if (vizKind == 7) {
+                        geometry::RTree rt; rt.build(P, 16);
+                        rt.nodeBoxesDepth(boxes, levels, kDepthTree);
+                    } else if (vizKind == 8) {
+                        geometry::BallTree bt; bt.build(P, 32);
+                        bt.nodeSpheresDepth(sphC, sphR, sphL, 7);  // spheres get heavy -> shallow
+                    }
+
+                    if (!boxes.empty() || !sphC.empty()) {
+                        float thick = (md > 1e-6f ? md : 1.0f) * 0.0005f;
+                        float maxDiag = (md > 1e-6f ? md : 1.0f) * 1.5f;  // cull only bigger-than-model cells
+                        const size_t kCap = 60000;                        // box budget
+                        debug::DebugDraw tmp;  // local accumulator (not the frame one)
+                        // Cull oversized boxes, then stride-sample to the budget.
+                        std::vector<size_t> keep;
+                        for (size_t i = 0; i < boxes.size(); ++i)
+                            if ((boxes[i].max - boxes[i].min).norm() <= maxDiag) keep.push_back(i);
+                        size_t stride = keep.size() > kCap ? (keep.size() + kCap - 1) / kCap : 1;
+                        int drawn = 0;
+                        for (size_t j = 0; j < keep.size(); j += stride) {
+                            size_t i = keep[j];
+                            tmp.addWireBox(boxes[i].min, boxes[i].max, levelColor(levels[i]), thick);
+                            ++drawn;
+                        }
+                        std::vector<size_t> ks;
+                        for (size_t i = 0; i < sphR.size(); ++i)
+                            if (sphR[i] <= maxDiag) ks.push_back(i);
+                        size_t ss = ks.size() > kCap ? (ks.size() + kCap - 1) / kCap : 1;
+                        for (size_t j = 0; j < ks.size(); j += ss) {
+                            size_t i = ks[j];
+                            tmp.addSphere(sphC[i], sphR[i], levelColor(sphL[i]), 8);
+                            ++drawn;
+                        }
+                        cache.boxCount = static_cast<int>(boxes.size() + sphC.size());
+                        cache.inliers  = drawn;
+                        cache.total    = static_cast<int>(P.size());
+                        const auto& verts = tmp.vertices();
+                        if (!verts.empty()) {
+                            render::BufferDesc bd;
+                            bd.type = render::BufferType::Vertex;
+                            bd.usage = render::BufferUsage::Static;
+                            bd.data = verts.data();
+                            bd.size = verts.size() * sizeof(render::Vertex);
+                            cache.vbo = renderer.createBuffer(bd);
+                            render::MeshDesc md2;
+                            md2.vertexBuffer = cache.vbo;
+                            md2.layout = render::Vertex::layout();
+                            md2.vertexCount = static_cast<uint32_t>(verts.size());
+                            md2.topology = render::PrimitiveTopology::Triangles;
+                            cache.mesh = renderer.createMesh(md2);
+                            cache.vertexCount = static_cast<uint32_t>(verts.size());
+                        }
+                    }
+                }
+
+                if (cache.mesh != render::kInvalidMesh) {
+                    renderer.setDrawMode(kSolid);
+                    const auto& t = sv.get<Transform>(e);
+                    Eigen::Matrix4f model = Mworld * t.matrix();
+                    render::DrawItem item;
+                    item.mesh = cache.mesh;
+                    std::memcpy(item.model, model.data(), sizeof(item.model));
+                    renderer.submit(item);
+                }
             }
         }
     }

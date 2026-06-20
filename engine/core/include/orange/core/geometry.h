@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 #include <Eigen/Core>
 
@@ -101,5 +103,26 @@ struct AABB {
         return tNear <= tFar && tFar >= 0.0f;
     }
 };
+
+// Per-axis percentile AABB ([pct, 1-pct]) so a few far outliers don't inflate the
+// bounds. Falls back to the exact AABB for small sets. Used to keep spatial-viz
+// cell sizes (and derived line thickness) tied to the model, not to stray points.
+inline AABB robustBounds(const std::vector<Eigen::Vector3f>& pts, float pct = 0.01f) {
+    AABB b;
+    if (pts.empty()) return b;
+    if (pts.size() < 50) {
+        for (const auto& p : pts) b.expand(p);
+        return b;
+    }
+    std::vector<float> v(pts.size());
+    for (int a = 0; a < 3; ++a) {
+        for (size_t i = 0; i < pts.size(); ++i) v[i] = pts[i][a];
+        size_t lo = static_cast<size_t>(v.size() * pct);
+        size_t hi = v.size() - 1 - lo;
+        std::nth_element(v.begin(), v.begin() + lo, v.end()); b.min[a] = v[lo];
+        std::nth_element(v.begin(), v.begin() + hi, v.end()); b.max[a] = v[hi];
+    }
+    return b;
+}
 
 } // namespace orange::geometry

@@ -55,6 +55,19 @@ Turn the suite off with `-DORANGE_BUILD_TESTS=OFF` at configure time.
 | `modes`       | `orange::modes` (`modes.h`)      | `modeCount`/`modeName`, every `runMode` runs, geometry emitted |
 | `io`          | `XYZFormat` (`serialization.h`)  | point-cloud write→read round-trip |
 
+`engine/tests/test_spatial.cpp` (spatial acceleration, vs brute force):
+
+| Group          | Subject                          | Sample assertions |
+|----------------|----------------------------------|-------------------|
+| `bvh`          | `BVH` (`bvh.h`)                  | 200 rays' nearest hit `t` matches the brute triangle scan |
+| `octree`       | `Octree` (`octree.h`)            | radius / AABB query counts, kNN distances vs brute |
+| `kdtree`       | `KDTree` (`kdtree.h`)            | nearest index, kNN distances, radius set vs brute |
+| `uniform_grid` | `UniformGrid` (`uniform_grid.h`) | radius count vs brute, occupied cells |
+| `loose_octree` | `LooseOctree` (`loose_octree.h`) | radius count vs brute |
+| `bsp`          | `BSP` (`bsp.h`)                  | radius count vs brute |
+| `rtree`        | `RTree` (`rtree.h`)             | radius + AABB counts vs brute |
+| `ball_tree`    | `BallTree` (`ball_tree.h`)       | radius count, kNN distances vs brute |
+
 `engine/tests/test_gui.cpp` (GUI behavior, headless):
 
 | Group           | Subject                       | Sample assertions |

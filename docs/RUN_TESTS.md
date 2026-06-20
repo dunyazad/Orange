@@ -34,8 +34,13 @@ Exit code `0` = all passed, `1` = a check failed.
 
 | CTest target       | What it checks |
 |--------------------|----------------|
-| `orange_tests`     | CPU toolkit: geometry, morton, color, sparse grid, modes, IO |
-| `orange_gui_tests` | GUI behavior headless: selection toolbar, picking (single/box/filter/modifier/vertex), visibility |
+| `orange_tests`         | CPU toolkit: geometry, morton, color, sparse grid, modes, IO |
+| `orange_gui_tests`     | GUI behavior headless: selection toolbar, picking (single/box/filter/modifier/vertex), visibility |
+| `orange_spatial_tests` | Spatial structures vs brute force (BVH/Octree/KD/Grid/Loose/BSP/RTree/Ball) + invariants (coverage, outlier robustness, subdivision) |
+| `orange_bench`         | L4 evaluation: build/query timings + speedup vs brute (regression guard) |
+
+Full automation scheme (layers L1–L5, per-feature matrix, golden-image plan):
+[TEST_AUTOMATION.md](TEST_AUTOMATION.md).
 
 GUI **rendering** (pixels), the font-measured menu bar, and the feel of
 lasso/paint/cross-section/camera framing are not auto-run — see the manual

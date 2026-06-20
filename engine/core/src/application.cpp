@@ -415,6 +415,23 @@ void Application::applyMenuAction(int action) {
         case A::Mode1: setMode(1); break;
         case A::Mode2: setMode(2); break;
         case A::Mode3: setMode(3); break;
+
+        case A::SpatialNone:   case A::SpatialBVH:    case A::SpatialOctree:
+        case A::SpatialKDTree: case A::SpatialGrid:   case A::SpatialLoose:
+        case A::SpatialBSP:    case A::SpatialRTree:  case A::SpatialBall: {
+            int k = action == static_cast<int>(A::SpatialBVH)    ? 1
+                  : action == static_cast<int>(A::SpatialOctree) ? 2
+                  : action == static_cast<int>(A::SpatialKDTree) ? 3
+                  : action == static_cast<int>(A::SpatialGrid)   ? 4
+                  : action == static_cast<int>(A::SpatialLoose)  ? 5
+                  : action == static_cast<int>(A::SpatialBSP)    ? 6
+                  : action == static_cast<int>(A::SpatialRTree)  ? 7
+                  : action == static_cast<int>(A::SpatialBall)   ? 8 : 0;
+            auto& ctx = world_.ctx();
+            if (!ctx.contains<ecs::SpatialViz>()) ctx.emplace<ecs::SpatialViz>();
+            ctx.get<ecs::SpatialViz>().kind = k;
+            break;
+        }
         case A::None:  break;
     }
 }
@@ -431,6 +448,8 @@ void Application::syncMenu() {
     bool csOn = false;
     { auto v = world_.view<ecs::CrossSection>();
       for (auto e : v) { csOn = v.get<ecs::CrossSection>(e).enabled; break; } }
+    int viz = 0;
+    if (world_.ctx().contains<ecs::SpatialViz>()) viz = world_.ctx().get<ecs::SpatialViz>().kind;
 
     for (auto& menu : mb->menus)
         for (auto& it : menu.items) {
@@ -443,6 +462,15 @@ void Application::syncMenu() {
                 case A::ColorHeight:        it.checked = colorMode_ == 1; break;
                 case A::ColorPosition:      it.checked = colorMode_ == 2; break;
                 case A::ColorGray:          it.checked = colorMode_ == 3; break;
+                case A::SpatialNone:        it.checked = viz == 0;        break;
+                case A::SpatialBVH:         it.checked = viz == 1;        break;
+                case A::SpatialOctree:      it.checked = viz == 2;        break;
+                case A::SpatialKDTree:      it.checked = viz == 3;        break;
+                case A::SpatialGrid:        it.checked = viz == 4;        break;
+                case A::SpatialLoose:       it.checked = viz == 5;        break;
+                case A::SpatialBSP:         it.checked = viz == 6;        break;
+                case A::SpatialRTree:       it.checked = viz == 7;        break;
+                case A::SpatialBall:        it.checked = viz == 8;        break;
                 default: break;
             }
         }

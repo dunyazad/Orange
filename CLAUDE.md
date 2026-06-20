@@ -27,7 +27,17 @@ CPU, Eigen-backed, CUDA-free utilities that live in `orange_core` (headers under
 `orange/core/`, sources under `engine/core/src/{geometry,io}/`):
 
 - **`orange::geometry`** — `Morton3D` (Z-order keys), `Ray`/`AABB`
-  (`geometry.h`), `SparseGrid` (hash grid; kNN + radius queries),
+  (`geometry.h`), spatial acceleration structures — `BVH` (`bvh.h`, triangle
+  ray pick, median-split AABB tree; the `pickingSystem` lazily builds + caches one
+  per mesh in a `PickBVH` component so repeated picks are O(log n)), `Octree`
+  (`octree.h`, point radius/AABB/kNN + region culling), `KDTree` (`kdtree.h`,
+  point nearest/kNN/radius), `UniformGrid` (`uniform_grid.h`), `LooseOctree`
+  (`loose_octree.h`), `BSP` (`bsp.h`, spatial-median), `RTree` (`rtree.h`, STR
+  bulk-loaded), `BallTree` (`ball_tree.h`, bounding spheres). The **Spatial menu**
+  visualizes the chosen structure on the *selected* mesh/point cloud: renderSystem
+  builds it once into a static, per-level-colored wireframe mesh (cached in
+  `SpatialVizCache`; ctx `SpatialViz` holds the kind) and draws it each frame —
+  box structures as wire boxes, `BallTree` as spheres. — `SparseGrid` (hash grid; kNN + radius queries),
   `SparseDataBlock` (8³-block TSDF fused from an oriented point cloud via
   `fromPointsData`), and `generateMesh()` / `pointsToMesh()` — a dual-contouring
   surface extractor (the **points-in → mesh-out** pipeline). `std::execution::par`
