@@ -18,6 +18,10 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/OrangeApp.cmake")
 add_subdirectory(render_api)   # interface-only C-ABI contract
 add_subdirectory(core)         # platform layer + ECS + plugin loader
 
+if(ORANGE_BUILD_TESTS)
+    add_subdirectory(tests)    # headless orange_core unit tests (CTest)
+endif()
+
 # Render backends, built as hot-swappable plugins that land in the shared output
 # dir next to the app. ORANGE_BUILD_GL/VK are defined at the top level.
 if(ORANGE_BUILD_GL)

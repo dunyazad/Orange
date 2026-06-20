@@ -211,6 +211,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                     if (e.button.button == SDL_BUTTON_LEFT) {
                         input_.buttonLeft = down;
                         if (down) input_.leftClicked = true;
+                        else      input_.leftReleased = true;
                     }
                     if (e.button.button == SDL_BUTTON_RIGHT)  input_.buttonRight  = down;
                     if (e.button.button == SDL_BUTTON_MIDDLE) input_.buttonMiddle = down;
@@ -234,6 +235,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
 
         input_.shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
         input_.ctrl  = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
+        input_.alt   = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
 
         if (onUpdate) onUpdate(world_, dt);
         ecs::menuBarInputSystem(world_, input_, window_.width(), window_.height());
@@ -251,10 +253,16 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
             }
         }
         syncMenu();
+        {  // expose the point size so renderSystem can size selection markers
+            auto& c = world_.ctx();
+            if (!c.contains<ecs::PointSizeState>()) c.emplace<ecs::PointSizeState>();
+            c.get<ecs::PointSizeState>().size = pointSize_;
+        }
         ecs::fpsWidgetInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::cameraControlsInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::crossSectionInputSystem(world_, input_, window_.width(), window_.height());
         ecs::axisGizmoInputSystem(world_, input_, dt, window_.width(), window_.height());
+        ecs::selectionToolbarInputSystem(world_, input_, window_.width(), window_.height());
         ecs::cameraManipulatorSystem(world_, input_, dt);
         ecs::pickingSystem(world_, input_, window_.width(), window_.height());
         ecs::spinSystem(world_, dt);
@@ -372,6 +380,11 @@ void Application::applyMenuAction(int action) {
         case A::ClearSelection: {
             auto v = world_.view<ecs::Renderable>();
             for (auto ent : v) v.get<ecs::Renderable>(ent).selected = false;
+            auto ev = world_.view<ecs::ElementSelection>();
+            for (auto ent : ev) {
+                auto& es = ev.get<ecs::ElementSelection>(ent);
+                es.vertices.clear(); es.faces.clear(); es.edges.clear();
+            }
             break;
         }
         case A::DeleteSelected: {

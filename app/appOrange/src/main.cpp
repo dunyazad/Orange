@@ -600,6 +600,35 @@ int main(int argc, char** argv) {
         world.emplace<ecs::MenuBar>(e, mb);
     }
 
+    // Left selection-mode toolbar. Dynamic vertex buffer rewritten each frame.
+    const int kTbQ = 512, kTbV = kTbQ * 4;  // must match kTbQuads in systems.cpp
+    const std::vector<render::Vertex> tbInit(kTbV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
+    std::vector<uint32_t> tbIdx;
+    for (uint32_t qi = 0; qi < static_cast<uint32_t>(kTbQ); ++qi) {
+        uint32_t b = qi * 4;
+        tbIdx.insert(tbIdx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+    }
+    core::VertexBuffer<render::Vertex> tbVbo(*app.renderer(), tbInit,
+                                             render::BufferUsage::Dynamic);
+    core::IndexBuffer                  tbIbo(*app.renderer(), tbIdx);
+    render::MeshDesc tbMeshDesc;
+    tbMeshDesc.vertexBuffer = tbVbo.handle();
+    tbMeshDesc.indexBuffer  = tbIbo.handle();
+    tbMeshDesc.layout       = render::Vertex::layout();
+    tbMeshDesc.vertexCount  = static_cast<uint32_t>(kTbV);
+    tbMeshDesc.indexCount   = static_cast<uint32_t>(kTbQ * 6);
+    {
+        auto e = world.create();
+        ecs::SelectionToolbar tb;
+        tb.mesh    = app.renderer()->createMesh(tbMeshDesc);
+        tb.vbo     = tbVbo.handle();
+        tb.font    = &uiFont;
+        tb.atlas   = uiFont.texture;
+        tb.buttons = ecs::defaultSelectionToolbar();
+        world.emplace<ecs::SelectionToolbar>(e, tb);
+    }
+    world.ctx().emplace<ecs::SelectionMode>();
+
     // CPU triangle soup of the cube for accurate (per-triangle) picking.
     ecs::PickGeometry cubePick;
     cubePick.positions.reserve(vertices.size());

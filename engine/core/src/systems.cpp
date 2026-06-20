@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <execution>
+#include <unordered_set>
 #include <vector>
 
 #include "orange/core/debug_draw.h"
@@ -899,6 +900,103 @@ void buildMenuGeometry(const MenuBar& mb, render::Vertex* out, uint32_t viewport
 }
 } // namespace
 
+namespace {
+// --- Left selection toolbar geometry ---------------------------------------
+constexpr float kTbX       = 8.0f;                 // left margin (px)
+constexpr float kTbTop     = kMenuBarHeight + 10.0f;
+constexpr float kTbBtn     = 46.0f;                // button size (px, square)
+constexpr float kTbGap     = 4.0f;                 // gap between buttons in a group
+constexpr float kTbGroupGap= 14.0f;               // gap between groups
+constexpr float kTbText    = 22.0f;               // button caption px height
+constexpr int   kTbQuads   = 512;
+constexpr int   kTbVerts   = kTbQuads * 4;
+
+// Top edge (px) of toolbar button `i`, accounting for the extra gap between groups.
+float toolbarButtonTop(const std::vector<ToolbarButton>& b, int i) {
+    float y = kTbTop;
+    for (int k = 0; k < i; ++k)
+        y += kTbBtn + (b[k].group != b[k + 1].group ? kTbGroupGap : kTbGap);
+    return y;
+}
+
+// Is button `b` the active value for its group given the current mode?
+bool toolbarButtonActive(const ToolbarButton& b, const SelectionMode& sm) {
+    switch (b.group) {
+        case 0: return b.value == static_cast<int>(sm.target);
+        case 1: return b.value == static_cast<int>(sm.action);
+        case 2: return b.value == static_cast<int>(sm.filter);
+        case 3: return b.value == static_cast<int>(sm.modifier);
+    }
+    return false;
+}
+
+void buildToolbarGeometry(const SelectionToolbar& tb, const SelectionMode& sm,
+                          render::Vertex* out, uint32_t viewportW, uint32_t viewportH) {
+    int q = 0;
+    if (!tb.font) { for (int i = 0; i < kTbVerts; ++i) out[i] = {{0,0,0},{0,0,0}}; return; }
+    const core::Font& f = *tb.font;
+    const float wu = f.whiteU, wv = f.whiteV;
+    const float W = static_cast<float>(viewportW), Hh = static_cast<float>(viewportH);
+    const float xs = Hh / W;
+    auto nx  = [&](float px) { return px / W; };
+    auto nyT = [&](float py) { return 1.0f - py / Hh; };
+    auto solid = [&](float x0, float yTop, float x1, float yBot, float r, float g,
+                     float b, float z) {
+        if (q >= kTbQuads) return;
+        float ny0 = nyT(yBot), ny1 = nyT(yTop), nx0 = nx(x0), nx1 = nx(x1);
+        out[q*4+0] = {{nx0, ny0, z}, {r, g, b}, {wu, wv}};
+        out[q*4+1] = {{nx1, ny0, z}, {r, g, b}, {wu, wv}};
+        out[q*4+2] = {{nx1, ny1, z}, {r, g, b}, {wu, wv}};
+        out[q*4+3] = {{nx0, ny1, z}, {r, g, b}, {wu, wv}};
+        ++q;
+    };
+    auto text = [&](const char* s, float penPxX, float basePxY, float hPx,
+                    const float col[3], float z) {
+        appendText(out, q, kTbQuads, f, s, nx(penPxX), nyT(basePxY), hPx / Hh, col, z, xs);
+    };
+
+    const float on[3]   = {0.20f, 0.55f, 0.95f};  // active button fill
+    const float hov[3]  = {0.30f, 0.33f, 0.40f};
+    const float off[3]  = {0.17f, 0.18f, 0.22f};
+    const float txt[3]  = {0.92f, 0.94f, 0.97f};
+
+    for (int i = 0; i < static_cast<int>(tb.buttons.size()); ++i) {
+        const ToolbarButton& b = tb.buttons[i];
+        float y0 = toolbarButtonTop(tb.buttons, i), y1 = y0 + kTbBtn;
+        float x0 = kTbX, x1 = kTbX + kTbBtn;
+        const float* fill = toolbarButtonActive(b, sm) ? on : (i == tb.hover ? hov : off);
+        solid(x0, y0, x1, y1, fill[0], fill[1], fill[2], 0.2f);
+        float tw = f.textWidth(b.label.c_str(), kTbText);
+        text(b.label.c_str(), x0 + (kTbBtn - tw) * 0.5f, y0 + (kTbBtn + kTbText) * 0.5f - 2.0f,
+             kTbText, txt, 0.5f);
+    }
+
+    // Box rubber-band / lasso overlay drawn while dragging.
+    const float band[3] = {0.95f, 0.75f, 0.20f};
+    auto seg = [&](float ax, float ay, float bx, float by) {  // thin quad between 2 px points
+        float dx = bx - ax, dy = by - ay;
+        float len = std::sqrt(dx*dx + dy*dy);
+        if (len < 1e-3f) return;
+        float npx = -dy / len * 1.2f, npy = dx / len * 1.2f;  // 1.2px half-thickness
+        if (q >= kTbQuads) return;
+        out[q*4+0] = {{nx(ax+npx), nyT(ay+npy), 0.4f}, {band[0],band[1],band[2]}, {wu,wv}};
+        out[q*4+1] = {{nx(bx+npx), nyT(by+npy), 0.4f}, {band[0],band[1],band[2]}, {wu,wv}};
+        out[q*4+2] = {{nx(bx-npx), nyT(by-npy), 0.4f}, {band[0],band[1],band[2]}, {wu,wv}};
+        out[q*4+3] = {{nx(ax-npx), nyT(ay-npy), 0.4f}, {band[0],band[1],band[2]}, {wu,wv}};
+        ++q;
+    };
+    if (sm.dragging && sm.action == SelAction::Box) {
+        float x0 = sm.dragX0, y0 = sm.dragY0, x1 = sm.dragX1, y1 = sm.dragY1;
+        seg(x0, y0, x1, y0); seg(x1, y0, x1, y1); seg(x1, y1, x0, y1); seg(x0, y1, x0, y0);
+    } else if (sm.dragging && sm.action == SelAction::Lasso) {
+        for (size_t i = 1; i < sm.lassoX.size(); ++i)
+            seg(sm.lassoX[i-1], sm.lassoY[i-1], sm.lassoX[i], sm.lassoY[i]);
+    }
+
+    for (int i = q * 4; i < kTbVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
+}
+} // namespace
+
 void spinSystem(entt::registry& world, float dt) {
     auto view = world.view<Transform, Spin>();
     for (auto entity : view) {
@@ -1110,6 +1208,59 @@ std::vector<Menu> defaultAppMenus() {
     return menus;
 }
 
+std::vector<ToolbarButton> defaultSelectionToolbar() {
+    return {
+        {"Obj", 0, static_cast<int>(SelTarget::Object)},
+        {"Vtx", 0, static_cast<int>(SelTarget::Vertex)},
+        {"Edg", 0, static_cast<int>(SelTarget::Edge)},
+        {"Fac", 0, static_cast<int>(SelTarget::Face)},
+        {"Sgl", 1, static_cast<int>(SelAction::Single)},
+        {"Box", 1, static_cast<int>(SelAction::Box)},
+        {"Las", 1, static_cast<int>(SelAction::Lasso)},
+        {"Pnt", 1, static_cast<int>(SelAction::Paint)},
+        {"All", 2, static_cast<int>(SelFilter::All)},
+        {"Msh", 2, static_cast<int>(SelFilter::Mesh)},
+        {"Pts", 2, static_cast<int>(SelFilter::Point)},
+        {"Set", 3, static_cast<int>(SelModifier::Replace)},
+        {"+",   3, static_cast<int>(SelModifier::Add)},
+        {"-",   3, static_cast<int>(SelModifier::Subtract)},
+    };
+}
+
+void selectionToolbarInputSystem(entt::registry& world, core::Input& input,
+                                 uint32_t viewportW, uint32_t viewportH) {
+    (void)viewportW; (void)viewportH;
+    SelectionToolbar* tb = nullptr;
+    auto view = world.view<SelectionToolbar>();
+    for (auto e : view) { tb = &view.get<SelectionToolbar>(e); break; }
+    if (!tb || !tb->visible) return;
+
+    auto& ctx = world.ctx();
+    if (!ctx.contains<SelectionMode>()) ctx.emplace<SelectionMode>();
+    auto& sm = ctx.get<SelectionMode>();
+
+    float mx = input.mousePosX, my = input.mousePosY;
+    tb->hover = -1;
+    for (int i = 0; i < static_cast<int>(tb->buttons.size()); ++i) {
+        float y0 = toolbarButtonTop(tb->buttons, i), y1 = y0 + kTbBtn;
+        float x0 = kTbX, x1 = kTbX + kTbBtn;
+        if (mx >= x0 && mx < x1 && my >= y0 && my < y1) {
+            tb->hover = i;
+            input.captured = true;  // bar owns its pixels
+            if (input.leftClicked) {
+                const ToolbarButton& b = tb->buttons[i];
+                switch (b.group) {
+                    case 0: sm.target   = static_cast<SelTarget>(b.value);   break;
+                    case 1: sm.action   = static_cast<SelAction>(b.value);   break;
+                    case 2: sm.filter   = static_cast<SelFilter>(b.value);   break;
+                    case 3: sm.modifier = static_cast<SelModifier>(b.value); break;
+                }
+            }
+            break;
+        }
+    }
+}
+
 bool entityVisibleOnScreen(entt::registry& world, entt::entity e, uint32_t viewportW,
                            uint32_t viewportH) {
     if (!world.all_of<Transform, Renderable>(e) || viewportW == 0 || viewportH == 0)
@@ -1160,12 +1311,21 @@ bool entityVisibleOnScreen(entt::registry& world, entt::entity e, uint32_t viewp
     return false;
 }
 
+// Point-in-polygon test (even-odd rule) for the lasso, in pixel space.
+static bool pointInPolygon(const std::vector<float>& xs, const std::vector<float>& ys,
+                           float px, float py) {
+    bool in = false;
+    size_t n = xs.size();
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+        if (((ys[i] > py) != (ys[j] > py)) &&
+            (px < (xs[j] - xs[i]) * (py - ys[i]) / (ys[j] - ys[i] + 1e-9f) + xs[i]))
+            in = !in;
+    }
+    return in;
+}
+
 void pickingSystem(entt::registry& world, const core::Input& input,
                    uint32_t viewportW, uint32_t viewportH) {
-    // Only act on a fresh left-click that no UI widget already consumed.
-    if (!input.leftClicked || input.captured) return;
-
-    // Build a world-space pick ray from the primary camera + cursor position.
     const Transform* camT = nullptr;
     const Camera*    cam  = nullptr;
     auto cams = world.view<Transform, Camera>();
@@ -1180,8 +1340,9 @@ void pickingSystem(entt::registry& world, const core::Input& input,
 
     float W = static_cast<float>(viewportW), H = static_cast<float>(viewportH);
     if (W <= 0.0f || H <= 0.0f) return;
-    float ndcX = 2.0f * input.mousePosX / W - 1.0f;
-    float ndcY = 1.0f - 2.0f * input.mousePosY / H;  // screen y-down -> ndc y-up
+    float mx = input.mousePosX, my = input.mousePosY;
+    float ndcX = 2.0f * mx / W - 1.0f;
+    float ndcY = 1.0f - 2.0f * my / H;
     float aspect = W / H;
 
     Eigen::Vector3f right   = math::rotate(camT->orientation, Eigen::Vector3f(1, 0, 0));
@@ -1199,33 +1360,248 @@ void pickingSystem(entt::registry& world, const core::Input& input,
         rayD = math::normalize(forward + right * (ndcX * aspect * tanHalf) +
                                up * (ndcY * tanHalf));
     }
-
-    // Keep the world-space ray (camera position + normalized direction) so hits
-    // on different entities are compared by true distance, not per-entity local
-    // units. Content is rendered as Mworld * T*R*S, so undo the world up-axis
-    // basis on the ray before the per-entity inverse(T*R*S) below.
     Eigen::Vector3f rayOW = rayO, rayDW = rayD;
     Eigen::Quaternionf mwInv = math::conjugate(worldUpQuat(worldZUp(world)));
     rayO = math::rotate(mwInv, rayO);
     rayD = math::rotate(mwInv, rayD);
     const Eigen::Matrix4f Mworld = worldUpMatrix(worldZUp(world));
 
-    // Test every drawable; keep the nearest hit along the ray.
+    // Projection used for screen-space region tests (Box/Lasso/Paint).
+    Eigen::Matrix4f proj = cam->mode == ProjectionMode::Orthographic
+        ? math::ortho(-aspect * cam->orthoSize, aspect * cam->orthoSize, -cam->orthoSize,
+                      cam->orthoSize, cam->zNear, cam->zFar)
+        : math::perspective(cam->fovYDegrees * 3.14159265f / 180.0f, aspect, cam->zNear, cam->zFar);
+    Eigen::Matrix4f viewM = math::lookAt(camT->position, camT->position + forward, up);
+    Eigen::Matrix4f viewProj = proj * viewM * Mworld;
+
+    auto& ctx = world.ctx();
+    if (!ctx.contains<SelectionMode>()) ctx.emplace<SelectionMode>();
+    auto& sm = ctx.get<SelectionMode>();
+
+    auto drawables = world.view<Transform, Renderable>();
+    auto eligible = [&](const Renderable& r) {
+        if (!r.visible || r.mesh == render::kInvalidMesh || r.drawMode == core::DrawMode::None)
+            return false;
+        if (sm.filter == SelFilter::Mesh && r.pointCloud)  return false;
+        if (sm.filter == SelFilter::Point && !r.pointCloud) return false;
+        return true;
+    };
+    // Project a local point (of entity with model `m`) to window pixels.
+    auto project = [&](const Eigen::Matrix4f& m, const Eigen::Vector3f& p, float& sx,
+                       float& sy) -> bool {
+        Eigen::Vector4f c = viewProj * m * Eigen::Vector4f(p.x(), p.y(), p.z(), 1.0f);
+        if (c.w() <= 1e-6f) return false;
+        sx = (c.x() / c.w() * 0.5f + 0.5f) * W;
+        sy = (1.0f - (c.y() / c.w() * 0.5f + 0.5f)) * H;
+        return true;
+    };
+    auto clearAll = [&]() {
+        for (auto e : drawables) drawables.get<Renderable>(e).selected = false;
+        auto esv = world.view<ElementSelection>();
+        for (auto e : esv) {
+            auto& es = esv.get<ElementSelection>(e);
+            es.vertices.clear(); es.faces.clear(); es.edges.clear();
+        }
+    };
+    auto toggleV = [&](ElementSelection& es, uint32_t v, bool sub) {
+        auto it = std::find(es.vertices.begin(), es.vertices.end(), v);
+        if (sub) { if (it != es.vertices.end()) es.vertices.erase(it); }
+        else if (it == es.vertices.end()) es.vertices.push_back(v);
+    };
+    auto toggleF = [&](ElementSelection& es, uint32_t fidx, bool sub) {
+        auto it = std::find(es.faces.begin(), es.faces.end(), fidx);
+        if (sub) { if (it != es.faces.end()) es.faces.erase(it); }
+        else if (it == es.faces.end()) es.faces.push_back(fidx);
+    };
+    auto toggleE = [&](ElementSelection& es, uint32_t a, uint32_t b, bool sub) {
+        uint32_t lo = std::min(a, b), hi = std::max(a, b);
+        auto same = [&](const ElementSelection::Edge& e) {
+            return std::min(e.a, e.b) == lo && std::max(e.a, e.b) == hi;
+        };
+        auto it = std::find_if(es.edges.begin(), es.edges.end(), same);
+        if (sub) { if (it != es.edges.end()) es.edges.erase(it); }
+        else if (it == es.edges.end()) es.edges.push_back({a, b});
+    };
+
+    // Keyboard modifiers override the toolbar modifier for this action: Shift adds,
+    // Alt subtracts, and (in a region action, where Ctrl isn't the camera recenter)
+    // Ctrl subtracts. No modifier key => the toolbar's Set/Add/Subtract.
+    SelModifier effMod = sm.modifier;
+    if (input.shift)      effMod = SelModifier::Add;
+    else if (input.alt)   effMod = SelModifier::Subtract;
+    else if (input.ctrl && sm.action != SelAction::Single) effMod = SelModifier::Subtract;
+
+    // ---- Region actions: Box / Lasso / Paint (span multiple frames) ----------
+    if (sm.action != SelAction::Single) {
+        // Apply the current region to the scene (used live for Paint, on release for
+        // Box/Lasso). `inRegion` decides membership in window pixels.
+        // Merge `add` into `dst` (uint32 index sets) honoring the modifier without an
+        // O(n^2) per-item search: after a Replace, clearAll() left dst empty so the
+        // non-subtract path is a plain append.
+        auto mergeIdx = [](std::vector<uint32_t>& dst, const std::vector<uint32_t>& add,
+                           bool sub) {
+            if (add.empty()) return;
+            if (sub) {
+                std::unordered_set<uint32_t> rm(add.begin(), add.end());
+                dst.erase(std::remove_if(dst.begin(), dst.end(),
+                                         [&](uint32_t v) { return rm.count(v) > 0; }),
+                          dst.end());
+            } else if (dst.empty()) {
+                dst = add;
+            } else {
+                std::unordered_set<uint32_t> have(dst.begin(), dst.end());
+                for (uint32_t v : add) if (have.insert(v).second) dst.push_back(v);
+            }
+        };
+        auto edgeKey = [](uint32_t a, uint32_t b) {
+            uint64_t lo = std::min(a, b), hi = std::max(a, b);
+            return (lo << 32) | hi;
+        };
+        auto mergeEdges = [&](std::vector<ElementSelection::Edge>& dst,
+                              const std::vector<ElementSelection::Edge>& add, bool sub) {
+            if (add.empty()) return;
+            if (sub) {
+                std::unordered_set<uint64_t> rm;
+                for (auto& e : add) rm.insert(edgeKey(e.a, e.b));
+                dst.erase(std::remove_if(dst.begin(), dst.end(),
+                              [&](const ElementSelection::Edge& e) { return rm.count(edgeKey(e.a, e.b)) > 0; }),
+                          dst.end());
+            } else {
+                std::unordered_set<uint64_t> have;
+                for (auto& e : dst) have.insert(edgeKey(e.a, e.b));
+                for (auto& e : add) if (have.insert(edgeKey(e.a, e.b)).second) dst.push_back(e);
+            }
+        };
+
+        auto applyRegion = [&](int kind /*0 box,1 lasso,2 paint*/) {
+            const float paintR = 16.0f;
+            float bx0 = std::min(sm.dragX0, sm.dragX1), bx1 = std::max(sm.dragX0, sm.dragX1);
+            float by0 = std::min(sm.dragY0, sm.dragY1), by1 = std::max(sm.dragY0, sm.dragY1);
+            auto inRegion = [&](float sx, float sy) -> bool {
+                if (kind == 0) return sx >= bx0 && sx <= bx1 && sy >= by0 && sy <= by1;
+                if (kind == 1) return pointInPolygon(sm.lassoX, sm.lassoY, sx, sy);
+                float dx = sx - mx, dy = sy - my; return dx * dx + dy * dy <= paintR * paintR;
+            };
+            if (effMod == SelModifier::Replace) clearAll();
+            bool sub = effMod == SelModifier::Subtract;
+
+            for (auto e : drawables) {
+                const auto& t = drawables.get<Transform>(e);
+                auto& r = drawables.get<Renderable>(e);
+                if (!eligible(r)) continue;
+                Eigen::Matrix4f m = t.matrix();
+                if (sm.target == SelTarget::Object) {
+                    Eigen::Vector3f ctr = (r.boundsMin + r.boundsMax) * 0.5f;
+                    float sx, sy;
+                    if (project(m, ctr, sx, sy) && inRegion(sx, sy))
+                        r.selected = !sub;
+                    continue;
+                }
+                const PickGeometry* pg = world.try_get<PickGeometry>(e);
+                if (!pg) continue;
+                auto& es = world.get_or_emplace<ElementSelection>(e);
+
+                // Combined clip matrix (proj*view*Mworld*model) as scalars: avoids an
+                // Eigen Vector4 temporary per point in the hot loops below.
+                Eigen::Matrix4f MM = viewProj * m;
+                const float* A = MM.data();
+                auto projPx = [&](float x, float y, float z, float& sx, float& sy) -> bool {
+                    float cx = A[0]*x + A[4]*y + A[8]*z + A[12];
+                    float cy = A[1]*x + A[5]*y + A[9]*z + A[13];
+                    float cw = A[3]*x + A[7]*y + A[11]*z + A[15];
+                    if (cw <= 1e-6f) return false;
+                    sx = (cx / cw * 0.5f + 0.5f) * W;
+                    sy = (1.0f - (cy / cw * 0.5f + 0.5f)) * H;
+                    return true;
+                };
+
+                if (sm.target == SelTarget::Vertex) {
+                    // Project + region-test every point in parallel chunks (point
+                    // clouds can hold millions), then bulk-merge the matches.
+                    const auto& P = pg->positions;
+                    const size_t n = P.size();
+                    const size_t kChunk = 16384;
+                    const size_t chunks = (n + kChunk - 1) / kChunk;
+                    std::vector<std::vector<uint32_t>> partial(chunks);
+                    std::vector<size_t> ids(chunks);
+                    for (size_t c = 0; c < chunks; ++c) ids[c] = c;
+                    std::for_each(std::execution::par, ids.begin(), ids.end(), [&](size_t c) {
+                        size_t b = c * kChunk, en = std::min(b + kChunk, n);
+                        auto& outv = partial[c];
+                        for (size_t i = b; i < en; ++i) {
+                            float sx, sy;
+                            if (projPx(P[i].x(), P[i].y(), P[i].z(), sx, sy) && inRegion(sx, sy))
+                                outv.push_back(static_cast<uint32_t>(i));
+                        }
+                    });
+                    std::vector<uint32_t> matched;
+                    for (auto& p : partial) matched.insert(matched.end(), p.begin(), p.end());
+                    mergeIdx(es.vertices, matched, sub);
+                } else if (sm.target == SelTarget::Face) {
+                    std::vector<uint32_t> matched;
+                    for (size_t i = 0; i + 2 < pg->indices.size(); i += 3) {
+                        const auto& a = pg->positions[pg->indices[i]];
+                        const auto& b = pg->positions[pg->indices[i + 1]];
+                        const auto& c = pg->positions[pg->indices[i + 2]];
+                        Eigen::Vector3f ctr = (a + b + c) / 3.0f;
+                        float sx, sy;
+                        if (projPx(ctr.x(), ctr.y(), ctr.z(), sx, sy) && inRegion(sx, sy))
+                            matched.push_back(static_cast<uint32_t>(i / 3));
+                    }
+                    mergeIdx(es.faces, matched, sub);
+                } else {  // Edge
+                    std::vector<ElementSelection::Edge> matched;
+                    for (size_t i = 0; i + 2 < pg->indices.size(); i += 3) {
+                        uint32_t idx[3] = {pg->indices[i], pg->indices[i + 1], pg->indices[i + 2]};
+                        for (int k = 0; k < 3; ++k) {
+                            Eigen::Vector3f mid =
+                                (pg->positions[idx[k]] + pg->positions[idx[(k + 1) % 3]]) * 0.5f;
+                            float sx, sy;
+                            if (projPx(mid.x(), mid.y(), mid.z(), sx, sy) && inRegion(sx, sy))
+                                matched.push_back({idx[k], idx[(k + 1) % 3]});
+                        }
+                    }
+                    mergeEdges(es.edges, matched, sub);
+                }
+            }
+        };
+
+        if (input.leftClicked && !input.captured) {
+            sm.dragging = true;
+            sm.dragX0 = sm.dragX1 = mx; sm.dragY0 = sm.dragY1 = my;
+            sm.lassoX.assign(1, mx); sm.lassoY.assign(1, my);
+            if (sm.action == SelAction::Paint) applyRegion(2);
+        } else if (sm.dragging && input.buttonLeft) {
+            sm.dragX1 = mx; sm.dragY1 = my;
+            if (sm.action == SelAction::Lasso) {
+                float lx = sm.lassoX.back(), ly = sm.lassoY.back();
+                if ((mx - lx) * (mx - lx) + (my - ly) * (my - ly) > 9.0f) {
+                    sm.lassoX.push_back(mx); sm.lassoY.push_back(my);
+                }
+            }
+            if (sm.action == SelAction::Paint) applyRegion(2);
+        }
+        if (sm.dragging && input.leftReleased) {
+            if (sm.action == SelAction::Box)   applyRegion(0);
+            else if (sm.action == SelAction::Lasso) applyRegion(1);
+            sm.dragging = false;
+            sm.lassoX.clear(); sm.lassoY.clear();
+        }
+        return;
+    }
+
+    // ---- Single click / Ctrl-recenter ---------------------------------------
+    if (!input.leftClicked || input.captured) return;
+
+    // Nearest eligible drawable along the ray (front-most under the cursor).
     entt::entity best = entt::null;
     float bestT = 1e30f;
-    auto drawables = world.view<Transform, Renderable>();
     for (auto e : drawables) {
         const auto& t = drawables.get<Transform>(e);
         const auto& r = drawables.get<Renderable>(e);
-        // Skip what isn't drawn -- you can't pick an invisible (None-mode) mesh.
-        if (!r.visible || r.mesh == render::kInvalidMesh ||
-            r.drawMode == core::DrawMode::None)
-            continue;
+        if (!eligible(r)) continue;
 
-        // Transform the ray into the entity's local space: inverse(T*R*S) =
-        // S^-1 * R^-1 * T^-1. Scale is applied component-wise.
-        Eigen::Vector3f lo = math::rotate(math::conjugate(t.orientation),
-                                     rayO - t.position);
+        Eigen::Vector3f lo = math::rotate(math::conjugate(t.orientation), rayO - t.position);
         Eigen::Vector3f ld = math::rotate(math::conjugate(t.orientation), rayD);
         Eigen::Vector3f inv(t.scale.x() != 0 ? 1.0f / t.scale.x() : 0.0f,
                        t.scale.y() != 0 ? 1.0f / t.scale.y() : 0.0f,
@@ -1233,39 +1609,26 @@ void pickingSystem(entt::registry& world, const core::Input& input,
         lo = lo.cwiseProduct(inv);
         ld = ld.cwiseProduct(inv);
 
-        // Point cloud: pick by screen-space proximity to an actual point sprite, so
-        // clicking visibly empty space (even inside the AABB) selects nothing. A
-        // point is hit when it projects within ~a sprite radius of the cursor; the
-        // allowed world perpendicular scales with depth, so the test is a constant
-        // number of pixels regardless of zoom. Resolved entirely here.
         if (const PickGeometry* pg = world.try_get<PickGeometry>(e); pg && r.pointCloud) {
-            // Broad-phase: if the local ray misses the (slightly inflated) AABB,
-            // no sprite can be near it -- skip the whole cloud. The margin covers
-            // border points whose sprite still overlaps a just-outside click.
             Eigen::Vector3f margin =
                 (r.boundsMax - r.boundsMin).cwiseMax(Eigen::Vector3f(1, 1, 1)) * 0.05f;
             float tAabb;
             if (!intersectAABB(lo, ld, r.boundsMin - margin, r.boundsMax + margin, tAabb))
                 continue;
-
             const Eigen::Matrix4f toWorld = Mworld * t.matrix();
-            const float* M = toWorld.data();  // column-major; assume affine (row w = 0,0,0,1)
+            const float* M = toWorld.data();
             const float ox = rayOW.x(), oy = rayOW.y(), oz = rayOW.z();
             const float dx = rayDW.x(), dy = rayDW.y(), dz = rayDW.z();
-            const float pixelRadius = 6.0f;  // about the rendered point-sprite size
+            const float pixelRadius = 6.0f;
             const bool  ortho = (cam->mode == ProjectionMode::Orthographic);
             const float kAng  = ortho ? 0.0f
                 : 2.0f * std::tan(cam->fovYDegrees * 3.14159265f / 180.0f * 0.5f) / H * pixelRadius;
             const float orthoThr = ortho ? (2.0f * cam->orthoSize / H * pixelRadius) : 0.0f;
-
-            // Nearest sprite along the ray. The point cloud can hold millions of
-            // points, so split it into chunks reduced in parallel; each chunk uses
-            // plain scalar math (no Eigen temporaries) to stay fast in Debug too.
             const auto& P = pg->positions;
             const size_t n = P.size();
             const size_t kChunk = 16384;
             const size_t chunks = (n + kChunk - 1) / kChunk;
-            const float upper = bestT;  // running cross-entity nearest (read-only here)
+            const float upper = bestT;
             std::vector<float> chunkMin(chunks, upper);
             std::vector<size_t> chunkIds(chunks);
             for (size_t c = 0; c < chunks; ++c) chunkIds[c] = c;
@@ -1275,13 +1638,13 @@ void pickingSystem(entt::registry& world, const core::Input& input,
                 float localMin = upper;
                 for (size_t i = begin; i < end; ++i) {
                     const float x = P[i].x(), y = P[i].y(), z = P[i].z();
-                    const float wx = M[0] * x + M[4] * y + M[8] * z + M[12];
-                    const float wy = M[1] * x + M[5] * y + M[9] * z + M[13];
-                    const float wz = M[2] * x + M[6] * y + M[10] * z + M[14];
+                    const float wx = M[0]*x + M[4]*y + M[8]*z + M[12];
+                    const float wy = M[1]*x + M[5]*y + M[9]*z + M[13];
+                    const float wz = M[2]*x + M[6]*y + M[10]*z + M[14];
                     const float rx = wx - ox, ry = wy - oy, rz = wz - oz;
-                    const float tw = rx * dx + ry * dy + rz * dz;
+                    const float tw = rx*dx + ry*dy + rz*dz;
                     if (tw <= 0.0f || tw >= localMin) continue;
-                    const float perp2 = (rx * rx + ry * ry + rz * rz) - tw * tw;
+                    const float perp2 = (rx*rx + ry*ry + rz*rz) - tw*tw;
                     const float thr = ortho ? orthoThr : kAng * tw;
                     if (perp2 < thr * thr) localMin = tw;
                 }
@@ -1293,7 +1656,6 @@ void pickingSystem(entt::registry& world, const core::Input& input,
             continue;
         }
 
-        // Accurate triangle pick when CPU geometry is available, else the AABB.
         float tLocal = 0.0f;
         bool hit = false;
         if (const PickGeometry* pg = world.try_get<PickGeometry>(e)) {
@@ -1305,8 +1667,7 @@ void pickingSystem(entt::registry& world, const core::Input& input,
                 const Eigen::Vector3f& c = pg->positions[pg->indices[i + 2]];
                 float tt;
                 if (ray.intersectTriangle(a, b, c, tt) && tt >= 0.0f && tt < bestLocal) {
-                    bestLocal = tt;
-                    hit = true;
+                    bestLocal = tt; hit = true;
                 }
             }
             tLocal = bestLocal;
@@ -1314,40 +1675,91 @@ void pickingSystem(entt::registry& world, const core::Input& input,
             hit = intersectAABB(lo, ld, r.boundsMin, r.boundsMax, tLocal);
         }
         if (!hit) continue;
-
-        // Project the local hit back to world space and compare true distance.
         Eigen::Vector3f localHit = lo + ld * tLocal;
         Eigen::Vector4f wh =
             Mworld * t.matrix() * Eigen::Vector4f(localHit.x(), localHit.y(), localHit.z(), 1.0f);
         float tWorld = (Eigen::Vector3f(wh.x(), wh.y(), wh.z()) - rayOW).dot(rayDW);
-        if (tWorld > 0.0f && tWorld < bestT) {
-            bestT = tWorld;
-            best  = e;
-        }
+        if (tWorld > 0.0f && tWorld < bestT) { bestT = tWorld; best = e; }
     }
 
     if (input.ctrl) {
-        // Ctrl+left-click recenters the camera: glide the orbit pivot (and with it
-        // the camera position) to the picked point. Selection is left untouched; an
-        // empty Ctrl-click (no hit) does nothing.
+        // Ctrl+left-click recenters the camera on the picked point (selection kept).
         if (best != entt::null) {
-            const Eigen::Vector3f hit = rayOW + rayDW * bestT;  // render-world pick point
+            const Eigen::Vector3f hit = rayOW + rayDW * bestT;
             auto manips = world.view<Camera, CameraManipulator>();
             for (auto e : manips) {
                 if (!manips.get<Camera>(e).primary) continue;
                 auto& m = manips.get<CameraManipulator>(e);
-                m.targetFrom      = m.target;
-                m.targetTo        = hit;
-                m.distFrom = m.distTo = m.distance;  // recenter keeps the zoom level
-                m.targetAnimTime  = 0.0f;
-                m.targetAnimating = true;
+                m.targetFrom = m.target; m.targetTo = hit;
+                m.distFrom = m.distTo = m.distance;
+                m.targetAnimTime = 0.0f; m.targetAnimating = true;
                 break;
             }
         }
+        return;
+    }
+
+    bool sub = effMod == SelModifier::Subtract;
+    if (effMod == SelModifier::Replace) clearAll();
+
+    if (sm.target == SelTarget::Object) {
+        if (best != entt::null) drawables.get<Renderable>(best).selected = !sub;
+        return;
+    }
+    // Element single-pick on the front-most entity under the cursor.
+    if (best == entt::null) return;
+    const PickGeometry* pg = world.try_get<PickGeometry>(best);
+    if (!pg || pg->positions.empty()) return;
+    const auto& t = drawables.get<Transform>(best);
+    auto& es = world.get_or_emplace<ElementSelection>(best);
+    Eigen::Matrix4f m = t.matrix();
+
+    if (sm.target == SelTarget::Vertex) {
+        uint32_t bestV = 0; float bestD = 1e30f; bool found = false;
+        for (uint32_t vi = 0; vi < pg->positions.size(); ++vi) {
+            float sx, sy;
+            if (!project(m, pg->positions[vi], sx, sy)) continue;
+            float d = (sx - mx) * (sx - mx) + (sy - my) * (sy - my);
+            if (d < bestD) { bestD = d; bestV = vi; found = true; }
+        }
+        if (found && bestD <= 14.0f * 14.0f) toggleV(es, bestV, sub);
     } else {
-        // Plain click single-selects: clear all, mark the hit (empty click clears).
-        for (auto e : drawables) drawables.get<Renderable>(e).selected = false;
-        if (best != entt::null) drawables.get<Renderable>(best).selected = true;
+        // Face/Edge: ray-hit the triangle (local space), then pick that face or its
+        // nearest edge to the cursor.
+        Eigen::Vector3f lo = math::rotate(math::conjugate(t.orientation), rayO - t.position);
+        Eigen::Vector3f ld = math::rotate(math::conjugate(t.orientation), rayD);
+        Eigen::Vector3f inv(t.scale.x() != 0 ? 1.0f / t.scale.x() : 0.0f,
+                       t.scale.y() != 0 ? 1.0f / t.scale.y() : 0.0f,
+                       t.scale.z() != 0 ? 1.0f / t.scale.z() : 0.0f);
+        lo = lo.cwiseProduct(inv); ld = ld.cwiseProduct(inv);
+        geometry::Ray ray(lo, ld);
+        const size_t kNoFace = static_cast<size_t>(-1);
+        size_t hitFace = kNoFace; float bestLocal = 1e30f;
+        for (size_t i = 0; i + 2 < pg->indices.size(); i += 3) {
+            const auto& a = pg->positions[pg->indices[i]];
+            const auto& b = pg->positions[pg->indices[i + 1]];
+            const auto& c = pg->positions[pg->indices[i + 2]];
+            float tt;
+            if (ray.intersectTriangle(a, b, c, tt) && tt >= 0.0f && tt < bestLocal) {
+                bestLocal = tt; hitFace = i;
+            }
+        }
+        if (hitFace == kNoFace) return;
+        if (sm.target == SelTarget::Face) {
+            toggleF(es, static_cast<uint32_t>(hitFace / 3), sub);
+        } else {  // Edge: nearest of the hit triangle's 3 edges to the cursor
+            uint32_t idx[3] = {pg->indices[hitFace], pg->indices[hitFace + 1],
+                               pg->indices[hitFace + 2]};
+            int bestE = 0; float bestD = 1e30f;
+            for (int k = 0; k < 3; ++k) {
+                Eigen::Vector3f mid = (pg->positions[idx[k]] + pg->positions[idx[(k+1)%3]]) * 0.5f;
+                float sx, sy;
+                if (!project(m, mid, sx, sy)) continue;
+                float d = (sx - mx) * (sx - mx) + (sy - my) * (sy - my);
+                if (d < bestD) { bestD = d; bestE = k; }
+            }
+            toggleE(es, idx[bestE], idx[(bestE + 1) % 3], sub);
+        }
     }
 }
 
@@ -1789,6 +2201,64 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     }
     renderer.setDrawMode(kSolid);  // scene only: rest stays solid
 
+    // --- Element selection highlights (vertex/edge/face) ---------------
+    // Emitted into the debug-draw accumulator in content space (T*R*S); the
+    // drawDebugGeometry call below applies Mworld, like the point-cloud box.
+    {
+        auto esv = world.view<Transform, ElementSelection, PickGeometry>();
+        auto& dd = debug::DebugDraw::instance();
+        const Eigen::Vector3f hl(0.15f, 1.0f, 0.25f);  // bright lime, pops on pink/white
+
+        // Vertex markers are camera-facing quads sized a few times the point-sprite
+        // pixel size, so a selected point reads clearly over the dot it covers.
+        // Debug geometry is emitted in content space (Mworld applied later), so the
+        // camera right/up axes are pulled back through Mworld^-1.
+        float px = 6.0f;
+        if (world.ctx().contains<PointSizeState>()) px = world.ctx().get<PointSizeState>().size;
+        px *= 2.5f;  // markers a bit larger than the points so they stand out
+        const bool  ortho = primaryCam && primaryCam->mode == ProjectionMode::Orthographic;
+        const float fovY  = primaryCam ? primaryCam->fovYDegrees : 60.0f;
+        const float Hpx   = static_cast<float>(viewportH > 0 ? viewportH : 1);
+        const float kPersp = 2.0f * std::tan(fovY * 3.14159265f / 180.0f * 0.5f) / Hpx * px;
+        const float kOrtho = primaryCam ? 2.0f * primaryCam->orthoSize / Hpx * px : 0.01f;
+        const Eigen::Quaternionf wq    = worldUpQuat(worldZUp(world));
+        const Eigen::Quaternionf wqInv = math::conjugate(wq);
+        const Eigen::Vector3f cr = math::rotate(wqInv, math::rotate(camOrient, Eigen::Vector3f(1, 0, 0)));
+        const Eigen::Vector3f cu = math::rotate(wqInv, math::rotate(camOrient, Eigen::Vector3f(0, 1, 0)));
+
+        for (auto e : esv) {
+            const auto& t  = esv.get<Transform>(e);
+            const auto& es = esv.get<ElementSelection>(e);
+            const auto& pg = esv.get<PickGeometry>(e);
+            Eigen::Matrix4f m = t.matrix();
+            auto wp = [&](const Eigen::Vector3f& p) {
+                Eigen::Vector4f w = m * Eigen::Vector4f(p.x(), p.y(), p.z(), 1.0f);
+                return Eigen::Vector3f(w.x(), w.y(), w.z());
+            };
+            auto marker = [&](const Eigen::Vector3f& cp) {
+                // Half-size in content units that projects to ~px/2 pixels.
+                Eigen::Vector3f wpos = math::rotate(wq, cp);  // Mworld is pure rotation
+                float dist = (wpos - camPos).norm();
+                float half = 0.5f * (ortho ? kOrtho : kPersp * dist);
+                dd.addQuad(cp - (cr + cu) * half, cp + (cr - cu) * half,
+                           cp + (cr + cu) * half, cp + (cu - cr) * half, hl);
+            };
+            for (uint32_t vi : es.vertices)
+                if (vi < pg.positions.size()) marker(wp(pg.positions[vi]));
+            for (const auto& ed : es.edges)
+                if (ed.a < pg.positions.size() && ed.b < pg.positions.size())
+                    dd.addLine(wp(pg.positions[ed.a]), wp(pg.positions[ed.b]), hl,
+                               (ortho ? kOrtho : kPersp * camDist) * 0.3f);
+            for (uint32_t fi : es.faces) {
+                size_t i = static_cast<size_t>(fi) * 3;
+                if (i + 2 < pg.indices.size())
+                    dd.addTriangle(wp(pg.positions[pg.indices[i]]),
+                                   wp(pg.positions[pg.indices[i + 1]]),
+                                   wp(pg.positions[pg.indices[i + 2]]), hl);
+            }
+        }
+    }
+
     // --- Immediate-mode debug geometry (world space, behind the grid) --
     drawDebugGeometry(world, renderer, Mworld);
 
@@ -2008,6 +2478,40 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::DrawItem item;
         item.mesh    = cs.mesh;
         item.texture = cs.atlas;
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
+        std::memcpy(item.model, model.data(), sizeof(item.model));
+        renderer.submit(item);
+        break;
+    }
+
+    // --- Left selection toolbar overlay -------------------------------
+    auto tbs = world.view<SelectionToolbar>();
+    for (auto entity : tbs) {
+        auto& tb = tbs.get<SelectionToolbar>(entity);
+        if (!tb.visible || !tb.font || tb.mesh == render::kInvalidMesh ||
+            tb.vbo == render::kInvalidBuffer)
+            break;
+        SelectionMode sm;
+        if (world.ctx().contains<SelectionMode>()) sm = world.ctx().get<SelectionMode>();
+
+        render::Vertex verts[kTbVerts];
+        buildToolbarGeometry(tb, sm, verts, viewportW, viewportH);
+        renderer.updateBuffer(tb.vbo, verts, sizeof(verts));
+
+        render::OverlayContext ov;
+        ov.x = 0; ov.y = 0;
+        ov.width = static_cast<int>(viewportW);
+        ov.height = static_cast<int>(viewportH);
+        ov.clearDepth = true;
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+        std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+        renderer.beginOverlay(ov);
+
+        render::DrawItem item;
+        item.mesh    = tb.mesh;
+        item.texture = tb.atlas;
         Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);

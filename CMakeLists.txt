@@ -26,6 +26,11 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 # Build options ---------------------------------------------------------------
 option(ORANGE_BUILD_GL "Build the OpenGL render plugin" ON)
 option(ORANGE_BUILD_VK "Build the Vulkan render plugin (auto if SDK found)" ON)
+option(ORANGE_BUILD_TESTS "Build the headless orange_core unit tests" ON)
+
+if(ORANGE_BUILD_TESTS)
+    enable_testing()  # so `ctest --test-dir build` finds the tests below
+endif()
 
 # ---------------------------------------------------------------------------
 # Dependencies (SDL3, EnTT) via FetchContent

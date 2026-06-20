@@ -54,6 +54,15 @@ void menuBarInputSystem(entt::registry& world, core::Input& input,
 // the dispatch in Application::applyMenuAction.
 std::vector<Menu> defaultAppMenus();
 
+// Left selection toolbar: hit-tests the mode buttons and writes the chosen value
+// into the ctx SelectionMode. Sets input.captured over the bar. Runs before
+// picking so a button click never falls through to the scene.
+void selectionToolbarInputSystem(entt::registry& world, core::Input& input,
+                                 uint32_t viewportW, uint32_t viewportH);
+
+// The default toolbar button set (target / action / filter / modifier groups).
+std::vector<ToolbarButton> defaultSelectionToolbar();
+
 // Picking: on a fresh left-click (not consumed by a UI widget), casts a ray
 // from the primary camera through the cursor, finds the nearest (Transform,
 // Renderable) hit via ray-vs-local-AABB, and marks it Renderable::selected

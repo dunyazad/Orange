@@ -245,11 +245,70 @@ struct CrossSection {
     render::BufferHandle   vbo  = render::kInvalidBuffer;
 };
 
+// --- Selection modes (driven by the left selection toolbar) ----------------
+// What a click selects, how the region is gathered, which entity types are
+// eligible, and how the result combines with the existing selection.
+enum class SelTarget   { Object = 0, Vertex, Edge, Face };  // selection granularity
+enum class SelAction   { Single = 0, Box, Lasso, Paint };   // how the region is drawn
+enum class SelFilter   { All = 0, Mesh, Point };            // eligible entity types
+enum class SelModifier { Replace = 0, Add, Subtract };      // combine with current
+
+// Live selection state, stored in the registry ctx (read by pickingSystem and the
+// toolbar). Holds the four mode enums plus the transient drag geometry for the
+// Box/Lasso/Paint actions (window-space pixels).
+struct SelectionMode {
+    SelTarget   target   = SelTarget::Object;
+    SelAction   action   = SelAction::Single;
+    SelFilter   filter   = SelFilter::All;
+    SelModifier modifier = SelModifier::Replace;
+
+    bool  dragging = false;                  // a Box/Lasso/Paint drag is in progress
+    float dragX0 = 0, dragY0 = 0;            // box rubber-band start (px)
+    float dragX1 = 0, dragY1 = 0;            // box rubber-band current (px)
+    std::vector<float> lassoX, lassoY;       // freehand lasso polygon (px)
+};
+
+// Per-entity selected sub-elements (when SelTarget is Vertex/Edge/Face). Indices
+// refer to the entity's PickGeometry. Empty unless element selection is used.
+struct ElementSelection {
+    struct Edge { uint32_t a = 0, b = 0; };
+    std::vector<uint32_t> vertices;  // selected vertex indices
+    std::vector<uint32_t> faces;     // selected triangle indices (PickGeometry tri i/3)
+    std::vector<Edge>     edges;     // selected edges (vertex-index pairs)
+};
+
+// Left vertical selection toolbar. One labelled button per mode value, grouped
+// (target / action / filter / modifier). selectionToolbarInputSystem hit-tests
+// the buttons and writes the chosen value into the ctx SelectionMode; renderSystem
+// draws it as an overlay. Normally a single one in the world.
+struct ToolbarButton {
+    std::string label;   // short caption (e.g. "Obj", "Box", "+")
+    int group = 0;       // 0 target, 1 action, 2 filter, 3 modifier
+    int value = 0;       // enum value within the group
+};
+struct SelectionToolbar {
+    bool visible = true;
+    std::vector<ToolbarButton> buttons;
+    int  hover = -1;     // hovered button index (-1 none)
+
+    render::MeshHandle   mesh = render::kInvalidMesh;
+    render::BufferHandle vbo  = render::kInvalidBuffer;
+    const core::Font*     font  = nullptr;
+    render::TextureHandle atlas = render::kInvalidTexture;
+};
+
 // View toggles stored in the registry context (registry::ctx), not on an entity.
 // `grid` is flipped by the Space key and read by renderSystem to show/hide the
 // infinite ground grid. Absent context => defaults (grid on).
 struct GridState {
     bool visible = true;
+};
+
+// Current point-sprite size in pixels (mirrors Application::pointSize_, set each
+// frame). renderSystem reads it so vertex-selection markers match the on-screen
+// size of the point sprites. Absent => default.
+struct PointSizeState {
+    float size = 6.0f;
 };
 
 // Height (px) of the top menu bar. The axis gizmo and camera-controls panel are
