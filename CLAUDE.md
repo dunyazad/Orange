@@ -101,7 +101,31 @@ cmake --build D:/Library/Orange/build --config Debug
 
 ## Key facts to keep in mind
 
-- **Plugin ABI is v17.** v17 added `IRenderer::setColorMode(uint32_t)` (Shift+`` ` ``
+- **Plugin ABI is v18.** v18 changed `IRenderer::drawGrid` to
+  `drawGrid(int upAxis, float cellSize, const float cameraPos[3], float viewRadius)`:
+  the grid now scales to the loaded model instead of a fixed ~3-unit assumption.
+  `cellSize` is the world size of one minor cell (major lines every 10); the host
+  derives it from the scene's world AABB (largest x/z extent → ~10 cells across,
+  snapped to a power of ten). `cameraPos` + `viewRadius` move the distance fade from
+  a fixed disc around the origin to a disc around the **camera** (radius ≈ orbit
+  distance × 4), so the grid keeps filling the view at any zoom instead of cutting
+  off when zoomed out. GL drives `uGridScale`/`uCamPos`/`uViewRadius` uniforms (needed
+  a `glUniform3fv` entry in the hand-rolled `gl_loader`), VK fragment push constants
+  at offsets 132 (cellSize) / 144 (camPos vec3) / 156 (viewRadius); the grid push
+  range grew to 160 bytes. The host side lives in `systems.cpp` renderSystem, which
+  computes the scene world AABB once and reuses it for the grid cell size AND the
+  cross-section slider range. **Model framing (appOrange):** meshes load at their
+  **original coordinates** (the old recenter-on-origin + fit-to-3-units step is gone);
+  `finalizeMesh` instead frames the camera on the new mesh (target → bounds center,
+  distance → fit the bounding sphere to the FOV, home pose updated so R reframes) and
+  widens min/maxDistance. The camera's `zNear`/`zFar` are recomputed **every frame**
+  from the orbit distance (`zNear = max(0.001, dist*0.005)`, `zFar = dist*50`) so
+  nothing z-clips at any zoom. Wheel zoom is multiplicative
+  (`distance *= pow(0.9, wheel*zoomSpeed)`) so it feels the same at any model scale;
+  pan was already `panSpeed*distance`. The processing modes were already
+  diag-relative. The cross-section slider range (`CrossSection::minPos/maxPos`) is
+  set each frame from the scene AABB on the active axis (was hardcoded ±3).
+- v17 added `IRenderer::setColorMode(uint32_t)` (Shift+`` ` ``
   cycles it): scene meshes/point clouds recolor in the fragment shader from the
   world position — 0 = original (vertex color), 1 = height (world Y → jet heatmap),
   2 = position (world XYZ → RGB), 3 = grayscale (luminance). **appOrange starts in

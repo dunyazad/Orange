@@ -53,9 +53,15 @@ public:
     // (fwidth-based) with distance fade and correct depth, so the scene occludes
     // it. Uses the current frame's view/proj/invViewProj. `upAxis` (1 = Y up,
     // 2 = Z up) only recolors the in-plane depth axis line (blue Z vs green Y) to
-    // match the gizmo's up-axis toggle; the grid plane itself is unchanged. Call
-    // between the scene submits and endFrame().
-    virtual void drawGrid(int upAxis) = 0;
+    // match the gizmo's up-axis toggle; the grid plane itself is unchanged.
+    // `cellSize` is the world size of one minor grid cell (major lines every 10);
+    // the host derives it from the loaded model's size so the grid scales with it.
+    // `cameraPos` is the camera's world position and `viewRadius` how far it can see
+    // across the ground; the grid fades around the camera over that radius so it
+    // always fills the view at any zoom (not a fixed disc around the origin).
+    // Call between the scene submits and endFrame().
+    virtual void drawGrid(int upAxis, float cellSize, const float cameraPos[3],
+                          float viewRadius) = 0;
 
     // Events ---------------------------------------------------------------
     virtual void resize(uint32_t width, uint32_t height) = 0;

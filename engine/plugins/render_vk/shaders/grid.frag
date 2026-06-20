@@ -4,6 +4,9 @@ layout(push_constant) uniform Push {
     mat4 viewProj;
     mat4 invViewProj;
     int  upAxis;        // 1 = Y up, 2 = Z up (recolors the in-plane depth axis)
+    float gridScale;    // world size of one minor cell (scales grid to model)
+    vec3  camPos;       // camera world position (grid fades around it)  @offset 144
+    float viewRadius;   // how far the camera sees across the ground     @offset 156
 } pc;
 
 layout(location = 0) in vec3 vNear;
@@ -25,11 +28,13 @@ void main() {
     if (clip.w <= 0.0) discard;
     gl_FragDepth = clip.z / clip.w;        // Vulkan NDC depth already [0,1]
 
-    float fade = 1.0 - smoothstep(22.0, 75.0, length(world.xz));
+    float s = max(pc.gridScale, 1e-6);
+    float r = max(pc.viewRadius, s * 1.0);
+    float fade = 1.0 - smoothstep(r * 0.6, r, length(world.xz - pc.camPos.xz));
     if (fade <= 0.0) discard;
 
-    float minor = gridFactor(world.xz);
-    float major = gridFactor(world.xz * 0.1);
+    float minor = gridFactor(world.xz / s);
+    float major = gridFactor(world.xz / (s * 10.0));
     vec3  col = mix(vec3(0.33, 0.35, 0.40), vec3(0.60, 0.63, 0.70), major);
     float a   = max(minor * 0.55, major);
 

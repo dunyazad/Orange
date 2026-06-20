@@ -43,7 +43,8 @@ public:
     void submit(const render::DrawItem& item) override;
     void beginOverlay(const render::OverlayContext& overlay) override;
     void endFrame() override;
-    void drawGrid(int upAxis) override;
+    void drawGrid(int upAxis, float cellSize, const float cameraPos[3],
+                  float viewRadius) override;
 
     void resize(uint32_t width, uint32_t height) override;
     void setVsync(bool enabled) override;
@@ -84,6 +85,9 @@ private:
     int          uGridViewProj_    = -1;
     int          uGridInvViewProj_ = -1;
     int          uGridUpAxis_      = -1;
+    int          uGridScale_       = -1;
+    int          uGridCamPos_      = -1;
+    int          uGridViewRadius_  = -1;
     float        invViewProj_[16];  // inverse(viewProj_), refreshed each beginFrame
 
     unsigned int whiteTex_ = 0;  // 1x1 white fallback

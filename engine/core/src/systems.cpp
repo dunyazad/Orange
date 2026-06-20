@@ -858,10 +858,13 @@ void cameraManipulatorSystem(entt::registry& world, const core::Input& input,
             m.orientation = math::normalize(m.orientation * dYaw * dPitch);
         }
 
-        // Zoom: scroll wheel changes distance.
+        // Zoom: scroll wheel scales distance multiplicatively, so each notch moves
+        // a constant fraction -- same feel whether the model is millimetres or
+        // kilometres across (a fixed step would crawl on big models, teleport on
+        // small ones).
         if (input.wheel != 0.0f) {
             m.targetAnimating = false;  // a manual zoom overrides a reset/recenter glide
-            m.distance -= input.wheel * m.zoomSpeed;
+            m.distance *= std::pow(0.9f, input.wheel * m.zoomSpeed);
             m.distance  = clampf(m.distance, m.minDistance, m.maxDistance);
         }
 
@@ -1445,13 +1448,23 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     Eigen::Matrix4f proj = Eigen::Matrix4f::Identity();
     Eigen::Quaternionf camOrient = Eigen::Quaternionf::Identity();  // captured for the gizmo overlay
     const Camera* primaryCam = nullptr;  // captured for the controls panel
+    Eigen::Vector3f camPos = Eigen::Vector3f::Zero();  // camera eye (grid fade center)
+    float camDist = 1.0f;                              // orbit distance (grid view radius)
 
     auto cams = world.view<Transform, Camera>();
     for (auto entity : cams) {
-        const auto& cam = cams.get<Camera>(entity);
+        auto& cam = cams.get<Camera>(entity);
         if (!cam.primary) continue;
         const auto& ct = cams.get<Transform>(entity);
         primaryCam = &cam;
+        camPos = ct.position;
+        if (const auto* mm = world.try_get<CameraManipulator>(entity)) camDist = mm->distance;
+
+        // Clip planes track the orbit distance so geometry and the (camera-faded)
+        // grid never z-clip at any zoom -- a fixed far plane would cut the grid when
+        // zoomed out, a fixed near plane would cut the model when zoomed in.
+        cam.zNear = (std::max)(0.001f, camDist * 0.005f);
+        cam.zFar  = camDist * 50.0f;
 
         float aspect = viewportH > 0
                            ? static_cast<float>(viewportW) / static_cast<float>(viewportH)
@@ -1482,6 +1495,29 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     // frame (not the camera) changes when the gizmo toggles Y/Z up.
     const Eigen::Matrix4f Mworld = worldUpMatrix(worldZUp(world));
 
+    // Scene world-space AABB over every visible drawable (corners pushed through
+    // Mworld * model). Drives the grid cell size and the cross-section slider range
+    // so both scale with whatever model is loaded, not a fixed ~3-unit assumption.
+    Eigen::Vector3f sceneMin = Eigen::Vector3f::Zero(), sceneMax = Eigen::Vector3f::Zero();
+    bool sceneValid = false;
+    {
+        auto bv = world.view<Transform, Renderable>();
+        for (auto e : bv) {
+            const auto& t = bv.get<Transform>(e);
+            const auto& r = bv.get<Renderable>(e);
+            if (!r.visible || r.mesh == render::kInvalidMesh) continue;
+            Eigen::Matrix4f m = Mworld * t.matrix();
+            for (int c = 0; c < 8; ++c) {
+                Eigen::Vector4f corner((c & 1) ? r.boundsMax.x() : r.boundsMin.x(),
+                                       (c & 2) ? r.boundsMax.y() : r.boundsMin.y(),
+                                       (c & 4) ? r.boundsMax.z() : r.boundsMin.z(), 1.0f);
+                Eigen::Vector3f w = (m * corner).head<3>();
+                if (!sceneValid) { sceneMin = sceneMax = w; sceneValid = true; }
+                else { sceneMin = sceneMin.cwiseMin(w); sceneMax = sceneMax.cwiseMax(w); }
+            }
+        }
+    }
+
     // Cross-section: turn (enabled, axis, flip, pos) into a render-world clip plane
     // and hand it to the backend before the scene submits. Keep the half-space with
     // coordinate <= pos (or >= pos when flipped); the opposite side is discarded.
@@ -1490,9 +1526,17 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         float plane[4]  = {0, 0, 0, 0};
         auto  csv = world.view<CrossSection>();
         for (auto e : csv) {
-            const auto& cs = csv.get<CrossSection>(e);
+            auto& cs = csv.get<CrossSection>(e);
+            int   a  = cs.axis < 0 ? 0 : (cs.axis > 2 ? 2 : cs.axis);
+            // Fit the slider range to the model's extent on the chosen axis.
+            if (sceneValid) {
+                float lo  = sceneMin[a], hi = sceneMax[a];
+                float pad = (hi - lo) * 0.02f + 1e-4f;
+                cs.minPos = lo - pad;
+                cs.maxPos = hi + pad;
+                cs.pos    = clampf(cs.pos, cs.minPos, cs.maxPos);
+            }
             if (cs.enabled) {
-                int   a = cs.axis < 0 ? 0 : (cs.axis > 2 ? 2 : cs.axis);
                 float s = cs.flip ? -1.0f : 1.0f;
                 plane[0] = plane[1] = plane[2] = 0.0f;
                 plane[a] = s;                          // normal along the chosen axis
@@ -1581,7 +1625,23 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     // toggle (GridState in ctx) has hidden it.
     {
         const auto* gs = world.ctx().find<GridState>();
-        if (!gs || gs->visible) renderer.drawGrid(worldZUp(world) ? 2 : 1);
+        if (!gs || gs->visible) {
+            // Cell size scales with the scene: take the largest horizontal (x/z)
+            // extent of the world AABB, aim for ~10 minor cells across it, then snap
+            // to a power of ten so lines land on round coordinates. 1.0 if empty.
+            float cell = 1.0f;
+            if (sceneValid) {
+                Eigen::Vector3f s = sceneMax - sceneMin;
+                float ext = (std::max)(s.x(), s.z());
+                if (ext > 1e-6f)
+                    cell = std::pow(10.0f, std::round(std::log10(ext / 10.0f)));
+            }
+            // Fade radius tracks the camera: ~ orbit distance, so the grid keeps
+            // filling the view as you zoom out (with a floor so it never vanishes).
+            float viewRadius = (std::max)(camDist * 4.0f, cell * 20.0f);
+            float cp[3] = {camPos.x(), camPos.y(), camPos.z()};
+            renderer.drawGrid(worldZUp(world) ? 2 : 1, cell, cp, viewRadius);
+        }
     }
 
     // --- Axis gizmo overlay (top-right corner) -------------------------

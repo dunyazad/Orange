@@ -632,8 +632,8 @@ int main(int argc, char** argv) {
         {"All files", "*"},
     };
 
-    // Takes the CPU mesh produced by the background loader, centers +
-    // uniform-scales it to fit, uploads GPU buffers, and spawns a
+    // Takes the CPU mesh produced by the background loader, uploads GPU buffers
+    // at its original coordinates, and spawns a
     // (Transform, Renderable) entity that renderSystem picks up. Runs on the main
     // (render) thread because GPU resource creation is context-affine.
     auto finalizeMesh = [&](const std::string& path, std::vector<render::Vertex>& mv,
@@ -649,16 +649,6 @@ int main(int argc, char** argv) {
             mn = mn.cwiseMin(p);
             mx = mx.cwiseMax(p);
         }
-        Eigen::Vector3f center = (mn + mx) * 0.5f;
-        Eigen::Vector3f size   = mx - mn;
-        float      ext    = (std::max)({size.x(), size.y(), size.z()});
-        float      sf     = ext > 1e-6f ? 3.0f / ext : 1.0f;  // fit to ~3 world units
-        for (auto& v : mv) {                                  // recenter on origin
-            v.position[0] -= center.x();
-            v.position[1] -= center.y();
-            v.position[2] -= center.z();
-        }
-
         const bool isPoints = mi.empty();  // faceless PLY -> point cloud
 
         loadedVbos.push_back(
@@ -678,12 +668,12 @@ int main(int argc, char** argv) {
 
         auto e = world.create();
         ecs::Transform t;
-        t.scale = Eigen::Vector3f(sf, sf, sf);
+        t.scale = Eigen::Vector3f(1.0f, 1.0f, 1.0f);  // draw at original coordinates
         world.emplace<ecs::Transform>(e, t);
         ecs::Renderable r;
         r.mesh      = mesh;
-        r.boundsMin = mn - center;  // local-space bounds (pre-scale) for picking
-        r.boundsMax = mx - center;
+        r.boundsMin = mn;  // local-space bounds for picking (original coords)
+        r.boundsMax = mx;
         if (isPoints) r.pointCloud = true;  // drawn as point sprites; box-wireframe selection
         world.emplace<ecs::Renderable>(e, r);
 
@@ -696,6 +686,34 @@ int main(int argc, char** argv) {
             pick.positions.emplace_back(v.position[0], v.position[1], v.position[2]);
         if (!isPoints) pick.indices = mi;
         world.emplace<ecs::PickGeometry>(e, std::move(pick));
+
+        // Frame the camera on the just-loaded mesh: orbit pivot -> bounds center,
+        // distance -> fit the bounding sphere to the vertical FOV (+ margin). Also
+        // updates the home pose so R resets to this framing, and widens the zoom
+        // range so big/far models don't clip.
+        {
+            auto camv = world.view<ecs::Camera, ecs::CameraManipulator>();
+            for (auto ce : camv) {
+                auto& cam = camv.get<ecs::Camera>(ce);
+                if (!cam.primary) continue;
+                auto& m      = camv.get<ecs::CameraManipulator>(ce);
+                Eigen::Vector3f c = (mn + mx) * 0.5f;
+                float radius = (mx - mn).norm() * 0.5f;
+                float fovY   = cam.fovYDegrees * 3.14159265f / 180.0f;
+                float dist   = radius / std::sin(fovY * 0.5f) * 1.3f;  // margin
+                dist         = (std::max)(dist, 0.01f);
+                m.minDistance = (std::min)(m.minDistance, dist * 0.05f);
+                m.maxDistance = (std::max)(m.maxDistance, dist * 4.0f);
+                // Clip planes scaled to the fit so big/far models don't z-clip.
+                cam.zNear = (std::max)(0.001f, dist * 0.01f);
+                cam.zFar  = (m.maxDistance + radius) * 1.5f;
+                m.target = c; m.distance = dist;
+                m.targetAnimating = false; m.animating = false;
+                m.homeTarget = c; m.homeDistance = dist;
+                m.homeOrientation = m.orientation;
+                break;
+            }
+        }
 
         if (isPoints)
             SDL_Log("Mesh: loaded '%s' (%zu points)", path.c_str(), mv.size());

@@ -781,11 +781,12 @@ bool VkRenderer::createGridPipeline() {
     dyn.dynamicStateCount = 2;
     dyn.pDynamicStates = dynStates;
 
-    // Push constant: viewProj (0) + invViewProj (64) + upAxis (128), both stages.
+    // Push constant: viewProj (0) + invViewProj (64) + upAxis (128) + gridScale
+    // (132) + camPos (144, vec3) + viewRadius (156), both stages.
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pcr.offset = 0;
-    pcr.size = 132;
+    pcr.size = 160;
 
     VkPipelineLayoutCreateInfo plci{};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -821,7 +822,8 @@ bool VkRenderer::createGridPipeline() {
     return true;
 }
 
-void VkRenderer::drawGrid(int upAxis) {
+void VkRenderer::drawGrid(int upAxis, float cellSize, const float cameraPos[3],
+                          float viewRadius) {
     if (!frameActive_ || gridPipeline_ == VK_NULL_HANDLE) return;
     VkCommandBuffer cmd = commandBuffers_[currentFrame_];
     mat4Inverse(viewProj_, invViewProj_);  // viewProj_ holds the scene's clip*proj*view
@@ -831,6 +833,9 @@ void VkRenderer::drawGrid(int upAxis) {
     vkCmdPushConstants(cmd, gridLayout_, st, 0, 64, viewProj_);
     vkCmdPushConstants(cmd, gridLayout_, st, 64, 64, invViewProj_);
     vkCmdPushConstants(cmd, gridLayout_, st, 128, 4, &upAxis);
+    vkCmdPushConstants(cmd, gridLayout_, st, 132, 4, &cellSize);
+    vkCmdPushConstants(cmd, gridLayout_, st, 144, 12, cameraPos);
+    vkCmdPushConstants(cmd, gridLayout_, st, 156, 4, &viewRadius);
     vkCmdDraw(cmd, 3, 1, 0, 0);
 
     // Restore the mesh pipeline so the gizmo/UI overlays (which assume it) work.

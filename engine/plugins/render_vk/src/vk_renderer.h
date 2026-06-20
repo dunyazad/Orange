@@ -60,7 +60,8 @@ public:
     void submit(const render::DrawItem& item) override;
     void beginOverlay(const render::OverlayContext& overlay) override;
     void endFrame() override;
-    void drawGrid(int upAxis) override;
+    void drawGrid(int upAxis, float cellSize, const float cameraPos[3],
+                  float viewRadius) override;
 
     void resize(uint32_t width, uint32_t height) override;
     void setVsync(bool enabled) override;

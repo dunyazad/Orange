@@ -110,6 +110,9 @@ in vec3 vNear;
 in vec3 vFar;
 uniform mat4 uViewProj;
 uniform int  uUpAxis;   // 1 = Y up, 2 = Z up (recolors the in-plane "depth" axis)
+uniform float uGridScale;  // world size of one minor cell (scales grid to model)
+uniform vec3  uCamPos;     // camera world position (grid fades around it)
+uniform float uViewRadius; // how far the camera sees across the ground
 out vec4 FragColor;
 
 float gridFactor(vec2 coord) {
@@ -127,11 +130,13 @@ void main() {
     if (clip.w <= 0.0) discard;
     gl_FragDepth = (clip.z / clip.w) * 0.5 + 0.5;   // GL NDC [-1,1] -> [0,1]
 
-    float fade = 1.0 - smoothstep(22.0, 75.0, length(world.xz));
+    float s = max(uGridScale, 1e-6);
+    float r = max(uViewRadius, s * 1.0);
+    float fade = 1.0 - smoothstep(r * 0.6, r, length(world.xz - uCamPos.xz));
     if (fade <= 0.0) discard;
 
-    float minor = gridFactor(world.xz);
-    float major = gridFactor(world.xz * 0.1);
+    float minor = gridFactor(world.xz / s);
+    float major = gridFactor(world.xz / (s * 10.0));
     vec3  col = mix(vec3(0.33, 0.35, 0.40), vec3(0.60, 0.63, 0.70), major);
     float a   = max(minor * 0.55, major);
 
@@ -313,6 +318,9 @@ bool GLRenderer::buildGridProgram() {
     uGridViewProj_    = glGetUniformLocation(gridProgram_, "uViewProj");
     uGridInvViewProj_ = glGetUniformLocation(gridProgram_, "uInvViewProj");
     uGridUpAxis_      = glGetUniformLocation(gridProgram_, "uUpAxis");
+    uGridScale_       = glGetUniformLocation(gridProgram_, "uGridScale");
+    uGridCamPos_      = glGetUniformLocation(gridProgram_, "uCamPos");
+    uGridViewRadius_  = glGetUniformLocation(gridProgram_, "uViewRadius");
     glGenVertexArrays(1, &gridVao_);  // empty VAO for the vertex-less pass
     return true;
 }
@@ -484,11 +492,15 @@ void GLRenderer::beginFrame(const render::FrameContext& frame) {
     glUniform1i(uLighting_, lighting_ ? 1 : 0);              // scene lighting
 }
 
-void GLRenderer::drawGrid(int upAxis) {
+void GLRenderer::drawGrid(int upAxis, float cellSize, const float cameraPos[3],
+                          float viewRadius) {
     glUseProgram(gridProgram_);
     glUniformMatrix4fv(uGridViewProj_, 1, GL_FALSE, viewProj_);
     glUniformMatrix4fv(uGridInvViewProj_, 1, GL_FALSE, invViewProj_);
     glUniform1i(uGridUpAxis_, upAxis);
+    glUniform1f(uGridScale_, cellSize);
+    glUniform3fv(uGridCamPos_, 1, cameraPos);
+    glUniform1f(uGridViewRadius_, viewRadius);
     glBindVertexArray(gridVao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);  // full-screen triangle, vertex-less
     glBindVertexArray(0);
