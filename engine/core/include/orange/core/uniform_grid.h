@@ -29,6 +29,11 @@ public:
             cells_[key(cellOf(points[i]))].push_back(i);
     }
 
+    // `points` is REFERENCED, not copied -- keep it alive while querying. If you
+    // built against a temporary (e.g. on a worker thread), rebind() to a stable
+    // array of identical contents before querying. O(1).
+    void rebind(const std::vector<Eigen::Vector3f>& points) { pts_ = &points; }
+
     bool empty() const { return cells_.empty(); }
 
     // Indices within `radius` of `center` (scans the overlapped cell range).

@@ -57,6 +57,16 @@ public:
 
     bool empty() const { return nodes_.empty(); }
 
+    // Re-point the referenced (not owned) source arrays without rebuilding the
+    // tree. Use after building against a temporary copy (e.g. on a worker thread)
+    // to rebind to stable arrays of IDENTICAL contents -- the node boxes and
+    // triangle order stay valid, only the pointers move. Cheap (O(1)).
+    void rebind(const std::vector<Eigen::Vector3f>& positions,
+                const std::vector<uint32_t>& indices) {
+        pos_ = &positions;
+        idx_ = &indices;
+    }
+
     // AABB of every node (for visualization).
     void nodeBoxes(std::vector<AABB>& out) const {
         out.clear(); out.reserve(nodes_.size());

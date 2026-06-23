@@ -32,6 +32,11 @@ public:
         root_ = level.empty() ? -1 : level[0];
     }
 
+    // `points` is REFERENCED, not copied -- keep it alive while querying. If you
+    // built against a temporary (e.g. on a worker thread), rebind() to a stable
+    // array of identical contents before querying. O(1).
+    void rebind(const std::vector<Eigen::Vector3f>& points) { pts_ = &points; }
+
     bool empty() const { return root_ < 0; }
 
     void radiusQuery(const Eigen::Vector3f& center, float radius, std::vector<int>& out) const {

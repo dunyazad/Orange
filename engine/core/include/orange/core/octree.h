@@ -37,6 +37,11 @@ public:
         buildNode(0, root, all, 0);
     }
 
+    // `points` is REFERENCED, not copied -- keep it alive while querying. If you
+    // built against a temporary (e.g. on a worker thread), rebind() to a stable
+    // array of identical contents before querying. O(1).
+    void rebind(const std::vector<Eigen::Vector3f>& points) { pts_ = &points; }
+
     bool empty() const { return nodes_.empty(); }
 
     // AABB of every node (for visualization).

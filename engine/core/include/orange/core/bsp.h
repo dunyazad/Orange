@@ -33,6 +33,11 @@ public:
         buildNode(0, 0, static_cast<int>(points.size()), root, 0);
     }
 
+    // `points` is REFERENCED, not copied -- keep it alive while querying. If you
+    // built against a temporary (e.g. on a worker thread), rebind() to a stable
+    // array of identical contents before querying. O(1).
+    void rebind(const std::vector<Eigen::Vector3f>& points) { pts_ = &points; }
+
     bool empty() const { return nodes_.empty(); }
 
     void radiusQuery(const Eigen::Vector3f& center, float radius, std::vector<int>& out) const {

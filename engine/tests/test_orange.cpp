@@ -19,7 +19,15 @@
 #include <Eigen/Geometry>
 #include <entt/entt.hpp>
 
+#include "orange/core/ball_tree.h"
+#include "orange/core/bsp.h"
+#include "orange/core/bvh.h"
 #include "orange/core/color.h"
+#include "orange/core/kdtree.h"
+#include "orange/core/loose_octree.h"
+#include "orange/core/octree.h"
+#include "orange/core/rtree.h"
+#include "orange/core/uniform_grid.h"
 #include "orange/core/debug_draw.h"
 #include "orange/core/geometry.h"
 #include "orange/core/modes.h"
@@ -293,9 +301,64 @@ static void test_ui_layout() {
     std::remove(path.c_str());
 }
 
+// --- BVH rebind (background-build safety) -----------------------------------
+// A BVH references (does not own) its source arrays. The async pick-BVH build
+// builds against a worker-thread copy, then rebinds to the entity's stable arrays.
+// This reproduces that: build against temporaries, rebind, let the temporaries
+// die, then query -- it must still return the correct hit (no dangling read).
+static void test_bvh_rebind() {
+    std::printf("[bvh_rebind]\n");
+    std::vector<Eigen::Vector3f> pos = {{0, 0, 0}, {1, 0, 0}, {1, 1, 0}, {0, 1, 0}};
+    std::vector<uint32_t>        idx = {0, 1, 2, 0, 2, 3};
+    orange::geometry::BVH bvh;
+    {
+        std::vector<Eigen::Vector3f> tmpPos = pos;  // worker-local copies
+        std::vector<uint32_t>        tmpIdx = idx;
+        bvh.build(tmpPos, tmpIdx);
+        bvh.rebind(pos, idx);  // re-point at the stable arrays
+    }                          // tmpPos/tmpIdx destroyed here
+    float t = 0.0f; int tri = -1;
+    bool hit = bvh.nearestHit(
+        orange::geometry::Ray(Eigen::Vector3f(0.6f, 0.4f, 1.0f), Eigen::Vector3f(0, 0, -1)),
+        t, tri);
+    CHECK(hit);
+    CHECK(std::fabs(t - 1.0f) < 1e-3f);
+
+    // The point-based structures share the same "references input" pattern and now
+    // expose rebind() too. Build each against a temporary copy, rebind to the
+    // stable array, let the copy die, then query -- must not read freed memory.
+    std::vector<Eigen::Vector3f> cloud;
+    for (int x = 0; x < 6; ++x)
+        for (int y = 0; y < 6; ++y) cloud.emplace_back((float)x, (float)y, 0.0f);
+    Eigen::Vector3f q(2.0f, 2.0f, 0.0f);
+    int brute = 0;
+    for (const auto& p : cloud) if ((p - q).squaredNorm() <= 1.5f * 1.5f) ++brute;
+
+    auto rebindRadius = [&](auto& s, const char* /*name*/) {
+        { auto tmp = cloud; s.build(tmp, 8); s.rebind(cloud); }  // tmp dies here
+        std::vector<int> out;
+        s.radiusQuery(q, 1.5f, out);
+        CHECK((int)out.size() == brute);
+    };
+    orange::geometry::Octree      oc;  rebindRadius(oc, "octree");
+    orange::geometry::LooseOctree lo;  rebindRadius(lo, "loose");
+    orange::geometry::BSP         bsp; rebindRadius(bsp, "bsp");
+    orange::geometry::RTree       rt;  rebindRadius(rt, "rtree");
+    orange::geometry::BallTree    bt;  rebindRadius(bt, "ball");
+
+    orange::geometry::UniformGrid g;
+    { auto tmp = cloud; g.build(tmp, 1.0f); g.rebind(cloud); }
+    { std::vector<int> out; g.radiusQuery(q, 1.5f, out); CHECK((int)out.size() == brute); }
+
+    orange::geometry::KDTree kd;
+    { auto tmp = cloud; kd.build(tmp); kd.rebind(cloud); }
+    { float dd = 0; int n = kd.nearest(q, &dd); CHECK(n >= 0 && (cloud[n] - q).norm() < 1e-4f); }
+}
+
 int main() {
     std::printf("Orange unit tests\n");
     test_geometry();
+    test_bvh_rebind();
     test_morton();
     test_color();
     test_sparse_grid();

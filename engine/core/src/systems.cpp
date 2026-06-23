@@ -1627,7 +1627,11 @@ static bool ensurePickBVH(entt::registry& world, entt::entity e, const PickGeome
     if (accel.built) return true;
     if (accel.job) {
         if (!accel.job->done.load(std::memory_order_acquire)) return false;  // still building
-        accel.bvh   = std::move(accel.job->bvh);
+        accel.bvh = std::move(accel.job->bvh);
+        // The worker built against a copy of the points; re-point the BVH at the
+        // entity's stable PickGeometry arrays (same contents) so its referenced
+        // spans don't dangle once the worker's copy is freed.
+        accel.bvh.rebind(pg.positions, pg.indices);
         accel.built = true;
         accel.job.reset();
         return true;
