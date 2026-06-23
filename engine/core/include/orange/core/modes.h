@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include <Eigen/Core>
@@ -26,17 +27,34 @@ struct ModeInput {
 };
 
 // Active-mode selector, stored in the registry ctx. The host bumps `generation`
-// whenever it changes `index` so the system knows to recompute.
+// whenever it changes `index` so the system knows to recompute. `index < 0` means
+// NO mode is active -- the default, so merely selecting an entity does not run a
+// processing operator (it must be turned on from the Geometry menu / M key).
 struct ModeState {
-    int      index      = 0;
+    int      index      = -1;
     uint64_t generation = 1;
 };
 
-// The registered modes (stable order; index into this list).
-int         modeCount();
-const char* modeName(int index);
+// Operator family, used to group the modes in the menu. Filters mark points
+// keep/drop; Analyze maps a per-point scalar to a heatmap; Generate emits new
+// geometry (a reconstructed mesh / resampled cloud).
+enum class ModeCategory { Filter = 0, Analyze, Generate, Transform };
 
-// Run mode `index` on `in`, emitting its visualization into `out`.
-void runMode(int index, const ModeInput& in, debug::DebugDraw& out);
+// The registered modes (stable order; index into this list).
+int          modeCount();
+const char*  modeName(int index);
+ModeCategory modeCategory(int index);
+const char*  modeCategoryName(ModeCategory c);
+
+// Progress callback: a long-running mode reports its completion fraction in
+// [0,1] as it works (throttled, not per-point). May be empty (ignored). Called
+// from the worker thread, so the sink must be thread-safe.
+using ProgressFn = std::function<void(float)>;
+
+// Run mode `index` on `in`, emitting its visualization into `out`, reporting
+// progress through `progress`. Modes that need normals estimate them from the
+// points when `in.normals` is empty.
+void runMode(int index, const ModeInput& in, debug::DebugDraw& out,
+             const ProgressFn& progress = {});
 
 } // namespace orange::modes

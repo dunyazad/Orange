@@ -43,6 +43,14 @@ include(cmake/dependencies.cmake)
 # not the FetchContent dependency builds above.
 if(MSVC)
     add_compile_options(/utf-8)
+    # Keep debug symbols in Release too, so the crash handler (and Visual Studio /
+    # WinDbg on the minidump) can resolve file:line in optimized builds. /Zi emits
+    # a PDB; /DEBUG keeps it at link time; /OPT:REF,ICF undo the size cost /DEBUG
+    # would otherwise leave so the Release binary stays lean.
+    add_compile_options($<$<CONFIG:Release>:/Zi>)
+    add_link_options($<$<CONFIG:Release>:/DEBUG>
+                     $<$<CONFIG:Release>:/OPT:REF>
+                     $<$<CONFIG:Release>:/OPT:ICF>)
 endif()
 
 # ---------------------------------------------------------------------------

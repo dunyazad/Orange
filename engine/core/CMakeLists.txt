@@ -7,9 +7,14 @@ add_library(orange_core STATIC
     src/application.cpp
     src/screenshot.cpp
     src/console.cpp
+    src/crash_handler.cpp
+    src/ui_layout.cpp
     src/geometry/sparse_grid.cpp
     src/geometry/sparse_data_block.cpp
     src/geometry/mesh_generation.cpp
+    src/geometry/normals.cpp
+    src/geometry/primitives.cpp
+    src/geometry/point_ops.cpp
     src/io/serialization.cpp
     src/modes/modes.cpp)
 add_library(orange::core ALIAS orange_core)
@@ -39,6 +44,11 @@ endif()
 # Needed for dlopen/dlsym on Unix-likes.
 if(NOT WIN32)
     target_link_libraries(orange_core PUBLIC ${CMAKE_DL_LIBS})
+endif()
+
+# DbgHelp backs the crash handler's stack walk + minidump on Windows.
+if(WIN32)
+    target_link_libraries(orange_core PUBLIC dbghelp)
 endif()
 
 target_compile_features(orange_core PUBLIC cxx_std_17)

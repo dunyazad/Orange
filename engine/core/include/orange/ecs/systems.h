@@ -23,6 +23,13 @@ void cameraManipulatorSystem(entt::registry& world, const core::Input& input,
 void fpsWidgetInputSystem(entt::registry& world, core::Input& input, float dt,
                           uint32_t viewportW, uint32_t viewportH);
 
+// Tree-view (scene outliner) widget: positions the panel, handles title-bar drag,
+// scroll-wheel, group expand/collapse, and row clicks (which select the entity by
+// writing Renderable::selected). Sets input.captured over the panel so clicks
+// don't also pick in the viewport.
+void treeViewInputSystem(entt::registry& world, core::Input& input,
+                         uint32_t viewportW, uint32_t viewportH);
+
 // Camera controls panel: positions the panel under the gizmo and handles clicks
 // on its buttons (toggle projection, FOV/size +/-). Sets input.captured on use.
 void cameraControlsInputSystem(entt::registry& world, core::Input& input, float dt,
@@ -77,10 +84,19 @@ bool entityVisibleOnScreen(entt::registry& world, entt::entity e,
                            uint32_t viewportW, uint32_t viewportH);
 
 // Runs the active point-cloud processing mode (modes::ModeState in ctx) on the
-// input cloud (modes::ModeInput in ctx) and emits its visualization into the
-// debug-draw accumulator. Recomputes only when the selected mode changes; no-op
-// if no ModeInput is present. Call before renderSystem.
+// selected entity's cloud, on a BACKGROUND thread so the main loop never blocks;
+// emits the last result into the debug-draw accumulator each frame. Recomputes
+// only when the active mode or selection changes. Call before renderSystem.
 void processingModeSystem(entt::registry& world);
+
+// If a processing-mode computation is running in the background, returns true and
+// fills `outProgress` (0..1) + `outName` (mode label) for a UI status line; false
+// when idle. Lets the app show e.g. "Smooth 42%".
+bool processingModeProgress(entt::registry& world, float& outProgress, std::string& outName);
+
+// Same, for a background SpatialViz wireframe build (the spatial-structure overlay
+// is built off-thread too). Returns true with progress + "Spatial" while building.
+bool spatialVizProgress(entt::registry& world, float& outProgress, std::string& outName);
 
 // Gathers the primary camera + all (Transform, MeshRenderer) entities and
 // issues draw calls through the renderer. This is the ECS -> render bridge.

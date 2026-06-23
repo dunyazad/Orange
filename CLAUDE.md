@@ -261,16 +261,51 @@ cmake --build D:/Library/Orange/build --config Debug
   (`GridState` in registry ctx, read by `renderSystem`); **R** resets the camera to
   its home pose (animated orientation + target + distance glide back to
   `CameraManipulator::home*`); **C** screenshots; **Esc** quits.
-- **Processing modes (`orange::modes`):** the Orange take on Hydrogen's "apps" —
-  selectable point-cloud operations that run on a `modes::ModeInput` (stored in
-  the registry ctx) and emit a visualization via the debug-draw accumulator.
-  `processingModeSystem` runs the active mode (`modes::ModeState` ctx) only when
-  the selection changes (cached), re-emitting each frame. The four ported,
-  CUDA/Helium-free modes: **Clustering** (SparseGrid radius + union-find),
-  **Morphology** (voxel erode + largest connected component), **SDF Filter**
-  (UDF splat + box blur + iso-surface resample), **Reconstruct** (TSDF →
-  `pointsToMesh`). appOrange feeds a deterministic sample cloud; **M** cycles.
-  (Adding a mode = one function + an entry in `kModes` in `modes.cpp`.)
+- **Processing modes / geometry operators (`orange::modes`):** the Orange take on
+  Hydrogen's "apps" — selectable point-cloud operations that emit a visualization
+  via the debug-draw accumulator. Each mode is tagged with a `ModeCategory`
+  (**Generate / Analyze / Filter**); the **Geometry** menu is built from the
+  registry, grouped by category with separators (so adding a mode = one function +
+  one `kModes` row in `modes.cpp` + a contiguous `MenuAction::ModeN`, and it
+  appears automatically). `processingModeSystem` (in `systems.cpp`) sources its
+  input from the **first selected entity's** `PickGeometry` (vertex positions →
+  world space), or from a ctx `modes::ModeInput` if one is present (tests/fixed
+  clouds); it caches the result and recomputes only when the active mode
+  (`modes::ModeState`) or the selection changes. **M** cycles the active mode. The
+  ten ported, CUDA/Helium-free operators: *Generate* — **Reconstruct** (TSDF →
+  `pointsToMesh`; estimates normals when absent), **SDF Filter** (UDF splat + box
+  blur + iso-surface resample); *Analyze* (per-point scalar → heatmap) —
+  **Clustering** (SparseGrid radius + union-find), **Curvature** (PCA surface
+  variation λ0/Σλ), **Normal Deviation** (angle vs neighbourhood mean normal),
+  **Density (KDE)** (Gaussian kernel); *Filter* (keep/drop, green/red) —
+  **Outlier: SOR** (statistical), **Outlier: ROR** (radius count), **Outlier:
+  PFOR** (plane-fit distance), **Morphology** (voxel erode + largest component);
+  *Transform* — **Smooth (bilateral)** (edge-preserving Laplacian) and **ICP
+  Register** (self-demo: perturb → realign, target blue / aligned green). The
+  Analyze/Filter/normal ops share `orange::geometry::estimateNormals`
+  (`normals.h`, SparseGrid kNN + PCA) and a kNN/PCA helper in `modes.cpp`; Smooth
+  and ICP are CPU reimplementations of Helium's GPU-only versions, in
+  `orange::geometry` (`point_ops.h`: `smoothPoints`, `icpAlign` — Eigen-SVD
+  point-to-point). All self-scale to the input's bbox diagonal (fixed thresholds,
+  no UI sliders yet).
+- **Create menu (parametric primitives):** `orange::geometry::buildPlane/Box/
+  Sphere/Cylinder/Cone/Torus/Disk/Capsule/Arrow` (`primitives.h`, the CPU port of
+  Helium's GeometryBuilder) return a `geometry::Triangle` soup; `Application::
+  applyMenuAction`'s `spawnPrimitive` uploads it to a GPU buffer/mesh and spawns a
+  real, pickable `Renderable` entity (at the camera pivot, scaled to orbit
+  distance) with a matching `PickGeometry`. So generated shapes are themselves
+  selectable and can be fed to the geometry operators above.
+- **Tree-view / scene outliner (`TreeView`):** a draggable overlay widget built
+  on the same dynamic-VB + font-atlas quad pattern as the FPS widget. Lists the
+  world's drawable entities under collapsible group headers (Meshes / Point
+  Clouds); rows are rebuilt from the world each frame (the component holds only UI
+  state). `treeViewInputSystem` handles title-bar drag, wheel scroll, group
+  expand/collapse, and row clicks — a click writes `Renderable::selected` (plain =
+  replace, Ctrl = toggle), so it is two-way synced with the viewport silhouette
+  selection. `renderSystem` draws it as an overlay (title bar drawn last / higher
+  z so scrolled-up rows vanish under it). Created in appOrange's `main.cpp`
+  alongside the FPS widget; `kTreeQuads` (systems.cpp) must match the app's index
+  capacity.
 - **Text/UI:** gizmo labels and FPS/controls widgets are rasterized with
   stb_truetype (loads `C:/Windows/Fonts/malgun.ttf` on Windows) into RGBA atlases
   drawn as textured overlay quads via `IRenderer::beginOverlay`. Overlay layers

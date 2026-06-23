@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -26,6 +27,9 @@
 
 #include "mesh_io.h"
 #include "orange/core/application.h"
+#include "orange/core/crash_handler.h"
+#include "orange/core/screenshot.h"
+#include "orange/core/ui_layout.h"
 #include "orange/core/buffer.h"
 #include "orange/core/console.h"
 #include "orange/core/math.h"
@@ -288,6 +292,30 @@ struct LoadJob {
 int main(int argc, char** argv) {
     SDL_SetMainReady();
 
+    // Install first so any later crash prints a symbolized stack trace +
+    // orange_crash.txt / orange_crash.dmp instead of vanishing silently.
+    core::installCrashHandler();
+
+    // Diagnostic: `appOrange --crashtest` deliberately faults here so you can
+    // confirm the crash handler produces a stack trace (with file:line) and the
+    // crash files. Harmless otherwise.
+    bool shotMode = false;
+    bool hangMode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--crashtest") == 0) {
+            volatile int* p = nullptr;
+            *p = 42;
+        }
+        // `appOrange --shot` renders a few frames, saves auto_shot.png, and exits
+        // -- a deterministic headless screenshot for verifying the UI layout.
+        if (std::strcmp(argv[i], "--shot") == 0) shotMode = true;
+        // `appOrange --hangtest` deliberately freezes the main thread so you can
+        // confirm the watchdog catches the hang (writes orange_hang.txt/.dmp).
+        if (std::strcmp(argv[i], "--hangtest") == 0) hangMode = true;
+    }
+    int shotFrames = 0;
+    int hangFrames = 0;
+
     // Console on the monitor right of the largest; 3D window maximizes on the
     // largest monitor (handled in Window::create).
     core::setupConsoleWindow();
@@ -517,6 +545,41 @@ int main(int argc, char** argv) {
         widget.vsync = config.vsync;       // reflect the actual initial state
         world.emplace<ecs::FpsWidget>(e, widget);
     }
+
+    // Draggable tree-view (scene outliner): same dynamic-VB + quad-index pattern
+    // as the FPS widget. kTreeQ must match kTreeQuads in systems.cpp.
+    const int kTreeQ = 600, kTreeV = kTreeQ * 4;
+    const std::vector<render::Vertex> treeInit(kTreeV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
+    std::vector<uint32_t> treeIdx;
+    for (uint32_t q = 0; q < static_cast<uint32_t>(kTreeQ); ++q) {
+        uint32_t b = q * 4;
+        treeIdx.insert(treeIdx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+    }
+    core::VertexBuffer<render::Vertex> treeVbo(*app.renderer(), treeInit,
+                                               render::BufferUsage::Dynamic);
+    core::IndexBuffer treeIbo(*app.renderer(), treeIdx);
+    render::MeshDesc treeMeshDesc;
+    treeMeshDesc.vertexBuffer = treeVbo.handle();
+    treeMeshDesc.indexBuffer  = treeIbo.handle();
+    treeMeshDesc.layout       = render::Vertex::layout();
+    treeMeshDesc.vertexCount  = static_cast<uint32_t>(kTreeV);
+    treeMeshDesc.indexCount   = static_cast<uint32_t>(kTreeQ * 6);
+    {
+        auto e = world.create();
+        ecs::TreeView tv;
+        tv.mesh  = app.renderer()->createMesh(treeMeshDesc);
+        tv.vbo   = treeVbo.handle();
+        tv.font  = &uiFont;
+        tv.atlas = uiFont.texture;
+        world.emplace<ecs::TreeView>(e, tv);
+    }
+
+    // Restore the draggable widgets (FPS + tree) to their last-saved positions;
+    // saved again after the run loop so each launch reopens where they were left.
+    const char* uiBase = SDL_GetBasePath();  // owned by SDL, do not free
+    const std::string uiLayoutPath =
+        (uiBase ? std::string(uiBase) : std::string()) + "orange_ui_layout.txt";
+    core::loadWidgetLayout(world, uiLayoutPath);
 
     // Camera controls panel (projection toggle + FOV/size), under the gizmo.
     const int kCtrlQ = 64, kCtrlV = kCtrlQ * 4;
@@ -757,6 +820,19 @@ int main(int argc, char** argv) {
     float   statusHold = 0.0f;  // seconds to keep the final "Loaded/Failed" message
 
     auto onUpdate = [&](entt::registry& w, float dt) {
+        core::watchdogHeartbeat();  // tell the watchdog the main loop is alive
+
+        // Headless screenshot mode: let the scene settle, capture, then exit.
+        if (shotMode && ++shotFrames == 30) {
+            core::saveScreenshot(*app.renderer(), "auto_shot.png");
+            std::exit(0);
+        }
+        // Hang test: freeze the main thread so the watchdog can catch it.
+        if (hangMode && ++hangFrames == 30) {
+            volatile int x = 0;
+            for (;;) ++x;  // deliberate infinite loop (never returns)
+        }
+
         ecs::MenuBar* mb = nullptr;
         auto          mbv = w.view<ecs::MenuBar>();
         for (auto e : mbv) { mb = &mbv.get<ecs::MenuBar>(e); break; }
@@ -821,6 +897,16 @@ int main(int argc, char** argv) {
         } else if (statusHold > 0.0f) {
             statusHold -= dt;
             if (statusHold <= 0.0f && mb) mb->statusText.clear();
+        } else {
+            // No load in progress: surface any background processing-mode or
+            // spatial-structure build progress.
+            float pct = 0.0f;
+            std::string name;
+            if (ecs::processingModeProgress(w, pct, name) || ecs::spatialVizProgress(w, pct, name)) {
+                if (mb) mb->statusText = name + " " + std::to_string((int)(pct * 100.0f + 0.5f)) + "%";
+            } else if (mb && !mb->statusText.empty()) {
+                mb->statusText.clear();  // finished -> clear the line
+            }
         }
     };
 
@@ -829,6 +915,13 @@ int main(int argc, char** argv) {
             "Delete removes); Tab cycles the selection's drawing mode (H reveals None-hidden meshes); "
             "+/- resize point-cloud sprites.");
     SDL_Log("appOrange: ESC or close the window to quit.");
+
+    // Watch for a main-thread hang (shorter timeout in the hang self-test).
+    core::installWatchdog(hangMode ? 2.0 : 10.0);
     app.run(onUpdate);  // onUpdate + spinSystem + renderSystem run each frame
+    core::stopWatchdog();
+
+    // Persist the draggable widgets' final positions for next launch.
+    core::saveWidgetLayout(world, uiLayoutPath);
     return 0;
 }

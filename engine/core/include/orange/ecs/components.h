@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -60,12 +62,22 @@ struct PickGeometry {
     std::vector<uint32_t>        indices;    // triangle list (3 per face)
 };
 
-// Cached BVH over a PickGeometry's triangles, built lazily on first ray pick so
-// repeated picks of a large mesh are O(log n) instead of testing every triangle.
-// References the entity's PickGeometry buffers (stable while the component lives).
+// Background build of a pick BVH for a huge mesh (millions of triangles), so the
+// click that triggers it doesn't freeze the main thread. Held by shared_ptr so the
+// worker can be detached. Small meshes skip this and build inline (instant).
+struct PickBvhJob {
+    std::atomic<bool> done{false};
+    geometry::BVH     bvh;
+};
+
+// Cached BVH over a PickGeometry's triangles, built on first ray pick so repeated
+// picks of a large mesh are O(log n) instead of testing every triangle. Small
+// meshes build inline; a huge mesh builds on a worker (`job`) while picks fall back
+// to the coarse AABB until it is ready. References the entity's PickGeometry buffers.
 struct PickBVH {
-    geometry::BVH bvh;
-    bool          built = false;
+    geometry::BVH                bvh;
+    bool                         built = false;
+    std::shared_ptr<PickBvhJob>  job;    // in-flight background build (null = none)
 };
 
 enum class ProjectionMode { Perspective = 0, Orthographic = 1 };
@@ -181,7 +193,10 @@ struct FpsWidget {
     // Position is stored as a fraction of the viewport (top-left corner) so the
     // panel keeps its relative spot when the window is resized. fpsWidgetInputSystem
     // derives x/y from these each frame; dragging writes them back.
-    float relX = 0.0125f, relY = 0.052f;  // below the menu bar
+    // Top-left, just right of the selection toolbar (far-left ~54px strip) and just
+    // below the menu bar; the TreeView stacks directly under it (shared left x).
+    // (Tuned for a maximized ~4K window; both widgets are draggable + persisted.)
+    float relX = 0.0161f, relY = 0.0263f;
 
     static constexpr int kSamples = 64;
     float history[kSamples] = {};   // recent FPS values (ring buffer)
@@ -211,6 +226,45 @@ struct FpsWidget {
 
     // Shared proportional font for the readout; atlas = font->texture (its white
     // texel backs the opaque panel/bars).
+    const core::Font*     font  = nullptr;
+    render::TextureHandle atlas = render::kInvalidTexture;
+};
+
+// A draggable tree-view widget: a scene outliner that lists the world's drawable
+// entities grouped into collapsible categories (Meshes / Point Clouds). Built the
+// same way as FpsWidget -- a dynamic vertex buffer rewritten each frame into a
+// font-atlas overlay quad mesh. treeViewInputSystem hit-tests the title bar (drag),
+// the group arrows (expand/collapse), the scroll wheel, and the rows; clicking a
+// row selects that entity (syncing Renderable::selected, so the viewport silhouette
+// updates too). The rows themselves are rebuilt from the world each frame -- the
+// component only holds UI state + GPU resources.
+struct TreeView {
+    static constexpr int kGroups = 2;  // 0 = Meshes, 1 = Point Clouds
+
+    bool visible = true;
+    int  w = 252, h = 340;             // panel size (px)
+    int  x = 0, y = 0;                 // computed each frame from relX/relY
+
+    // Position stored as a viewport fraction (top-left), so it tracks resizes.
+    // Stacked directly under the FpsWidget in the top-left column (shared left x,
+    // ~6px below the FPS panel), clear of the selection toolbar. Tuned for a
+    // maximized ~4K window; draggable + persisted thereafter.
+    float relX = 0.0161f, relY = 0.0935f;
+
+    bool  expanded[kGroups] = {true, true};  // per-group collapse state
+    float scroll = 0.0f;               // vertical scroll offset (px, >= 0)
+    int   hover  = -1;                  // hovered row index (-1 none)
+
+    // Drag state (panel moved by its title bar).
+    bool  dragging = false;
+    float dragOffX = 0.0f, dragOffY = 0.0f;
+
+    // GPU resources (dynamic vertex buffer rewritten each frame).
+    render::MeshHandle   mesh = render::kInvalidMesh;
+    render::BufferHandle vbo  = render::kInvalidBuffer;
+
+    // Shared proportional font; atlas = font->texture (white texel backs the
+    // opaque panel/row fills).
     const core::Font*     font  = nullptr;
     render::TextureHandle atlas = render::kInvalidTexture;
 };
@@ -286,6 +340,20 @@ struct ElementSelection {
     std::vector<Edge>     edges;     // selected edges (vertex-index pairs)
 };
 
+// Per-entity cached GPU mesh of the ElementSelection highlight (vertex cubes /
+// edge tubes / face triangles), baked in the entity's local space and drawn each
+// frame with model = Mworld * Transform. Rebuilt only when the selection content
+// changes (tracked by `sig`, a hash of the index sets) -- the old path rebuilt a
+// billboard quad per selected vertex into the per-frame debug-draw mesh and
+// re-uploaded it every frame, which tanked the FPS on large (e.g. box) selections.
+struct ElementSelCache {
+    uint64_t             sig  = 0;   // hash of the selection the mesh was built from
+    bool                 built = false;
+    render::MeshHandle   mesh = render::kInvalidMesh;
+    render::BufferHandle vbo  = render::kInvalidBuffer;
+    uint32_t             vertexCount = 0;
+};
+
 // Left vertical selection toolbar. One labelled button per mode value, grouped
 // (target / action / filter / modifier). selectionToolbarInputSystem hit-tests
 // the buttons and writes the chosen value into the ctx SelectionMode; renderSystem
@@ -327,12 +395,29 @@ struct SpatialViz {
     int kind = 0;
 };
 
-// Per-entity cached GPU wireframe of the current SpatialViz kind. Built once (into
-// a static mesh in the entity's local space) when the kind changes, then drawn
-// each frame with model = Mworld * Transform -- so a deep tree costs nothing per
-// frame (the old per-frame debug-draw rebuild was the bottleneck).
+// Background build of a spatial-structure wireframe: a worker thread fills `verts`
+// (the structure + its node boxes/spheres, in the entity's local space) from a
+// self-contained copy of the points, then sets `done`; the main thread uploads it
+// to the GPU. Heavy on a million-point cloud, so it must not run on the render
+// thread. Held by shared_ptr so the worker can be detached and outlive the cache.
+struct SpatialVizJob {
+    std::atomic<bool>           done{false};
+    std::atomic<float>          progress{0.0f};  // [0,1]
+    std::vector<render::Vertex> verts;
+    int                         kind = 0;
+    int                         boxCount = 0, drawn = 0, total = 0;
+};
+
+// Per-entity cached GPU wireframe of the current SpatialViz kind, plus the
+// in-flight background build that produces it. The wireframe is built on a worker
+// thread (the structure build + box generation is O(N log N) over every point);
+// the main thread only uploads the finished vertices and draws the cached mesh
+// each frame with model = Mworld * Transform.
 struct SpatialVizCache {
-    int kind = -1;
+    int kind        = -1;   // kind the current GPU mesh shows (-1 = none)
+    int pendingKind = -1;   // kind a background build is currently producing (-1 = none)
+    std::shared_ptr<SpatialVizJob> job;  // in-flight build (null = idle)
+
     render::MeshHandle   mesh = render::kInvalidMesh;
     render::BufferHandle vbo  = render::kInvalidBuffer;
     uint32_t             vertexCount = 0;
@@ -357,7 +442,15 @@ enum class MenuAction : int {
     DrawNone, DrawSolid, DrawWireframe, DrawWireSolid, DrawPoint,
     SelectAll, DeleteSelected, ClearSelection, UnhideAll,
     PointSizeUp, PointSizeDown,
-    Mode0, Mode1, Mode2, Mode3,
+    // Geometry-processing operators. Contiguous so the menu/dispatch can map a
+    // mode index i to MenuAction(Mode0 + i). Reserve a generous range so adding
+    // modes in modes.cpp needs no new enum here.
+    ModeOff,  // deactivate the processing operator (default state)
+    Mode0, Mode1, Mode2, Mode3, Mode4, Mode5, Mode6, Mode7,
+    Mode8, Mode9, Mode10, Mode11, Mode12, Mode13, Mode14, Mode15,
+    // Parametric primitive spawners (Create menu) -> a new Renderable entity.
+    CreatePlane, CreateBox, CreateSphere, CreateCylinder, CreateCone,
+    CreateTorus, CreateDisk, CreateCapsule, CreateArrow,
     SpatialNone, SpatialBVH, SpatialOctree, SpatialKDTree,
     SpatialGrid, SpatialLoose, SpatialBSP, SpatialRTree, SpatialBall,
 };

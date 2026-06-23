@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>  // MatrixBase::cross is defined here, not in Core
 
 #include "orange/core/ball_tree.h"
 #include "orange/core/bsp.h"

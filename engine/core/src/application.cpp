@@ -2,10 +2,12 @@
 
 #include <SDL3/SDL.h>
 
+#include <cfloat>
 #include <vector>
 
 #include "orange/core/draw_mode.h"
 #include "orange/core/modes.h"
+#include "orange/core/primitives.h"
 #include "orange/core/screenshot.h"
 #include "orange/ecs/components.h"
 #include "orange/ecs/systems.h"
@@ -112,6 +114,11 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                         ms.index = (ms.index + 1) % modes::modeCount();
                         ms.generation++;
                         SDL_Log("Application: processing mode = %s", modes::modeName(ms.index));
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_O && (e.key.mod & SDL_KMOD_CTRL)) {
+                        // Ctrl+O: open the native file dialog (same as File > Open...).
+                        auto mv = world_.view<ecs::MenuBar>();
+                        for (auto ent : mv) { mv.get<ecs::MenuBar>(ent).requestOpenFile = true; break; }
                     }
                     if (e.key.scancode == SDL_SCANCODE_A && (e.key.mod & SDL_KMOD_CTRL)) {
                         // Ctrl+A: select every Renderable that is visible on screen.
@@ -259,6 +266,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
             c.get<ecs::PointSizeState>().size = pointSize_;
         }
         ecs::fpsWidgetInputSystem(world_, input_, dt, window_.width(), window_.height());
+        ecs::treeViewInputSystem(world_, input_, window_.width(), window_.height());
         ecs::cameraControlsInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::crossSectionInputSystem(world_, input_, window_.width(), window_.height());
         ecs::axisGizmoInputSystem(world_, input_, dt, window_.width(), window_.height());
@@ -303,6 +311,66 @@ void Application::applyMenuAction(int action) {
         ms.index = idx % modes::modeCount();
         ms.generation++;
     };
+    // Upload a primitive triangle soup and spawn a real, pickable entity at the
+    // primary camera's pivot, sized to its orbit distance so it is always visible.
+    auto spawnPrimitive = [&](const std::vector<geometry::Triangle>& tris) {
+        if (tris.empty() || !r) return;
+        std::vector<render::Vertex> verts;
+        verts.reserve(tris.size() * 3);
+        ecs::PickGeometry pick;
+        Eigen::Vector3f mn = Eigen::Vector3f::Constant(FLT_MAX);
+        Eigen::Vector3f mx = Eigen::Vector3f::Constant(-FLT_MAX);
+        uint32_t idx = 0;
+        for (const auto& t : tris)
+            for (int k = 0; k < 3; ++k) {
+                const Eigen::Vector3f& p = t.v[k];
+                render::Vertex v{};
+                v.position[0] = p.x(); v.position[1] = p.y(); v.position[2] = p.z();
+                v.color[0] = t.c[k].x(); v.color[1] = t.c[k].y(); v.color[2] = t.c[k].z();
+                verts.push_back(v);
+                pick.positions.push_back(p);
+                pick.indices.push_back(idx++);
+                mn = mn.cwiseMin(p); mx = mx.cwiseMax(p);
+            }
+
+        render::BufferDesc bd;
+        bd.type  = render::BufferType::Vertex;
+        bd.usage = render::BufferUsage::Static;
+        bd.data  = verts.data();
+        bd.size  = verts.size() * sizeof(render::Vertex);
+        render::BufferHandle vbo = r->createBuffer(bd);
+
+        render::MeshDesc md;
+        md.vertexBuffer = vbo;
+        md.indexBuffer  = render::kInvalidBuffer;
+        md.layout       = render::Vertex::layout();
+        md.vertexCount  = static_cast<uint32_t>(verts.size());
+        render::MeshHandle mesh = r->createMesh(md);
+
+        Eigen::Vector3f pos = Eigen::Vector3f::Zero();
+        float scl = 1.0f;
+        auto cv = world_.view<ecs::Camera, ecs::CameraManipulator>();
+        for (auto e : cv) {
+            if (!cv.get<ecs::Camera>(e).primary) continue;
+            auto& m = cv.get<ecs::CameraManipulator>(e);
+            pos = m.target;
+            scl = m.distance * 0.3f;
+            break;
+        }
+
+        auto e = world_.create();
+        ecs::Transform tr;
+        tr.position = pos;
+        tr.scale    = Eigen::Vector3f::Constant(scl);
+        world_.emplace<ecs::Transform>(e, tr);
+        ecs::Renderable rr;
+        rr.mesh      = mesh;
+        rr.boundsMin = mn;
+        rr.boundsMax = mx;
+        world_.emplace<ecs::Renderable>(e, rr);
+        world_.emplace<ecs::PickGeometry>(e, std::move(pick));
+    };
+    const Eigen::Vector3f kPrimColor(0.72f, 0.74f, 0.78f);  // neutral (recolored by color mode)
 
     switch (static_cast<A>(action)) {
         case A::OpenFile: {
@@ -411,10 +479,23 @@ void Application::applyMenuAction(int action) {
             if (r) r->setPointSize(pointSize_);
             break;
 
-        case A::Mode0: setMode(0); break;
-        case A::Mode1: setMode(1); break;
-        case A::Mode2: setMode(2); break;
-        case A::Mode3: setMode(3); break;
+        case A::ModeOff: setMode(-1); break;
+        case A::Mode0: case A::Mode1: case A::Mode2:  case A::Mode3:
+        case A::Mode4: case A::Mode5: case A::Mode6:  case A::Mode7:
+        case A::Mode8: case A::Mode9: case A::Mode10: case A::Mode11:
+        case A::Mode12: case A::Mode13: case A::Mode14: case A::Mode15:
+            setMode(action - static_cast<int>(A::Mode0));
+            break;
+
+        case A::CreatePlane:    spawnPrimitive(geometry::buildPlane(1.0f, kPrimColor)); break;
+        case A::CreateBox:      spawnPrimitive(geometry::buildBox(Eigen::Vector3f(1, 1, 1), kPrimColor)); break;
+        case A::CreateSphere:   spawnPrimitive(geometry::buildSphere(0.5f, 24, kPrimColor)); break;
+        case A::CreateCylinder: spawnPrimitive(geometry::buildCylinder(0.5f, 1.0f, 24, kPrimColor)); break;
+        case A::CreateCone:     spawnPrimitive(geometry::buildCone(0.5f, 1.0f, 24, kPrimColor)); break;
+        case A::CreateTorus:    spawnPrimitive(geometry::buildTorus(0.5f, 0.18f, 24, 16, kPrimColor)); break;
+        case A::CreateDisk:     spawnPrimitive(geometry::buildDisk(0.5f, 24, kPrimColor)); break;
+        case A::CreateCapsule:  spawnPrimitive(geometry::buildCapsule(0.3f, 0.6f, 16, kPrimColor)); break;
+        case A::CreateArrow:    spawnPrimitive(geometry::buildArrow(1.0f, 0.08f, 16, kPrimColor)); break;
 
         case A::SpatialNone:   case A::SpatialBVH:    case A::SpatialOctree:
         case A::SpatialKDTree: case A::SpatialGrid:   case A::SpatialLoose:

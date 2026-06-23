@@ -1,12 +1,18 @@
 #include "orange/ecs/systems.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <execution>
+#include <functional>
+#include <memory>
+#include <thread>
 #include <unordered_set>
 #include <vector>
+
+#include <SDL3/SDL.h>  // SDL_Log (background-job notices)
 
 #include "orange/core/ball_tree.h"
 #include "orange/core/bsp.h"
@@ -82,35 +88,160 @@ void drawDebugGeometry(entt::registry& world, render::IRenderer& renderer,
     dd.clear();
 }
 
-// Cached debug geometry for the active processing mode (recomputed only when the
-// mode selection changes), stored in the registry ctx.
+// A background computation of one processing-mode result. The worker thread fills
+// `verts` from a self-contained copy of the input (it never touches the registry),
+// then sets `done`; the main thread harvests it. `gen`/`sig` tag which request it
+// answers, so a stale result (selection/mode changed meanwhile) is discarded.
+struct ModeJob {
+    std::atomic<bool>           done{false};
+    std::atomic<float>          progress{0.0f};  // [0,1], updated by the worker
+    std::vector<render::Vertex> verts;
+    uint64_t                    gen = 0, sig = 0;
+    int                         index = -1;       // which mode (for the status label)
+};
+
+// Cached debug geometry for the active processing mode + the in-flight background
+// job that produces it, stored in the registry ctx. The heavy mode computation
+// runs on `worker` so the main (render) thread never blocks -- a million-point
+// cloud no longer freezes the UI.
 struct ModeCache {
     uint64_t generation = 0;
+    uint64_t selSig     = 0;   // signature of the selection the displayed result was built from
     std::vector<render::Vertex> verts;
+
+    std::shared_ptr<ModeJob> job;     // running computation (null if idle)
+    std::thread              worker;
+
+    ~ModeCache() {
+        // Never join (could block for minutes) nor std::terminate at teardown: a
+        // detached worker is self-contained and dies with the process.
+        if (worker.joinable()) worker.detach();
+    }
 };
 } // namespace
 
-// Runs the active processing mode on the input point cloud (both in the registry
-// ctx), caching its debug geometry and re-emitting it each frame so the heavy
-// computation only happens when the selected mode changes.
+// Runs the active processing mode on the *selected* entity's point cloud. The
+// heavy computation (kNN, reconstruction, smoothing -- O(N) over up to millions of
+// points) runs on a BACKGROUND thread so the main render loop never blocks: the
+// system kicks off a worker, keeps drawing the last result, and swaps in the new
+// one when the worker finishes. A request superseded by a selection/mode change
+// before its worker finishes is discarded. The input is the first selected entity
+// with a PickGeometry (its vertices, transformed to world space); a ctx
+// modes::ModeInput, if present, overrides it (tests / fixed clouds).
 void processingModeSystem(entt::registry& world) {
-    if (!world.ctx().contains<modes::ModeInput>()) return;
-    const auto& input = world.ctx().get<modes::ModeInput>();
+    auto& ctx = world.ctx();
 
     modes::ModeState state;
-    if (world.ctx().contains<modes::ModeState>()) state = world.ctx().get<modes::ModeState>();
+    if (ctx.contains<modes::ModeState>()) state = ctx.get<modes::ModeState>();
 
-    if (!world.ctx().contains<ModeCache>()) world.ctx().emplace<ModeCache>();
-    auto& cache = world.ctx().get<ModeCache>();
+    if (!ctx.contains<ModeCache>()) ctx.emplace<ModeCache>();
+    auto& cache = ctx.get<ModeCache>();
 
-    if (cache.generation != state.generation) {
-        debug::DebugDraw tmp;
-        modes::runMode(state.index, input, tmp);
-        cache.verts = tmp.vertices();
-        cache.generation = state.generation;
+    // Desired source + a cheap signature (no cloud copy yet).
+    const bool active   = state.index >= 0;
+    const bool hasFixed = ctx.contains<modes::ModeInput>();
+    entt::entity src = entt::null;
+    uint64_t selSig = 0;
+    if (active) {
+        if (hasFixed) {
+            selSig = 0xFFFFFFFFFFFFFFFFull;
+        } else {
+            auto v = world.view<Renderable, PickGeometry>();
+            for (auto e : v) {
+                if (!v.get<Renderable>(e).selected) continue;
+                const auto& pg = v.get<PickGeometry>(e);
+                if (pg.positions.empty()) break;
+                src = e;
+                selSig = ((uint64_t)(uint32_t)entt::to_integral(e) << 32) ^
+                         (uint64_t)pg.positions.size();
+                break;
+            }
+        }
+    }
+    // What the displayed result should answer. Fold in the mode index so switching
+    // modes on the same selection recomputes.
+    const uint64_t want = active ? (state.generation ^ (selSig * 0x9E3779B97F4A7C15ull) ^
+                                    ((uint64_t)(state.index + 1) << 8))
+                                 : 0;
+
+    // 1) Harvest a finished background job (non-blocking: only join once done).
+    if (cache.job && cache.job->done.load(std::memory_order_acquire)) {
+        if (cache.worker.joinable()) cache.worker.join();
+        if (cache.job->gen == want && cache.job->sig == selSig) {  // still relevant
+            cache.verts      = std::move(cache.job->verts);
+            cache.generation = want;
+            cache.selSig     = selSig;
+            SDL_Log("processingModeSystem: %s done (%zu verts)", modes::modeName(state.index),
+                    cache.verts.size());
+        }
+        cache.job.reset();
+    }
+
+    // 2) Inactive / nothing selected: show nothing (let any in-flight job finish
+    //    and be discarded above on a later frame).
+    if (!active || (!hasFixed && src == entt::null)) {
+        if (!cache.verts.empty()) { cache.verts.clear(); cache.generation = 0; cache.selSig = 0; }
+        debug::DebugDraw::instance().addRaw(cache.verts);
+        return;
+    }
+
+    // 3) Need a (re)compute and no worker in flight? Build the input on the main
+    //    thread (a cheap copy) and launch the heavy work on a background thread.
+    const bool needCompute = (cache.generation != want || cache.selSig != selSig);
+    if (needCompute && !cache.job) {
+        // Main thread only copies the raw positions (a fast memcpy) + the model
+        // matrix; the worker does the world transform AND the heavy operator.
+        modes::ModeInput fixedInput;
+        std::vector<Eigen::Vector3f> raw;
+        Eigen::Matrix4f M = Eigen::Matrix4f::Identity();
+        if (hasFixed) {
+            fixedInput = ctx.get<modes::ModeInput>();
+        } else {
+            raw = world.get<PickGeometry>(src).positions;  // vector copy
+            if (world.all_of<Transform>(src)) M = world.get<Transform>(src).matrix();
+        }
+
+        auto job = std::make_shared<ModeJob>();
+        job->gen   = want;
+        job->sig   = selSig;
+        job->index = state.index;
+        cache.job  = job;
+        SDL_Log("processingModeSystem: %s running in background on %zu points...",
+                modes::modeName(state.index),
+                hasFixed ? fixedInput.points.size() : raw.size());
+        int  idx = state.index;
+        bool useFixed = hasFixed;
+        cache.worker = std::thread(
+            [job, idx, useFixed, fixed = std::move(fixedInput), raw = std::move(raw), M]() mutable {
+                modes::ModeInput in;
+                if (useFixed) {
+                    in = std::move(fixed);
+                } else {
+                    in.points.resize(raw.size());
+                    for (size_t i = 0; i < raw.size(); ++i) {
+                        Eigen::Vector4f w = M * Eigen::Vector4f(raw[i].x(), raw[i].y(), raw[i].z(), 1.0f);
+                        in.points[i]      = Eigen::Vector3f(w.x(), w.y(), w.z());
+                    }
+                }
+                debug::DebugDraw tmp;
+                modes::runMode(idx, in, tmp,
+                               [job](float f) { job->progress.store(f, std::memory_order_relaxed); });
+                job->verts = tmp.vertices();
+                job->done.store(true, std::memory_order_release);
+            });
     }
 
     debug::DebugDraw::instance().addRaw(cache.verts);
+}
+
+bool processingModeProgress(entt::registry& world, float& outProgress, std::string& outName) {
+    auto& ctx = world.ctx();
+    if (!ctx.contains<ModeCache>()) return false;
+    auto& cache = ctx.get<ModeCache>();
+    if (!cache.job || cache.job->done.load(std::memory_order_acquire)) return false;
+    outProgress = cache.job->progress.load(std::memory_order_relaxed);
+    outName     = modes::modeName(cache.job->index);
+    return true;
 }
 
 namespace {
@@ -534,6 +665,125 @@ void buildFpsGeometry(const FpsWidget& wgt, render::Vertex* out) {
     }
 
     for (int i = q * 4; i < kFpsVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
+}
+
+// --- Tree-view (scene outliner) widget -------------------------------------
+constexpr int   kTreeQuads  = 600;            // dynamic mesh capacity
+constexpr int   kTreeVerts  = kTreeQuads * 4;
+constexpr float kTreeTitleH = 34.0f;          // title bar (drag handle) height, px
+constexpr float kTreeRowH   = 30.0f;          // row height, px
+constexpr float kTreeTextPx = 20.0f;          // glyph height, px (large & readable)
+
+// One row of the outliner -- a group header or an entity leaf. Rebuilt from the
+// world each frame (shared by the input hit-test and the geometry builder so they
+// always agree on row layout).
+struct TreeRow {
+    bool         isGroup  = false;
+    bool         expanded = false;
+    bool         selected = false;
+    int          depth    = 0;
+    int          group    = 0;             // group id (for header toggle)
+    entt::entity entity   = entt::null;    // leaf entity (null for headers)
+    char         label[48] = {0};
+};
+
+void buildTreeRows(entt::registry& world, const TreeView& tv, std::vector<TreeRow>& rows) {
+    static const char* kGroupName[TreeView::kGroups] = {"Meshes", "Point Clouds"};
+    auto v = world.view<Renderable>();
+    for (int g = 0; g < TreeView::kGroups; ++g) {
+        const bool wantCloud = (g == 1);
+        int count = 0;
+        for (auto e : v)
+            if (v.get<Renderable>(e).pointCloud == wantCloud) ++count;
+
+        TreeRow hr;
+        hr.isGroup = true; hr.expanded = tv.expanded[g]; hr.group = g; hr.depth = 0;
+        std::snprintf(hr.label, sizeof(hr.label), "%s (%d)", kGroupName[g], count);
+        rows.push_back(hr);
+
+        if (!tv.expanded[g]) continue;
+        for (auto e : v) {
+            const auto& r = v.get<Renderable>(e);
+            if (r.pointCloud != wantCloud) continue;
+            TreeRow row;
+            row.depth = 1; row.selected = r.selected; row.entity = e;
+            unsigned int id = (unsigned int)entt::to_integral(e);
+            std::snprintf(row.label, sizeof(row.label), "%s %u", wantCloud ? "Cloud" : "Mesh", id);
+            rows.push_back(row);
+        }
+    }
+}
+
+float treeMaxScroll(const TreeView& tv, size_t rowCount) {
+    float content = (float)rowCount * kTreeRowH;
+    float viewH   = (float)tv.h - kTreeTitleH;
+    return (std::max)(0.0f, content - viewH);
+}
+
+// Builds the panel in normalized [0,1]^2 (y-up); rects are specified in panel
+// pixels measured from the top-left. Rows are drawn first, then the title bar on
+// top (higher z) so rows scrolled up vanish under it.
+void buildTreeGeometry(const TreeView& tv, const std::vector<TreeRow>& rows, render::Vertex* out) {
+    int q = 0;
+    if (!tv.font) { for (int i = 0; i < kTreeVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}}; return; }
+    const core::Font& f = *tv.font;
+    const float wu = f.whiteU, wv = f.whiteV;
+    const float W = (float)tv.w, H = (float)tv.h;
+    const float xs = H / W;                         // glyph horizontal aspect fix
+    auto nx    = [&](float px) { return px / W; };
+    auto nyTop = [&](float px) { return 1.0f - px / H; };
+    // Rect in panel pixels (x0<x1 left/right, t0<t1 top/bottom from the top edge).
+    auto rect = [&](float x0, float t0, float x1, float t1, float r, float g, float b, float z) {
+        if (q >= kTreeQuads) return;
+        float y0 = nyTop(t1), y1 = nyTop(t0);       // bottom, top in y-up
+        float X0 = nx(x0), X1 = nx(x1);
+        out[q * 4 + 0] = {{X0, y0, z}, {r, g, b}, {wu, wv}};
+        out[q * 4 + 1] = {{X1, y0, z}, {r, g, b}, {wu, wv}};
+        out[q * 4 + 2] = {{X1, y1, z}, {r, g, b}, {wu, wv}};
+        out[q * 4 + 3] = {{X0, y1, z}, {r, g, b}, {wu, wv}};
+        ++q;
+    };
+
+    rect(0, 0, W, H, 0.07f, 0.08f, 0.10f, 0.0f);    // panel background
+
+    const float lblH  = kTreeTextPx / H;            // leaf glyph height
+    const float grpH  = kTreeTextPx / H;            // header glyph height
+    const float grpCol[3]  = {0.90f, 0.93f, 0.97f};
+    const float leafCol[3] = {0.74f, 0.80f, 0.86f};
+    const float arwCol[3]  = {0.62f, 0.70f, 0.80f};
+
+    for (size_t i = 0; i < rows.size(); ++i) {
+        float top = kTreeTitleH + (float)i * kTreeRowH - tv.scroll;
+        if (top + kTreeRowH <= kTreeTitleH - 0.5f) continue;  // scrolled above (hidden by title)
+        if (top >= H) break;                                  // below the panel
+        const TreeRow& row = rows[i];
+
+        if ((int)i == tv.hover)
+            rect(2.0f, top, W - 2.0f, top + kTreeRowH, 0.16f, 0.18f, 0.22f, 0.2f);
+        if (row.selected)
+            rect(2.0f, top, W - 2.0f, top + kTreeRowH, 0.15f, 0.40f, 0.24f, 0.25f);
+
+        float indent   = 8.0f + (float)row.depth * 14.0f;
+        float baseline = top + kTreeRowH * 0.72f;
+        if (row.isGroup) {
+            const char arrow[2] = {row.expanded ? '-' : '+', '\0'};
+            appendText(out, q, kTreeQuads, f, arrow, nx(indent), nyTop(baseline), grpH, arwCol,
+                       0.35f, xs);
+            indent += 14.0f;
+        }
+        const float* col = row.isGroup ? grpCol : leafCol;
+        appendText(out, q, kTreeQuads, f, row.label, nx(indent), nyTop(baseline),
+                   row.isGroup ? grpH : lblH, col, 0.35f, xs);
+    }
+
+    // Title bar on top (covers any row scrolled up under it).
+    rect(0, 0, W, kTreeTitleH, 0.11f, 0.12f, 0.15f, 0.6f);
+    rect(0, kTreeTitleH - 1.0f, W, kTreeTitleH, 0.03f, 0.03f, 0.04f, 0.62f);  // divider
+    const float titleCol[3] = {0.92f, 0.95f, 0.93f};
+    appendText(out, q, kTreeQuads, f, "Scene", nx(9.0f), nyTop(kTreeTitleH * 0.70f),
+               kTreeTextPx / H, titleCol, 0.75f, xs);
+
+    for (int i = q * 4; i < kTreeVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
 
 // --- Camera controls panel -------------------------------------------------
@@ -1170,7 +1420,7 @@ std::vector<Menu> defaultAppMenus() {
 
     std::vector<Menu> menus;
     menus.push_back({"File", {
-        act("Open...",    A::OpenFile),
+        act("Open...",    A::OpenFile, "Ctrl+O"),
         act("Screenshot", A::Screenshot, "C"),
         sep(),
         act("Quit",       A::Quit, "Esc"),
@@ -1208,11 +1458,35 @@ std::vector<Menu> defaultAppMenus() {
         act("Delete Selected",      A::DeleteSelected, "Del"),
         act("Unhide All",           A::UnhideAll, "H"),
     }});
-    menus.push_back({"Points", {
-        act("Mode: Clustering",  A::Mode0),
-        act("Mode: Morphology",  A::Mode1),
-        act("Mode: SDF Filter",  A::Mode2),
-        act("Mode: Reconstruct", A::Mode3),
+    // Geometry-processing operators, generated from the modes registry and grouped
+    // by category (Generate / Analyze / Filter) with separators between groups.
+    // Each mode i maps to MenuAction(Mode0 + i); adding a mode in modes.cpp makes
+    // it appear here automatically (up to the Mode0..Mode9 action range).
+    {
+        Menu geo{"Geometry", {}};
+        geo.items.push_back(act("Off", A::ModeOff));  // no active operator (default)
+        geo.items.push_back(sep());
+        modes::ModeCategory prev = modes::modeCategory(0);
+        bool first = true;
+        for (int i = 0; i < modes::modeCount() && i < 16; ++i) {
+            modes::ModeCategory cat = modes::modeCategory(i);
+            if (!first && cat != prev) geo.items.push_back(sep());
+            first = false;
+            prev = cat;
+            geo.items.push_back(act(modes::modeName(i), static_cast<A>(static_cast<int>(A::Mode0) + i)));
+        }
+        menus.push_back(std::move(geo));
+    }
+    menus.push_back({"Create", {
+        act("Plane",    A::CreatePlane),
+        act("Box",      A::CreateBox),
+        act("Sphere",   A::CreateSphere),
+        act("Cylinder", A::CreateCylinder),
+        act("Cone",     A::CreateCone),
+        act("Torus",    A::CreateTorus),
+        act("Disk",     A::CreateDisk),
+        act("Capsule",  A::CreateCapsule),
+        act("Arrow",    A::CreateArrow),
     }});
     menus.push_back({"Spatial", {
         chk("Off",           A::SpatialNone),
@@ -1342,6 +1616,35 @@ static bool pointInPolygon(const std::vector<float>& xs, const std::vector<float
             in = !in;
     }
     return in;
+}
+
+// Ensure the entity's pick BVH is ready to query. Small meshes build inline
+// (instant); a huge mesh builds on a background thread (so the click doesn't
+// freeze) and this returns false until it finishes -- callers fall back to the
+// coarse AABB meanwhile. Harvests a finished background build on a later call.
+static bool ensurePickBVH(entt::registry& world, entt::entity e, const PickGeometry& pg) {
+    auto& accel = world.get_or_emplace<PickBVH>(e);
+    if (accel.built) return true;
+    if (accel.job) {
+        if (!accel.job->done.load(std::memory_order_acquire)) return false;  // still building
+        accel.bvh   = std::move(accel.job->bvh);
+        accel.built = true;
+        accel.job.reset();
+        return true;
+    }
+    const size_t kInlineTris = 200000;  // build modest BVHs inline; background huge ones
+    if (pg.indices.size() <= kInlineTris * 3) {
+        accel.bvh.build(pg.positions, pg.indices);
+        accel.built = true;
+        return true;
+    }
+    auto job  = std::make_shared<PickBvhJob>();
+    accel.job = job;
+    std::thread([job, pos = pg.positions, idx = pg.indices]() {
+        job->bvh.build(pos, idx);
+        job->done.store(true, std::memory_order_release);
+    }).detach();
+    return false;
 }
 
 void pickingSystem(entt::registry& world, const core::Input& input,
@@ -1679,11 +1982,16 @@ void pickingSystem(entt::registry& world, const core::Input& input,
         float tLocal = 0.0f;
         bool hit = false;
         if (const PickGeometry* pg = world.try_get<PickGeometry>(e); pg && !pg->indices.empty()) {
-            // Accurate triangle pick accelerated by a lazily-built, cached BVH.
-            auto& accel = world.get_or_emplace<PickBVH>(e);
-            if (!accel.built) { accel.bvh.build(pg->positions, pg->indices); accel.built = true; }
-            float tl; int tri;
-            if (accel.bvh.nearestHit(geometry::Ray(lo, ld), tl, tri)) { tLocal = tl; hit = true; }
+            // Accurate triangle pick via a cached BVH (built off-thread for huge
+            // meshes; coarse AABB until it is ready, so the click never freezes).
+            if (ensurePickBVH(world, e, *pg)) {
+                float tl; int tri;
+                if (world.get<PickBVH>(e).bvh.nearestHit(geometry::Ray(lo, ld), tl, tri)) {
+                    tLocal = tl; hit = true;
+                }
+            } else {
+                hit = intersectAABB(lo, ld, r.boundsMin, r.boundsMax, tLocal);
+            }
         } else {
             hit = intersectAABB(lo, ld, r.boundsMin, r.boundsMax, tLocal);
         }
@@ -1747,10 +2055,9 @@ void pickingSystem(entt::registry& world, const core::Input& input,
         lo = lo.cwiseProduct(inv); ld = ld.cwiseProduct(inv);
         const size_t kNoFace = static_cast<size_t>(-1);
         size_t hitFace = kNoFace;
-        auto& accel = world.get_or_emplace<PickBVH>(best);
-        if (!accel.built) { accel.bvh.build(pg->positions, pg->indices); accel.built = true; }
+        if (!ensurePickBVH(world, best, *pg)) return;  // BVH still building -> skip this pick
         float tl; int tri;
-        if (accel.bvh.nearestHit(geometry::Ray(lo, ld), tl, tri))
+        if (world.get<PickBVH>(best).bvh.nearestHit(geometry::Ray(lo, ld), tl, tri))
             hitFace = static_cast<size_t>(tri) * 3;
         if (hitFace == kNoFace) return;
         if (sm.target == SelTarget::Face) {
@@ -1904,6 +2211,79 @@ void fpsWidgetInputSystem(entt::registry& world, core::Input& input, float dt,
     }
 }
 
+void treeViewInputSystem(entt::registry& world, core::Input& input, uint32_t viewportW,
+                         uint32_t viewportH) {
+    auto view = world.view<TreeView>();
+    for (auto e : view) {
+        auto& tv = view.get<TreeView>(e);
+        if (!tv.visible) continue;
+
+        float maxX = (float)viewportW - tv.w;
+        float maxY = (float)viewportH - tv.h;
+        tv.x = (int)clampf(tv.relX * viewportW, 0.0f, (std::max)(0.0f, maxX));
+        tv.y = (int)clampf(tv.relY * viewportH, 0.0f, (std::max)(0.0f, maxY));
+
+        std::vector<TreeRow> rows;
+        buildTreeRows(world, tv, rows);
+        float maxScroll = treeMaxScroll(tv, rows.size());
+        tv.scroll = clampf(tv.scroll, 0.0f, maxScroll);
+
+        float mx = input.mousePosX, my = input.mousePosY;
+        bool inside = mx >= tv.x && mx <= tv.x + tv.w && my >= tv.y && my <= tv.y + tv.h;
+        tv.hover = -1;
+        if (!inside && !tv.dragging) continue;
+        if (inside) input.captured = true;
+
+        // Scroll wheel over the panel scrolls the list (and is consumed so the
+        // camera doesn't zoom).
+        if (inside && input.wheel != 0.0f) {
+            tv.scroll = clampf(tv.scroll - input.wheel * kTreeRowH * 2.0f, 0.0f, maxScroll);
+            input.wheel = 0.0f;
+        }
+
+        float localY = my - tv.y;            // px from panel top
+        bool onTitle = inside && localY < kTreeTitleH;
+        int  hoveredRow = -1;
+        if (inside && localY >= kTreeTitleH) {
+            int idx = (int)((localY - kTreeTitleH + tv.scroll) / kTreeRowH);
+            if (idx >= 0 && idx < (int)rows.size()) hoveredRow = idx;
+        }
+        tv.hover = hoveredRow;
+
+        if (input.leftClicked && onTitle) {
+            tv.dragging = true;
+            tv.dragOffX = mx - tv.x;
+            tv.dragOffY = my - tv.y;
+        } else if (input.leftClicked && hoveredRow >= 0) {
+            const TreeRow& row = rows[hoveredRow];
+            if (row.isGroup) {
+                tv.expanded[row.group] = !tv.expanded[row.group];
+            } else if (row.entity != entt::null && world.valid(row.entity)) {
+                bool additive = input.ctrl;  // Ctrl-click adds/toggles, else replace
+                if (!additive) {
+                    auto rv = world.view<Renderable>();
+                    for (auto o : rv) rv.get<Renderable>(o).selected = false;
+                }
+                if (auto* rr = world.try_get<Renderable>(row.entity))
+                    rr->selected = additive ? !rr->selected : true;
+            }
+            input.captured = true;
+        }
+
+        if (tv.dragging) {
+            if (input.buttonLeft) {
+                tv.x = (int)clampf(mx - tv.dragOffX, 0.0f, (std::max)(0.0f, maxX));
+                tv.y = (int)clampf(my - tv.dragOffY, 0.0f, (std::max)(0.0f, maxY));
+                tv.relX = viewportW > 0 ? (float)tv.x / viewportW : 0.0f;
+                tv.relY = viewportH > 0 ? (float)tv.y / viewportH : 0.0f;
+                input.captured = true;
+            } else {
+                tv.dragging = false;
+            }
+        }
+    }
+}
+
 void cameraControlsInputSystem(entt::registry& world, core::Input& input, float dt,
                                uint32_t viewportW, uint32_t viewportH) {
     CameraControls* cc = nullptr;
@@ -2029,6 +2409,95 @@ void crossSectionInputSystem(entt::registry& world, core::Input& input,
         input.captured = true;
     }
     if (inPanel) input.captured = true;
+}
+
+// Build the wireframe vertices for a spatial structure over `P` (and `indices`
+// for the triangle BVH). Self-contained (no GPU, no registry) so it runs on a
+// worker thread; the caller uploads `outVerts` to the GPU. `progress` reports
+// completion in [0,1]. Extracted from renderSystem's SpatialViz pass.
+static void buildSpatialVizVerts(const std::vector<Eigen::Vector3f>& P,
+                                 const std::vector<uint32_t>& indices, int vizKind,
+                                 std::vector<render::Vertex>& outVerts, int& outBoxCount,
+                                 int& outDrawn, int& outTotal,
+                                 const std::function<void(float)>& progress) {
+    auto levelColor = [](int d) {
+        Eigen::Vector4f c = color::FromHSV(color::fract(d * 0.16f), 0.85f, 1.0f);
+        return Eigen::Vector3f(c.x(), c.y(), c.z());
+    };
+    const int kDepthTree = 18;  // BVH / Octree
+    const int kDepthKD   = 12;  // KD-tree
+    outVerts.clear();
+    outBoxCount = 0; outDrawn = 0; outTotal = (int)P.size();
+    if (P.empty()) return;
+    if (progress) progress(0.05f);
+
+    std::vector<geometry::AABB> boxes; std::vector<int> levels;
+    std::vector<Eigen::Vector3f> sphC; std::vector<float> sphR; std::vector<int> sphL;
+    geometry::AABB rb = geometry::robustBounds(P, 0.001f);
+    float md = (rb.max - rb.min).norm();
+    geometry::AABB full; for (const auto& p : P) full.expand(p);
+
+    if (vizKind == 1 && !indices.empty()) {
+        geometry::BVH b; b.build(P, indices); b.nodeBoxesDepth(boxes, levels, kDepthTree);
+    } else if (vizKind == 2) {
+        geometry::Octree o; o.build(P, 64); o.nodeBoxesDepth(boxes, levels, kDepthTree);
+    } else if (vizKind == 3) {
+        geometry::KDTree k; k.build(P); k.cellBoxesDepth(full, boxes, levels, kDepthKD);
+    } else if (vizKind == 4) {
+        geometry::UniformGrid g; g.build(P, (md > 1e-6f ? md : 1.0f) / 40.0f);
+        g.occupiedCellBoxes(boxes); levels.assign(boxes.size(), 0);
+    } else if (vizKind == 5) {
+        geometry::LooseOctree lo; lo.build(P, 64); lo.nodeBoxesDepth(boxes, levels, kDepthTree);
+    } else if (vizKind == 6) {
+        geometry::BSP bsp; bsp.build(P, 64); bsp.nodeBoxesDepth(boxes, levels, kDepthTree);
+    } else if (vizKind == 7) {
+        geometry::RTree rt; rt.build(P, 16); rt.nodeBoxesDepth(boxes, levels, kDepthTree);
+    } else if (vizKind == 8) {
+        geometry::BallTree bt; bt.build(P, 32); bt.nodeSpheresDepth(sphC, sphR, sphL, 7);
+    }
+    if (progress) progress(0.5f);
+    if (boxes.empty() && sphC.empty()) return;
+
+    float thick   = (md > 1e-6f ? md : 1.0f) * 0.0005f;
+    float maxDiag = (md > 1e-6f ? md : 1.0f) * 1.5f;  // cull only bigger-than-model cells
+    const size_t kCap = 60000;                         // box budget
+    debug::DebugDraw tmp;
+    std::vector<size_t> keep;
+    for (size_t i = 0; i < boxes.size(); ++i)
+        if ((boxes[i].max - boxes[i].min).norm() <= maxDiag) keep.push_back(i);
+    size_t stride = keep.size() > kCap ? (keep.size() + kCap - 1) / kCap : 1;
+    int drawn = 0;
+    for (size_t j = 0; j < keep.size(); j += stride) {
+        tmp.addWireBox(boxes[keep[j]].min, boxes[keep[j]].max, levelColor(levels[keep[j]]), thick);
+        ++drawn;
+        if (progress && (j % 4096 == 0) && !keep.empty())
+            progress(0.5f + 0.5f * (float)j / (float)keep.size());
+    }
+    std::vector<size_t> ks;
+    for (size_t i = 0; i < sphR.size(); ++i)
+        if (sphR[i] <= maxDiag) ks.push_back(i);
+    size_t ss = ks.size() > kCap ? (ks.size() + kCap - 1) / kCap : 1;
+    for (size_t j = 0; j < ks.size(); j += ss) {
+        tmp.addSphere(sphC[ks[j]], sphR[ks[j]], levelColor(sphL[ks[j]]), 8);
+        ++drawn;
+    }
+    outBoxCount = (int)(boxes.size() + sphC.size());
+    outDrawn    = drawn;
+    outVerts    = tmp.vertices();
+    if (progress) progress(1.0f);
+}
+
+bool spatialVizProgress(entt::registry& world, float& outProgress, std::string& outName) {
+    auto v = world.view<SpatialVizCache>();
+    for (auto e : v) {
+        const auto& c = v.get<SpatialVizCache>(e);
+        if (c.job && !c.job->done.load(std::memory_order_acquire)) {
+            outProgress = c.job->progress.load(std::memory_order_relaxed);
+            outName     = "Spatial";
+            return true;
+        }
+    }
+    return false;
 }
 
 void renderSystem(entt::registry& world, render::IRenderer& renderer,
@@ -2210,59 +2679,92 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     renderer.setDrawMode(kSolid);  // scene only: rest stays solid
 
     // --- Element selection highlights (vertex/edge/face) ---------------
-    // Emitted into the debug-draw accumulator in content space (T*R*S); the
-    // drawDebugGeometry call below applies Mworld, like the point-cloud box.
+    // Baked ONCE into a static, per-entity GPU mesh (local space) when the
+    // selection content changes, then drawn each frame with model = Mworld *
+    // Transform -- exactly like the spatial-viz overlay below. The old path
+    // rebuilt a camera-facing quad per selected vertex into the per-frame
+    // debug-draw mesh and re-uploaded the whole thing every frame, so a large
+    // (e.g. box) selection of tens of thousands of points tanked the FPS.
+    // Markers are now view-independent little cubes (visible from any angle),
+    // sized from the mesh bounds instead of in screen pixels.
     {
-        auto esv = world.view<Transform, ElementSelection, PickGeometry>();
-        auto& dd = debug::DebugDraw::instance();
+        auto esv = world.view<Transform, ElementSelection, PickGeometry, Renderable>();
         const Eigen::Vector3f hl(0.15f, 1.0f, 0.25f);  // bright lime, pops on pink/white
 
-        // Vertex markers are camera-facing quads sized a few times the point-sprite
-        // pixel size, so a selected point reads clearly over the dot it covers.
-        // Debug geometry is emitted in content space (Mworld applied later), so the
-        // camera right/up axes are pulled back through Mworld^-1.
-        float px = 6.0f;
-        if (world.ctx().contains<PointSizeState>()) px = world.ctx().get<PointSizeState>().size;
-        px *= 2.5f;  // markers a bit larger than the points so they stand out
-        const bool  ortho = primaryCam && primaryCam->mode == ProjectionMode::Orthographic;
-        const float fovY  = primaryCam ? primaryCam->fovYDegrees : 60.0f;
-        const float Hpx   = static_cast<float>(viewportH > 0 ? viewportH : 1);
-        const float kPersp = 2.0f * std::tan(fovY * 3.14159265f / 180.0f * 0.5f) / Hpx * px;
-        const float kOrtho = primaryCam ? 2.0f * primaryCam->orthoSize / Hpx * px : 0.01f;
-        const Eigen::Quaternionf wq    = worldUpQuat(worldZUp(world));
-        const Eigen::Quaternionf wqInv = math::conjugate(wq);
-        const Eigen::Vector3f cr = math::rotate(wqInv, math::rotate(camOrient, Eigen::Vector3f(1, 0, 0)));
-        const Eigen::Vector3f cu = math::rotate(wqInv, math::rotate(camOrient, Eigen::Vector3f(0, 1, 0)));
-
         for (auto e : esv) {
-            const auto& t  = esv.get<Transform>(e);
             const auto& es = esv.get<ElementSelection>(e);
             const auto& pg = esv.get<PickGeometry>(e);
-            Eigen::Matrix4f m = t.matrix();
-            auto wp = [&](const Eigen::Vector3f& p) {
-                Eigen::Vector4f w = m * Eigen::Vector4f(p.x(), p.y(), p.z(), 1.0f);
-                return Eigen::Vector3f(w.x(), w.y(), w.z());
-            };
-            auto marker = [&](const Eigen::Vector3f& cp) {
-                // Half-size in content units that projects to ~px/2 pixels.
-                Eigen::Vector3f wpos = math::rotate(wq, cp);  // Mworld is pure rotation
-                float dist = (wpos - camPos).norm();
-                float half = 0.5f * (ortho ? kOrtho : kPersp * dist);
-                dd.addQuad(cp - (cr + cu) * half, cp + (cr - cu) * half,
-                           cp + (cr + cu) * half, cp + (cu - cr) * half, hl);
-            };
-            for (uint32_t vi : es.vertices)
-                if (vi < pg.positions.size()) marker(wp(pg.positions[vi]));
-            for (const auto& ed : es.edges)
-                if (ed.a < pg.positions.size() && ed.b < pg.positions.size())
-                    dd.addLine(wp(pg.positions[ed.a]), wp(pg.positions[ed.b]), hl,
-                               (ortho ? kOrtho : kPersp * camDist) * 0.3f);
-            for (uint32_t fi : es.faces) {
-                size_t i = static_cast<size_t>(fi) * 3;
-                if (i + 2 < pg.indices.size())
-                    dd.addTriangle(wp(pg.positions[pg.indices[i]]),
-                                   wp(pg.positions[pg.indices[i + 1]]),
-                                   wp(pg.positions[pg.indices[i + 2]]), hl);
+
+            // Cheap content signature: rebuild only when the selection changes.
+            uint64_t sig = 1469598103934665603ull;  // FNV-1a over the index sets
+            auto mix = [&](uint64_t x) { sig ^= x; sig *= 1099511628211ull; };
+            mix(es.vertices.size()); mix(es.faces.size()); mix(es.edges.size());
+            for (uint32_t v : es.vertices)        mix(v);
+            for (uint32_t f : es.faces)           mix(f);
+            for (const auto& ed : es.edges) { mix(ed.a); mix(ed.b); }
+
+            auto& cache = world.get_or_emplace<ElementSelCache>(e);
+            if (!cache.built || cache.sig != sig) {
+                if (cache.mesh != render::kInvalidMesh) renderer.destroyMesh(cache.mesh);
+                if (cache.vbo  != render::kInvalidBuffer) renderer.destroyBuffer(cache.vbo);
+                cache.mesh = render::kInvalidMesh; cache.vbo = render::kInvalidBuffer;
+                cache.vertexCount = 0; cache.sig = sig; cache.built = true;
+
+                const auto& r = esv.get<Renderable>(e);
+                float diag = (r.boundsMax - r.boundsMin).norm();
+                if (diag < 1e-6f) diag = 1.0f;
+                const float half  = diag * 0.004f;   // vertex-cube half size
+                const float thick = diag * 0.0015f;  // edge-tube thickness
+                const Eigen::Vector3f h(half, half, half);
+
+                debug::DebugDraw tmp;  // local accumulator (not the per-frame one)
+                // Cube markers dominate the vertex count; stride-sample to a budget
+                // so a pathological selection can't blow the static mesh up.
+                const size_t kCap = 80000;
+                size_t stride = es.vertices.size() > kCap
+                                    ? (es.vertices.size() + kCap - 1) / kCap : 1;
+                for (size_t j = 0; j < es.vertices.size(); j += stride) {
+                    uint32_t vi = es.vertices[j];
+                    if (vi < pg.positions.size())
+                        tmp.addBox(pg.positions[vi] - h, pg.positions[vi] + h, hl);
+                }
+                for (const auto& ed : es.edges)
+                    if (ed.a < pg.positions.size() && ed.b < pg.positions.size())
+                        tmp.addLine(pg.positions[ed.a], pg.positions[ed.b], hl, thick);
+                for (uint32_t fi : es.faces) {
+                    size_t i = static_cast<size_t>(fi) * 3;
+                    if (i + 2 < pg.indices.size())
+                        tmp.addTriangle(pg.positions[pg.indices[i]],
+                                        pg.positions[pg.indices[i + 1]],
+                                        pg.positions[pg.indices[i + 2]], hl);
+                }
+
+                const auto& verts = tmp.vertices();
+                if (!verts.empty()) {
+                    render::BufferDesc bd;
+                    bd.type  = render::BufferType::Vertex;
+                    bd.usage = render::BufferUsage::Static;
+                    bd.data  = verts.data();
+                    bd.size  = verts.size() * sizeof(render::Vertex);
+                    cache.vbo = renderer.createBuffer(bd);
+                    render::MeshDesc md;
+                    md.vertexBuffer = cache.vbo;
+                    md.layout       = render::Vertex::layout();
+                    md.vertexCount  = static_cast<uint32_t>(verts.size());
+                    md.topology     = render::PrimitiveTopology::Triangles;
+                    cache.mesh = renderer.createMesh(md);
+                    cache.vertexCount = static_cast<uint32_t>(verts.size());
+                }
+            }
+
+            if (cache.mesh != render::kInvalidMesh) {
+                renderer.setDrawMode(kSolid);
+                const auto& t = esv.get<Transform>(e);
+                Eigen::Matrix4f model = Mworld * t.matrix();
+                render::DrawItem item;
+                item.mesh = cache.mesh;
+                std::memcpy(item.model, model.data(), sizeof(item.model));
+                renderer.submit(item);
             }
         }
     }
@@ -2276,14 +2778,6 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         int vizKind = 0;
         if (world.ctx().contains<SpatialViz>()) vizKind = world.ctx().get<SpatialViz>().kind;
         if (vizKind > 0) {
-            // BVH/Octree box count is bounded by node count, so go deep; a k-d tree
-            // has one node per point (2^depth cells), so cap it shallower.
-            const int kDepthTree = 18;   // BVH / Octree
-            const int kDepthKD   = 12;   // KD-tree
-            auto levelColor = [](int d) {
-                Eigen::Vector4f c = color::FromHSV(color::fract(d * 0.16f), 0.85f, 1.0f);
-                return Eigen::Vector3f(c.x(), c.y(), c.z());
-            };
             auto sv = world.view<Transform, Renderable, PickGeometry>();
             for (auto e : sv) {
                 const auto& r = sv.get<Renderable>(e);
@@ -2292,96 +2786,52 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
                 if (pg.positions.empty()) continue;
                 auto& cache = world.get_or_emplace<SpatialVizCache>(e);
 
-                if (cache.kind != vizKind) {  // (re)build the static wireframe mesh
+                // Launch a BACKGROUND build when the wanted kind is neither shown nor
+                // already being produced, so the render thread never blocks on a
+                // million-point structure build. The old mesh keeps drawing until the
+                // new one is ready (no flicker).
+                if (vizKind != cache.kind && vizKind != cache.pendingKind) {
+                    cache.pendingKind = vizKind;
+                    auto job  = std::make_shared<SpatialVizJob>();
+                    job->kind = vizKind;
+                    cache.job = job;
+                    std::thread([job, P = pg.positions, idx = pg.indices, vizKind]() {
+                        buildSpatialVizVerts(
+                            P, idx, vizKind, job->verts, job->boxCount, job->drawn, job->total,
+                            [job](float f) { job->progress.store(f, std::memory_order_relaxed); });
+                        job->done.store(true, std::memory_order_release);
+                    }).detach();
+                }
+
+                // Harvest a finished build: upload its vertices to the GPU here on the
+                // main (render) thread, then swap it in.
+                if (cache.job && cache.job->done.load(std::memory_order_acquire)) {
                     if (cache.mesh != render::kInvalidMesh) renderer.destroyMesh(cache.mesh);
                     if (cache.vbo != render::kInvalidBuffer) renderer.destroyBuffer(cache.vbo);
                     cache.mesh = render::kInvalidMesh; cache.vbo = render::kInvalidBuffer;
-                    cache.vertexCount = 0; cache.kind = vizKind;
-
-                    std::vector<geometry::AABB> boxes; std::vector<int> levels;
-                    // Ball tree visualizes spheres instead of boxes.
-                    std::vector<Eigen::Vector3f> sphC; std::vector<float> sphR; std::vector<int> sphL;
-
-                    // Build on ALL points so the whole model is covered. Robust bounds
-                    // are used only to size the line thickness and to cull a handful of
-                    // oversized cells (outlier points blow a few cells up to span the
-                    // scene); they do NOT filter the points fed to the structure.
-                    const std::vector<Eigen::Vector3f>& P = pg.positions;
-                    geometry::AABB rb = geometry::robustBounds(P, 0.001f);  // only extreme strays
-                    float md = (rb.max - rb.min).norm();
-                    geometry::AABB full; for (const auto& p : P) full.expand(p);
-
-                    if (vizKind == 1 && !pg.indices.empty()) {
-                        geometry::BVH b; b.build(P, pg.indices);
-                        b.nodeBoxesDepth(boxes, levels, kDepthTree);
-                    } else if (vizKind == 2) {
-                        geometry::Octree o; o.build(P, 64);
-                        o.nodeBoxesDepth(boxes, levels, kDepthTree);
-                    } else if (vizKind == 3) {
-                        geometry::KDTree k; k.build(P);
-                        k.cellBoxesDepth(full, boxes, levels, kDepthKD);
-                    } else if (vizKind == 4) {
-                        geometry::UniformGrid g; g.build(P, (md > 1e-6f ? md : 1.0f) / 40.0f);
-                        g.occupiedCellBoxes(boxes); levels.assign(boxes.size(), 0);
-                    } else if (vizKind == 5) {
-                        geometry::LooseOctree lo; lo.build(P, 64);
-                        lo.nodeBoxesDepth(boxes, levels, kDepthTree);
-                    } else if (vizKind == 6) {
-                        geometry::BSP bsp; bsp.build(P, 64);
-                        bsp.nodeBoxesDepth(boxes, levels, kDepthTree);
-                    } else if (vizKind == 7) {
-                        geometry::RTree rt; rt.build(P, 16);
-                        rt.nodeBoxesDepth(boxes, levels, kDepthTree);
-                    } else if (vizKind == 8) {
-                        geometry::BallTree bt; bt.build(P, 32);
-                        bt.nodeSpheresDepth(sphC, sphR, sphL, 7);  // spheres get heavy -> shallow
+                    cache.vertexCount = 0;
+                    const auto& verts = cache.job->verts;
+                    if (!verts.empty()) {
+                        render::BufferDesc bd;
+                        bd.type  = render::BufferType::Vertex;
+                        bd.usage = render::BufferUsage::Static;
+                        bd.data  = verts.data();
+                        bd.size  = verts.size() * sizeof(render::Vertex);
+                        cache.vbo = renderer.createBuffer(bd);
+                        render::MeshDesc md2;
+                        md2.vertexBuffer = cache.vbo;
+                        md2.layout       = render::Vertex::layout();
+                        md2.vertexCount  = static_cast<uint32_t>(verts.size());
+                        md2.topology     = render::PrimitiveTopology::Triangles;
+                        cache.mesh = renderer.createMesh(md2);
+                        cache.vertexCount = static_cast<uint32_t>(verts.size());
                     }
-
-                    if (!boxes.empty() || !sphC.empty()) {
-                        float thick = (md > 1e-6f ? md : 1.0f) * 0.0005f;
-                        float maxDiag = (md > 1e-6f ? md : 1.0f) * 1.5f;  // cull only bigger-than-model cells
-                        const size_t kCap = 60000;                        // box budget
-                        debug::DebugDraw tmp;  // local accumulator (not the frame one)
-                        // Cull oversized boxes, then stride-sample to the budget.
-                        std::vector<size_t> keep;
-                        for (size_t i = 0; i < boxes.size(); ++i)
-                            if ((boxes[i].max - boxes[i].min).norm() <= maxDiag) keep.push_back(i);
-                        size_t stride = keep.size() > kCap ? (keep.size() + kCap - 1) / kCap : 1;
-                        int drawn = 0;
-                        for (size_t j = 0; j < keep.size(); j += stride) {
-                            size_t i = keep[j];
-                            tmp.addWireBox(boxes[i].min, boxes[i].max, levelColor(levels[i]), thick);
-                            ++drawn;
-                        }
-                        std::vector<size_t> ks;
-                        for (size_t i = 0; i < sphR.size(); ++i)
-                            if (sphR[i] <= maxDiag) ks.push_back(i);
-                        size_t ss = ks.size() > kCap ? (ks.size() + kCap - 1) / kCap : 1;
-                        for (size_t j = 0; j < ks.size(); j += ss) {
-                            size_t i = ks[j];
-                            tmp.addSphere(sphC[i], sphR[i], levelColor(sphL[i]), 8);
-                            ++drawn;
-                        }
-                        cache.boxCount = static_cast<int>(boxes.size() + sphC.size());
-                        cache.inliers  = drawn;
-                        cache.total    = static_cast<int>(P.size());
-                        const auto& verts = tmp.vertices();
-                        if (!verts.empty()) {
-                            render::BufferDesc bd;
-                            bd.type = render::BufferType::Vertex;
-                            bd.usage = render::BufferUsage::Static;
-                            bd.data = verts.data();
-                            bd.size = verts.size() * sizeof(render::Vertex);
-                            cache.vbo = renderer.createBuffer(bd);
-                            render::MeshDesc md2;
-                            md2.vertexBuffer = cache.vbo;
-                            md2.layout = render::Vertex::layout();
-                            md2.vertexCount = static_cast<uint32_t>(verts.size());
-                            md2.topology = render::PrimitiveTopology::Triangles;
-                            cache.mesh = renderer.createMesh(md2);
-                            cache.vertexCount = static_cast<uint32_t>(verts.size());
-                        }
-                    }
+                    cache.kind        = cache.job->kind;
+                    cache.boxCount    = cache.job->boxCount;
+                    cache.inliers     = cache.job->drawn;
+                    cache.total       = cache.job->total;
+                    cache.pendingKind = -1;
+                    cache.job.reset();
                 }
 
                 if (cache.mesh != render::kInvalidMesh) {
@@ -2560,6 +3010,37 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::DrawItem item;
         item.mesh    = wgt.mesh;
         item.texture = wgt.atlas;  // glyph atlas (white cell backs the solid parts)
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
+        std::memcpy(item.model, model.data(), sizeof(item.model));
+        renderer.submit(item);
+        break;
+    }
+
+    // --- Tree-view (scene outliner) overlay ---------------------------
+    auto tvv = world.view<TreeView>();
+    for (auto entity : tvv) {
+        auto& tv = tvv.get<TreeView>(entity);
+        if (!tv.visible || tv.mesh == render::kInvalidMesh || tv.vbo == render::kInvalidBuffer)
+            break;
+
+        std::vector<TreeRow> rows;
+        buildTreeRows(world, tv, rows);
+        render::Vertex verts[kTreeVerts];
+        buildTreeGeometry(tv, rows, verts);
+        renderer.updateBuffer(tv.vbo, verts, sizeof(verts));
+
+        render::OverlayContext ov;
+        ov.x = tv.x; ov.y = tv.y; ov.width = tv.w; ov.height = tv.h;
+        ov.clearDepth = true;
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+        std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+        renderer.beginOverlay(ov);
+
+        render::DrawItem item;
+        item.mesh    = tv.mesh;
+        item.texture = tv.atlas;
         Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);

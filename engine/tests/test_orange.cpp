@@ -16,13 +16,21 @@
 
 #include <Eigen/Core>
 
+#include <Eigen/Geometry>
+#include <entt/entt.hpp>
+
 #include "orange/core/color.h"
 #include "orange/core/debug_draw.h"
 #include "orange/core/geometry.h"
 #include "orange/core/modes.h"
 #include "orange/core/morton3d.h"
+#include "orange/core/normals.h"
+#include "orange/core/point_ops.h"
+#include "orange/core/primitives.h"
 #include "orange/core/serialization.h"
 #include "orange/core/sparse_grid.h"
+#include "orange/core/ui_layout.h"
+#include "orange/ecs/components.h"
 
 // --- tiny test harness ------------------------------------------------------
 static int g_total = 0;
@@ -166,13 +174,20 @@ static void test_modes() {
 
     auto& dd = orange::debug::DebugDraw::instance();
     bool anyEmitted = false;
+    int  progressCalls = 0;
+    bool progressInRange = true;
     for (int i = 0; i < orange::modes::modeCount(); ++i) {
         dd.clear();
-        orange::modes::runMode(i, in, dd);
+        orange::modes::runMode(i, in, dd, [&](float f) {
+            ++progressCalls;
+            if (f < 0.0f || f > 1.0001f) progressInRange = false;
+        });
         if (!dd.empty()) anyEmitted = true;
     }
     dd.clear();
     CHECK(anyEmitted);
+    CHECK(progressCalls > 0);     // modes report progress through the callback
+    CHECK(progressInRange);       // always within [0,1]
 }
 
 // --- mesh IO roundtrip ------------------------------------------------------
@@ -198,6 +213,86 @@ static void test_io() {
     std::remove(path.c_str());
 }
 
+// --- geometry processing: primitives / normals / smoothing / ICP ------------
+static void test_processing() {
+    std::printf("[processing]\n");
+
+    // Primitives: non-empty, finite, with unit-ish extent around the origin.
+    auto box = orange::geometry::buildBox(Eigen::Vector3f(1, 1, 1), Eigen::Vector3f(1, 1, 1));
+    CHECK(box.size() == 12);  // 6 faces * 2 tris
+    auto sphere = orange::geometry::buildSphere(0.5f, 16, Eigen::Vector3f(1, 1, 1));
+    CHECK(!sphere.empty());
+    bool finite = true;
+    for (const auto& t : sphere)
+        for (int k = 0; k < 3; ++k)
+            finite = finite && t.v[k].allFinite() && t.n[k].allFinite() &&
+                     std::abs(t.n[k].norm() - 1.0f) < 1e-3f;  // sphere normals unit
+    CHECK(finite);
+
+    // An asymmetric slab cloud (recoverable rotation) for normals/smooth/ICP.
+    std::vector<Eigen::Vector3f> cloud;
+    for (int x = 0; x < 8; ++x)
+        for (int y = 0; y < 4; ++y)
+            for (int z = 0; z < 2; ++z)
+                cloud.emplace_back((float)x, (float)y, (float)z);
+
+    auto nrm = orange::geometry::estimateNormals(cloud, 12);
+    CHECK(nrm.size() == cloud.size());
+
+    // Smoothing preserves the count and stays finite/bounded.
+    auto sm = orange::geometry::smoothPoints(cloud, 4, 0.5f, true, 10);
+    CHECK(sm.size() == cloud.size());
+    bool smOk = true;
+    for (const auto& p : sm) smOk = smOk && p.allFinite();
+    CHECK(smOk);
+
+    // ICP recovers a known rigid transform: build src = R*dst + t, then align.
+    Eigen::AngleAxisf R(0.15f, Eigen::Vector3f::UnitY());
+    Eigen::Vector3f t(0.4f, -0.3f, 0.2f);
+    std::vector<Eigen::Vector3f> src(cloud.size());
+    for (size_t i = 0; i < cloud.size(); ++i) src[i] = R * cloud[i] + t;
+    float rmse = 1e9f; int iters = 0;
+    Eigen::Matrix4f T = orange::geometry::icpAlign(src, cloud, 60, rmse, iters);
+    CHECK(rmse < 0.05f);   // converged to near-zero correspondence error
+    CHECK(iters >= 1);
+    CHECK(T.allFinite());
+}
+
+// --- widget layout persistence ---------------------------------------------
+static void test_ui_layout() {
+    std::printf("[ui_layout]\n");
+    const std::string path = "orange_ui_layout_test.txt";
+    {
+        entt::registry w;
+        auto e1 = w.create();
+        orange::ecs::FpsWidget fps;
+        fps.relX = 0.123f; fps.relY = 0.456f;
+        w.emplace<orange::ecs::FpsWidget>(e1, fps);
+        auto e2 = w.create();
+        orange::ecs::TreeView tv;
+        tv.relX = 0.777f; tv.relY = 0.222f; tv.expanded[0] = false; tv.expanded[1] = true;
+        w.emplace<orange::ecs::TreeView>(e2, tv);
+        orange::core::saveWidgetLayout(w, path);
+    }
+    {
+        entt::registry w;
+        auto e1 = w.create();
+        w.emplace<orange::ecs::FpsWidget>(e1);   // defaults
+        auto e2 = w.create();
+        w.emplace<orange::ecs::TreeView>(e2);
+        orange::core::loadWidgetLayout(w, path);
+        const auto& fps = w.get<orange::ecs::FpsWidget>(e1);
+        CHECK(std::fabs(fps.relX - 0.123f) < 1e-4f);
+        CHECK(std::fabs(fps.relY - 0.456f) < 1e-4f);
+        const auto& tv = w.get<orange::ecs::TreeView>(e2);
+        CHECK(std::fabs(tv.relX - 0.777f) < 1e-4f);
+        CHECK(std::fabs(tv.relY - 0.222f) < 1e-4f);
+        CHECK(tv.expanded[0] == false);
+        CHECK(tv.expanded[1] == true);
+    }
+    std::remove(path.c_str());
+}
+
 int main() {
     std::printf("Orange unit tests\n");
     test_geometry();
@@ -205,6 +300,8 @@ int main() {
     test_color();
     test_sparse_grid();
     test_modes();
+    test_processing();
+    test_ui_layout();
     test_io();
     std::printf("\n%d checks, %d failed\n", g_total, g_fail);
     return g_fail == 0 ? 0 : 1;
