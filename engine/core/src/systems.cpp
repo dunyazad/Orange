@@ -1009,6 +1009,147 @@ void buildCrossSectionGeometry(const CrossSection& cs, render::Vertex* out) {
     for (int i = q * 4; i < kCsVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
 
+// --- Poisson reconstruction dialog -----------------------------------------
+constexpr int kPoissonQuads = 256;
+constexpr int kPoissonVerts = kPoissonQuads * 4;
+
+// Per-slider metadata shared by the builder and the input system.
+struct PSliderSpec { const char* label; float vmin, vmax; bool isInt; };
+constexpr PSliderSpec kPSliders[4] = {
+    {"Depth",      4.0f, 14.0f, true},   // 2^depth grid; dense, so ~9-10 is the RAM ceiling
+    {"Iterations", 4.0f, 80.0f, true},   // Gauss-Seidel passes
+    {"Scale",      1.0f, 2.0f,  false},  // bounds padding
+    {"Pt Weight",  0.0f, 16.0f, false},  // screening strength
+};
+
+float poissonSliderValue(const PoissonDialog& d, int i) {
+    switch (i) {
+        case 0:  return (float)d.depth;
+        case 1:  return (float)d.iterations;
+        case 2:  return d.scale;
+        default: return d.pointWeight;
+    }
+}
+void poissonSetSliderValue(PoissonDialog& d, int i, float v) {
+    switch (i) {
+        case 0:  d.depth       = (int)std::lround(v); break;
+        case 1:  d.iterations  = (int)std::lround(v); break;
+        case 2:  d.scale       = v; break;
+        default: d.pointWeight = v; break;
+    }
+}
+
+struct PoissonRects { CRect track[4]; CRect run; CRect close; };
+PoissonRects poissonRects(const PoissonDialog& d) {
+    PoissonRects r;
+    const float pad = 16.0f;
+    for (int i = 0; i < 4; ++i) {
+        float rowTop = d.y + 42.0f + i * 36.0f;
+        r.track[i] = {d.x + pad, rowTop + 22.0f, d.w - 2 * pad, 6.0f};
+    }
+    r.run   = {d.x + pad, (float)(d.y + d.h) - 38.0f, d.w - 2 * pad, 28.0f};
+    r.close = {(float)(d.x + d.w) - 24.0f, (float)d.y + 7.0f, 16.0f, 16.0f};
+    return r;
+}
+float poissonHandleX(const PSliderSpec& s, float val, const CRect& track) {
+    float t = s.vmax > s.vmin ? (val - s.vmin) / (s.vmax - s.vmin) : 0.5f;
+    return track.x + clampf(t, 0.0f, 1.0f) * track.w;
+}
+
+// Builds the Poisson dialog: background, title + close, four labeled sliders
+// (groove + filled + handle + value readout) and a "Reconstruct" button.
+void buildPoissonDialogGeometry(const PoissonDialog& d, render::Vertex* out) {
+    const core::Font& f = *d.font;
+    int q = 0;
+    const float wu = f.whiteU, wv = f.whiteV;
+    auto quad = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                    float u0, float v0, float u1, float v1, float z) {
+        if (q >= kPoissonQuads) return;
+        out[q * 4 + 0] = {{x0, y0, z}, {r, g, b}, {u0, v1}};
+        out[q * 4 + 1] = {{x1, y0, z}, {r, g, b}, {u1, v1}};
+        out[q * 4 + 2] = {{x1, y1, z}, {r, g, b}, {u1, v0}};
+        out[q * 4 + 3] = {{x0, y1, z}, {r, g, b}, {u0, v0}};
+        ++q;
+    };
+    auto solid = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                     float z) { quad(x0, y0, x1, y1, r, g, b, wu, wv, wu, wv, z); };
+    const float xs = static_cast<float>(d.h) / static_cast<float>(d.w);  // aspect fix
+    auto text = [&](const char* s, float penX, float baseY, float h, float r, float g,
+                    float b, float z) {
+        for (; *s; ++s) {
+            const core::Glyph& gl = f.glyph(*s);
+            if (gl.w > 0 && gl.h > 0) {
+                float x0 = penX + gl.xoff * h * xs, y1 = baseY - gl.yoff * h;
+                float x1 = x0 + gl.w * h * xs, y0 = y1 - gl.h * h;
+                quad(x0, y0, x1, y1, r, g, b, gl.u0, gl.v0, gl.u1, gl.v1, z);
+            }
+            penX += gl.advance * h * xs;
+        }
+    };
+    auto textW = [&](const char* s, float h) { return f.textWidth(s, h) * xs; };
+    auto toN = [&](const CRect& rr, float& x0, float& y0, float& x1, float& y1) {
+        x0 = (rr.x - d.x) / d.w;            x1 = (rr.x + rr.w - d.x) / d.w;
+        y1 = 1.0f - (rr.y - d.y) / d.h;     y0 = 1.0f - (rr.y + rr.h - d.y) / d.h;
+    };
+
+    solid(0, 0, 1, 1, 0.10f, 0.11f, 0.13f, 0.0f);                       // panel background
+    solid(0, 1.0f - 28.0f / d.h, 1, 1, 0.16f, 0.18f, 0.22f, 0.05f);     // title bar
+
+    PoissonRects R = poissonRects(d);
+    float x0, y0, x1, y1;
+
+    // Title. Match the cross-section panel's 20px title.
+    float th = 20.0f / d.h;
+    text("Poisson Reconstruction", 12.0f / d.w, 1.0f - 7.0f / d.h - th, th,
+         0.88f, 0.90f, 0.94f, 0.6f);
+
+    // Close button (x).
+    toN(R.close, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.34f, 0.20f, 0.22f, 0.5f);
+    float ch = (y1 - y0) * 0.7f;
+    text("x", (x0 + x1) * 0.5f - textW("x", ch) * 0.5f, (y0 + y1) * 0.5f - ch * 0.35f, ch,
+         0.92f, 0.86f, 0.86f, 0.6f);
+
+    // Sliders.
+    char buf[32];
+    for (int i = 0; i < 4; ++i) {
+        const PSliderSpec& s = kPSliders[i];
+        const CRect& trk = R.track[i];
+        float val = poissonSliderValue(d, i);
+
+        // Label (left) at the row top, above the groove. 17px (panel default).
+        float lh = 17.0f / d.h;
+        float labelY = 1.0f - (trk.y - 18.0f - d.y) / d.h;
+        text(s.label, (trk.x - d.x) / d.w, labelY, lh, 0.80f, 0.84f, 0.90f, 0.6f);
+
+        // Value (right).
+        if (s.isInt) std::snprintf(buf, sizeof(buf), "%d", (int)std::lround(val));
+        else         std::snprintf(buf, sizeof(buf), "%.2f", val);
+        text(buf, (trk.x + trk.w - d.x) / d.w - textW(buf, lh), labelY, lh,
+             0.70f, 0.85f, 1.0f, 0.6f);
+
+        // Groove + filled + handle.
+        float hx = poissonHandleX(s, val, trk);
+        toN(trk, x0, y0, x1, y1);
+        solid(x0, y0, x1, y1, 0.20f, 0.21f, 0.25f, 0.3f);              // groove
+        float hxn = (hx - d.x) / d.w;
+        solid(x0, y0, hxn, y1, 0.30f, 0.55f, 0.95f, 0.35f);           // filled
+        float hw = 5.0f / d.w;
+        float hy0 = 1.0f - (trk.y + trk.h * 0.5f + 9.0f - d.y) / d.h;
+        float hy1 = 1.0f - (trk.y + trk.h * 0.5f - 9.0f - d.y) / d.h;
+        solid(hxn - hw, hy0, hxn + hw, hy1, 0.95f, 0.95f, 0.95f, 0.5f);  // handle
+    }
+
+    // Reconstruct button.
+    toN(R.run, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.20f, 0.42f, 0.30f, 0.3f);
+    float bh = (y1 - y0) * 0.62f;
+    text("Reconstruct", (x0 + x1) * 0.5f - textW("Reconstruct", bh) * 0.5f,
+         (y0 + y1) * 0.5f - bh * 0.35f, bh, 0.90f, 0.96f, 0.92f, 0.6f);
+
+    for (int i = q * 4; i < kPoissonVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
+}
+
 // --- Top menu bar ----------------------------------------------------------
 constexpr int   kMenuQuads = 1024;          // must match kMenuQ in main.cpp
 constexpr int   kMenuVerts = kMenuQuads * 4;
@@ -1475,6 +1616,8 @@ std::vector<Menu> defaultAppMenus() {
             prev = cat;
             geo.items.push_back(act(modes::modeName(i), static_cast<A>(static_cast<int>(A::Mode0) + i)));
         }
+        geo.items.push_back(sep());
+        geo.items.push_back(act("Poisson Reconstruction...", A::PoissonDialogToggle));
         menus.push_back(std::move(geo));
     }
     menus.push_back({"Create", {
@@ -1627,25 +1770,35 @@ static bool ensurePickBVH(entt::registry& world, entt::entity e, const PickGeome
     if (accel.built) return true;
     if (accel.job) {
         if (!accel.job->done.load(std::memory_order_acquire)) return false;  // still building
+        // Take ownership of the worker's stable geometry + tree, then bind the BVH
+        // to our heap-held copies (whose addresses survive component relocation).
+        accel.pos = accel.job->pos;
+        accel.idx = accel.job->idx;
         accel.bvh = std::move(accel.job->bvh);
-        // The worker built against a copy of the points; re-point the BVH at the
-        // entity's stable PickGeometry arrays (same contents) so its referenced
-        // spans don't dangle once the worker's copy is freed.
-        accel.bvh.rebind(pg.positions, pg.indices);
+        accel.bvh.rebind(*accel.pos, *accel.idx);
         accel.built = true;
         accel.job.reset();
         return true;
     }
+    // Own a stable-address copy of the geometry: the BVH references THIS (heap
+    // vectors), never the entity's PickGeometry (which EnTT moves on entity erase).
+    auto pos = std::make_shared<std::vector<Eigen::Vector3f>>(pg.positions);
+    auto idx = std::make_shared<std::vector<uint32_t>>(pg.indices);
+
     const size_t kInlineTris = 200000;  // build modest BVHs inline; background huge ones
     if (pg.indices.size() <= kInlineTris * 3) {
-        accel.bvh.build(pg.positions, pg.indices);
+        accel.pos = std::move(pos);
+        accel.idx = std::move(idx);
+        accel.bvh.build(*accel.pos, *accel.idx);
         accel.built = true;
         return true;
     }
     auto job  = std::make_shared<PickBvhJob>();
+    job->pos  = std::move(pos);
+    job->idx  = std::move(idx);
     accel.job = job;
-    std::thread([job, pos = pg.positions, idx = pg.indices]() {
-        job->bvh.build(pos, idx);
+    std::thread([job]() {
+        job->bvh.build(*job->pos, *job->idx);
         job->done.store(true, std::memory_order_release);
     }).detach();
     return false;
@@ -2415,6 +2568,80 @@ void crossSectionInputSystem(entt::registry& world, core::Input& input,
     if (inPanel) input.captured = true;
 }
 
+void poissonDialogInputSystem(entt::registry& world, core::Input& input,
+                              uint32_t viewportW, uint32_t viewportH) {
+    PoissonDialog* d = nullptr;
+    auto view = world.view<PoissonDialog>();
+    for (auto e : view) { d = &view.get<PoissonDialog>(e); break; }
+    if (!d || !d->visible) { if (d) { d->dragSlider = -1; d->dragging = false; } return; }
+
+    // Center once on first show; thereafter the title bar moves it.
+    if (!d->placed) {
+        d->x = (static_cast<int>(viewportW) - d->w) / 2;
+        d->y = (static_cast<int>(viewportH) - d->h) / 2;
+        d->placed = true;
+    }
+
+    float mx = input.mousePosX, my = input.mousePosY;
+    auto  hit = [&](const CRect& r) {
+        return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
+    };
+    PoissonRects R = poissonRects(*d);
+    bool inPanel = mx >= d->x && mx <= d->x + d->w && my >= d->y && my <= d->y + d->h;
+
+    // Close button.
+    if (input.leftClicked && hit(R.close)) {
+        d->visible = false; d->dragging = false; input.captured = true; return;
+    }
+
+    // Title-bar drag (top 28px, excluding the close button).
+    CRect titleBar = {(float)d->x, (float)d->y, (float)d->w - 28.0f, 28.0f};
+    if (input.leftClicked && hit(titleBar)) {
+        d->dragging = true;
+        d->dragDX = mx - d->x;
+        d->dragDY = my - d->y;
+    }
+    if (!input.buttonLeft) d->dragging = false;
+    if (d->dragging) {
+        d->x = static_cast<int>(mx - d->dragDX);
+        d->y = static_cast<int>(my - d->dragDY);
+        // Keep the panel on screen.
+        int maxX = static_cast<int>(viewportW) - d->w, maxY = static_cast<int>(viewportH) - d->h;
+        d->x = d->x < 0 ? 0 : (d->x > maxX ? (maxX < 0 ? 0 : maxX) : d->x);
+        d->y = d->y < 0 ? 0 : (d->y > maxY ? (maxY < 0 ? 0 : maxY) : d->y);
+        input.captured = true;
+        return;
+    }
+
+    // Reconstruct: raise the request edge; the app reads the params off the dialog,
+    // runs Poisson on a worker, and spawns the result as a new static mesh entity.
+    if (input.leftClicked && hit(R.run)) {
+        d->requestRun = true;
+        input.captured = true;
+        return;
+    }
+
+    // Slider grab: a click anywhere in a band around a groove starts the drag.
+    if (input.leftClicked) {
+        for (int i = 0; i < 4; ++i) {
+            const CRect& t = R.track[i];
+            CRect band = {t.x - 6.0f, t.y - 11.0f, t.w + 12.0f, t.h + 22.0f};
+            if (hit(band)) { d->dragSlider = i; break; }
+        }
+    }
+    if (!input.buttonLeft) d->dragSlider = -1;
+    if (d->dragSlider >= 0 && d->dragSlider < 4) {
+        const PSliderSpec& s = kPSliders[d->dragSlider];
+        const CRect& t = R.track[d->dragSlider];
+        float u = t.w > 0.0f ? (mx - t.x) / t.w : 0.0f;
+        u = clampf(u, 0.0f, 1.0f);
+        poissonSetSliderValue(*d, d->dragSlider, s.vmin + u * (s.vmax - s.vmin));
+        input.captured = true;
+    }
+
+    if (inPanel) input.captured = true;
+}
+
 // Build the wireframe vertices for a spatial structure over `P` (and `indices`
 // for the triangle BVH). Self-contained (no GPU, no registry) so it runs on a
 // worker thread; the caller uploads `outVerts` to the GPU. `progress` reports
@@ -3101,6 +3328,34 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::DrawItem item;
         item.mesh    = cs.mesh;
         item.texture = cs.atlas;
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
+        std::memcpy(item.model, model.data(), sizeof(item.model));
+        renderer.submit(item);
+        break;
+    }
+
+    // --- Poisson reconstruction dialog overlay ------------------------
+    auto pdview = world.view<PoissonDialog>();
+    for (auto entity : pdview) {
+        const auto& pd = pdview.get<PoissonDialog>(entity);
+        if (!pd.visible || !pd.font || pd.mesh == render::kInvalidMesh) break;
+
+        render::Vertex verts[kPoissonVerts];
+        buildPoissonDialogGeometry(pd, verts);
+        renderer.updateBuffer(pd.vbo, verts, sizeof(verts));
+
+        render::OverlayContext ov;
+        ov.x = pd.x; ov.y = pd.y; ov.width = pd.w; ov.height = pd.h;
+        ov.clearDepth = true;
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+        std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+        renderer.beginOverlay(ov);
+
+        render::DrawItem item;
+        item.mesh    = pd.mesh;
+        item.texture = pd.atlas;
         Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);

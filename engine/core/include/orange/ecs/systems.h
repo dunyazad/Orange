@@ -41,6 +41,13 @@ void cameraControlsInputSystem(entt::registry& world, core::Input& input, float 
 void crossSectionInputSystem(entt::registry& world, core::Input& input,
                              uint32_t viewportW, uint32_t viewportH);
 
+// Poisson reconstruction dialog: handles the parameter sliders and the
+// "Reconstruct" button (which writes geometry::PoissonParams into the ctx and
+// activates the Poisson processing mode). Sets input.captured over the panel.
+// No-op while the dialog is hidden.
+void poissonDialogInputSystem(entt::registry& world, core::Input& input,
+                              uint32_t viewportW, uint32_t viewportH);
+
 // Axis gizmo input: each frame, ray-picks the gizmo cube under the cursor to
 // update the hover region; on click, classifies the hit as face/edge/corner and
 // starts a smooth camera snap toward that view (plus a click-flash). Runs before

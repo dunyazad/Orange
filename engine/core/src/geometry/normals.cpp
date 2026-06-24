@@ -1,7 +1,10 @@
 #include "orange/core/normals.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
+#include <execution>
+#include <numeric>
 
 #include <Eigen/Eigenvalues>
 
@@ -26,33 +29,41 @@ std::vector<Eigen::Vector3f> estimateNormals(const std::vector<Eigen::Vector3f>&
     SparseGrid grid;
     grid.build(points, cell);
 
-    std::vector<unsigned int> nbr;
-    std::vector<float> dist;
+    // Per-point fit is independent (the grid query is const/read-only), so run it
+    // in parallel. Scratch buffers are declared inside the lambda => per-thread.
+    std::vector<size_t> idx(points.size());
+    std::iota(idx.begin(), idx.end(), (size_t)0);
     const size_t step = points.size() / 100 + 1;  // report ~1% granularity
-    for (size_t i = 0; i < points.size(); ++i) {
-        if (progress && (i % step == 0)) progress((float)i / (float)points.size());
+    std::atomic<size_t> done{0};
+    std::for_each(std::execution::par, idx.begin(), idx.end(), [&](size_t i) {
+        std::vector<unsigned int> nbr;
+        std::vector<float> dist;
         grid.kNearestNeighbors(points, points[i], k + 1, nbr, dist);  // [0] is self
-        if (nbr.size() < 3) continue;
+        if (nbr.size() >= 3) {
+            Eigen::Vector3f mean = Eigen::Vector3f::Zero();
+            for (unsigned int j : nbr) mean += points[j];
+            mean /= (float)nbr.size();
 
-        Eigen::Vector3f mean = Eigen::Vector3f::Zero();
-        for (unsigned int j : nbr) mean += points[j];
-        mean /= (float)nbr.size();
-
-        Eigen::Matrix3f cov = Eigen::Matrix3f::Zero();
-        for (unsigned int j : nbr) {
-            Eigen::Vector3f d = points[j] - mean;
-            cov += d * d.transpose();
+            Eigen::Matrix3f cov = Eigen::Matrix3f::Zero();
+            for (unsigned int j : nbr) {
+                Eigen::Vector3f d = points[j] - mean;
+                cov += d * d.transpose();
+            }
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+            if (es.info() == Eigen::Success) {
+                Eigen::Vector3f n = es.eigenvectors().col(0);  // smallest eigenvalue
+                if (n.squaredNorm() >= 1e-12f) {
+                    n.normalize();
+                    if (n.dot(points[i] - centroid) < 0.0f) n = -n;  // orient outward
+                    normals[i] = n;
+                }
+            }
         }
-        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
-        if (es.info() != Eigen::Success) continue;
-        Eigen::Vector3f n = es.eigenvectors().col(0);  // smallest eigenvalue
-        if (n.squaredNorm() < 1e-12f) continue;
-        n.normalize();
-
-        // Orient outward (away from the cloud centroid).
-        if (n.dot(points[i] - centroid) < 0.0f) n = -n;
-        normals[i] = n;
-    }
+        if (progress) {
+            size_t c = done.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (c % step == 0) progress((float)c / (float)points.size());
+        }
+    });
     return normals;
 }
 

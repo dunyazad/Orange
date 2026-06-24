@@ -64,20 +64,33 @@ struct PickGeometry {
 
 // Background build of a pick BVH for a huge mesh (millions of triangles), so the
 // click that triggers it doesn't freeze the main thread. Held by shared_ptr so the
-// worker can be detached. Small meshes skip this and build inline (instant).
+// worker can be detached. Small meshes skip this and build inline (instant). Carries
+// its own stable-address geometry copies (see PickBVH) so the worker references
+// memory that outlives nothing volatile.
 struct PickBvhJob {
     std::atomic<bool> done{false};
     geometry::BVH     bvh;
+    std::shared_ptr<std::vector<Eigen::Vector3f>> pos;
+    std::shared_ptr<std::vector<uint32_t>>        idx;
 };
 
-// Cached BVH over a PickGeometry's triangles, built on first ray pick so repeated
-// picks of a large mesh are O(log n) instead of testing every triangle. Small
-// meshes build inline; a huge mesh builds on a worker (`job`) while picks fall back
-// to the coarse AABB until it is ready. References the entity's PickGeometry buffers.
+// Cached BVH over a mesh's triangles, built on first ray pick so repeated picks of
+// a large mesh are O(log n) instead of testing every triangle. Small meshes build
+// inline; a huge mesh builds on a worker (`job`) while picks fall back to the coarse
+// AABB until it is ready.
+//
+// The BVH holds raw spans into `pos`/`idx`, which are OWNED here (heap vectors held
+// by shared_ptr) rather than borrowed from the entity's PickGeometry. EnTT relocates
+// components on entity destruction (swap-and-pop moves the last element into the
+// gap), which would dangle spans pointing into a PickGeometry; a shared_ptr-held
+// heap vector keeps a stable address even when this component is moved, so the BVH
+// never dangles.
 struct PickBVH {
     geometry::BVH                bvh;
     bool                         built = false;
     std::shared_ptr<PickBvhJob>  job;    // in-flight background build (null = none)
+    std::shared_ptr<std::vector<Eigen::Vector3f>> pos;  // stable geometry the bvh references
+    std::shared_ptr<std::vector<uint32_t>>        idx;
 };
 
 enum class ProjectionMode { Perspective = 0, Orthographic = 1 };
@@ -308,6 +321,36 @@ struct CrossSection {
     render::BufferHandle   vbo  = render::kInvalidBuffer;
 };
 
+// Poisson reconstruction parameter dialog ("포아송 표면 복원"). A floating panel with
+// a slider per tunable (grid depth, solver iterations, padding scale, screening
+// weight) and a "Reconstruct" button. poissonDialogInputSystem handles the slider
+// drags and the button; on Reconstruct it writes the params into the registry ctx
+// (geometry::PoissonParams) and activates the Poisson processing mode on the
+// selected point cloud. Hidden until opened from the Geometry menu. The panel is
+// centered; renderSystem draws it as an overlay when `visible`.
+struct PoissonDialog {
+    bool visible = false;
+
+    // Tunables (mirror geometry::PoissonParams; written to ctx on Reconstruct).
+    int   depth       = 6;     // 2^depth grid samples/axis  [4..14] (RAM-bound ~10)
+    int   iterations  = 24;    // Gauss-Seidel passes        [4..80]
+    float scale       = 1.2f;  // bounds padding factor      [1.0..2.0]
+    float pointWeight = 4.0f;  // screening strength         [0..16]
+
+    int  w = 280, h = 232;    // panel size (px)
+    int  x = 0, y = 0;        // top-left (px); centered once, then title-bar draggable
+    bool placed   = false;    // false until first centered (so resize doesn't re-center)
+    int  dragSlider = -1;     // which slider (0..3) is being dragged (-1 none)
+    bool dragging  = false;   // title bar is being dragged
+    float dragDX = 0, dragDY = 0;  // cursor-to-panel offset captured at grab
+    bool requestRun = false;  // edge flag: "Reconstruct" clicked; app runs Poisson + spawns a mesh
+
+    const core::Font*     font  = nullptr;  // shared text font
+    render::TextureHandle atlas = render::kInvalidTexture;
+    render::MeshHandle     mesh = render::kInvalidMesh;
+    render::BufferHandle   vbo  = render::kInvalidBuffer;
+};
+
 // --- Selection modes (driven by the left selection toolbar) ----------------
 // What a click selects, how the region is gathered, which entity types are
 // eligible, and how the result combines with the existing selection.
@@ -453,6 +496,7 @@ enum class MenuAction : int {
     CreateTorus, CreateDisk, CreateCapsule, CreateArrow,
     SpatialNone, SpatialBVH, SpatialOctree, SpatialKDTree,
     SpatialGrid, SpatialLoose, SpatialBSP, SpatialRTree, SpatialBall,
+    PoissonDialogToggle,  // open/close the Poisson reconstruction parameter dialog
 };
 
 // One row in a dropdown. kind: Action = clickable command; Check = command that

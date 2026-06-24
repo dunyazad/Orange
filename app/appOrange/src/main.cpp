@@ -33,6 +33,8 @@
 #include "orange/core/buffer.h"
 #include "orange/core/console.h"
 #include "orange/core/math.h"
+#include "orange/core/normals.h"
+#include "orange/core/poisson_reconstruction.h"
 #include "orange/ecs/components.h"
 #include "orange/ecs/systems.h"
 #include "orange/render/types.h"
@@ -285,6 +287,22 @@ struct LoadJob {
     bool                        active = false;  // main-thread only: a job exists
 
     ~LoadJob() { if (worker.joinable()) worker.join(); }
+};
+
+// Background Poisson reconstruction: same shape as LoadJob. Triggered by the
+// dialog's "Reconstruct" button, it estimates normals + solves on a worker, and
+// the main thread turns the resulting triangle soup into a new mesh entity.
+struct PoissonJob {
+    std::thread                 worker;
+    std::atomic<int>            percent{0};
+    std::atomic<bool>           done{false};
+    std::atomic<bool>           ok{false};
+    std::vector<render::Vertex> verts;
+    std::vector<uint32_t>       indices;
+    entt::entity                source = entt::null;  // the cloud entity to hide on success
+    bool                        active = false;
+
+    ~PoissonJob() { if (worker.joinable()) worker.join(); }
 };
 
 } // namespace
@@ -635,6 +653,33 @@ int main(int argc, char** argv) {
         world.emplace<ecs::CrossSection>(e, cs);
     }
 
+    // Poisson reconstruction dialog (parameter sliders + Reconstruct button).
+    const int kPoissonQ = 256, kPoissonV = kPoissonQ * 4;  // must match kPoissonQuads in systems.cpp
+    const std::vector<render::Vertex> pdInit(kPoissonV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
+    std::vector<uint32_t> pdIdx;
+    for (uint32_t q = 0; q < static_cast<uint32_t>(kPoissonQ); ++q) {
+        uint32_t b = q * 4;
+        pdIdx.insert(pdIdx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+    }
+    core::VertexBuffer<render::Vertex> pdVbo(*app.renderer(), pdInit,
+                                             render::BufferUsage::Dynamic);
+    core::IndexBuffer                  pdIbo(*app.renderer(), pdIdx);
+    render::MeshDesc pdMeshDesc;
+    pdMeshDesc.vertexBuffer = pdVbo.handle();
+    pdMeshDesc.indexBuffer  = pdIbo.handle();
+    pdMeshDesc.layout       = render::Vertex::layout();
+    pdMeshDesc.vertexCount  = static_cast<uint32_t>(kPoissonV);
+    pdMeshDesc.indexCount   = static_cast<uint32_t>(kPoissonQ * 6);
+    {
+        auto e = world.create();
+        ecs::PoissonDialog pd;
+        pd.font  = &uiFont;
+        pd.atlas = uiFont.texture;
+        pd.mesh  = app.renderer()->createMesh(pdMeshDesc);
+        pd.vbo   = pdVbo.handle();
+        world.emplace<ecs::PoissonDialog>(e, pd);
+    }
+
     // Top menu bar (multi-menu). Dynamic vertex buffer rewritten each frame.
     const int kMenuQ = 1024, kMenuV = kMenuQ * 4;  // must match kMenuQuads in systems.cpp
     const std::vector<render::Vertex> menuInit(kMenuV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
@@ -816,8 +861,9 @@ int main(int argc, char** argv) {
                     mi.size() / 3);
     };
 
-    LoadJob loadJob;
-    float   statusHold = 0.0f;  // seconds to keep the final "Loaded/Failed" message
+    LoadJob    loadJob;
+    PoissonJob poissonJob;
+    float      statusHold = 0.0f;  // seconds to keep the final "Loaded/Failed" message
 
     auto onUpdate = [&](entt::registry& w, float dt) {
         core::watchdogHeartbeat();  // tell the watchdog the main loop is alive
@@ -906,6 +952,111 @@ int main(int argc, char** argv) {
                 if (mb) mb->statusText = name + " " + std::to_string((int)(pct * 100.0f + 0.5f)) + "%";
             } else if (mb && !mb->statusText.empty()) {
                 mb->statusText.clear();  // finished -> clear the line
+            }
+        }
+
+        // --- Poisson reconstruction (dialog "Reconstruct" button) -------------
+        ecs::PoissonDialog* pd = nullptr;
+        auto pdv = w.view<ecs::PoissonDialog>();
+        for (auto e : pdv) { pd = &pdv.get<ecs::PoissonDialog>(e); break; }
+
+        if (pd && pd->requestRun) {
+            pd->requestRun = false;
+            if (!poissonJob.active) {
+                // Gather the first selected point cloud, in world space.
+                std::vector<Eigen::Vector3f> pts;
+                entt::entity srcEntity = entt::null;
+                auto rv = w.view<ecs::Renderable, ecs::PickGeometry>();
+                for (auto e : rv) {
+                    if (!rv.get<ecs::Renderable>(e).selected) continue;
+                    const auto& pg = rv.get<ecs::PickGeometry>(e);
+                    if (pg.positions.empty()) break;
+                    Eigen::Matrix4f M = Eigen::Matrix4f::Identity();
+                    if (w.all_of<ecs::Transform>(e)) M = w.get<ecs::Transform>(e).matrix();
+                    pts.reserve(pg.positions.size());
+                    for (const auto& p : pg.positions) {
+                        Eigen::Vector4f wp = M * Eigen::Vector4f(p.x(), p.y(), p.z(), 1.0f);
+                        pts.emplace_back(wp.x(), wp.y(), wp.z());
+                    }
+                    srcEntity = e;
+                    break;
+                }
+                if (pts.size() >= 4) {
+                    geometry::PoissonParams pp;
+                    pp.depth       = pd->depth;
+                    pp.iterations  = pd->iterations;
+                    pp.scale       = pd->scale;
+                    pp.pointWeight = pd->pointWeight;
+                    poissonJob.active = true;
+                    poissonJob.done.store(false);
+                    poissonJob.ok.store(false);
+                    poissonJob.percent.store(0);
+                    poissonJob.verts.clear();
+                    poissonJob.indices.clear();
+                    poissonJob.source = srcEntity;
+                    poissonJob.worker = std::thread(
+                        [job = &poissonJob, pts = std::move(pts), pp]() mutable {
+                            bool ok = false;
+                            // A deep depth on a dense grid can exhaust RAM; catch the
+                            // bad_alloc so it surfaces as "Poisson failed", not a crash.
+                            try {
+                                auto nrm = geometry::estimateNormals(
+                                    pts, 16, [job](float f) { job->percent.store((int)(f * 30.0f)); });
+                                auto tris = geometry::poissonReconstruct(
+                                    pts, nrm, pp,
+                                    [job](float f) { job->percent.store(30 + (int)(f * 70.0f)); });
+                                std::vector<render::Vertex> v;
+                                std::vector<uint32_t>       idx;
+                                v.reserve(tris.size() * 3);
+                                idx.reserve(tris.size() * 3);
+                                uint32_t c = 0;
+                                for (const auto& t : tris)
+                                    for (int k = 0; k < 3; ++k) {
+                                        render::Vertex vv{};
+                                        vv.position[0] = t.v[k].x(); vv.position[1] = t.v[k].y();
+                                        vv.position[2] = t.v[k].z();
+                                        vv.color[0] = t.c[k].x(); vv.color[1] = t.c[k].y();
+                                        vv.color[2] = t.c[k].z();
+                                        v.push_back(vv);
+                                        idx.push_back(c++);
+                                    }
+                                ok = !v.empty();
+                                if (ok) { job->verts = std::move(v); job->indices = std::move(idx); }
+                            } catch (...) {
+                                ok = false;  // out of memory (deep depth) or other failure
+                            }
+                            job->percent.store(100);
+                            job->ok.store(ok);
+                            job->done.store(true);
+                        });
+                } else if (mb) {
+                    mb->statusText = "Poisson: select a point cloud first";
+                    statusHold     = 2.5f;
+                }
+            }
+        }
+
+        // Drive Poisson status + finalize a finished reconstruction (main thread).
+        if (poissonJob.active) {
+            if (!poissonJob.done.load()) {
+                if (mb)
+                    mb->statusText = "Poisson " + std::to_string(poissonJob.percent.load()) + "%";
+            } else {
+                poissonJob.worker.join();
+                bool ok = poissonJob.ok.load();
+                if (ok) {
+                    finalizeMesh("poisson", poissonJob.verts, poissonJob.indices);
+                    // Hide the source point cloud so the new mesh isn't buried under
+                    // its sprites. drawMode None (not visible=false) so the H key
+                    // (Unhide All) brings it back.
+                    if (w.valid(poissonJob.source) && w.all_of<ecs::Renderable>(poissonJob.source))
+                        w.get<ecs::Renderable>(poissonJob.source).drawMode = core::DrawMode::None;
+                }
+                poissonJob.verts.clear();   poissonJob.verts.shrink_to_fit();
+                poissonJob.indices.clear(); poissonJob.indices.shrink_to_fit();
+                poissonJob.active = false;
+                statusHold        = ok ? 1.0f : 3.0f;
+                if (mb) mb->statusText = ok ? "Poisson done" : "Poisson failed";
             }
         }
     };

@@ -12,6 +12,7 @@ add_library(orange_core STATIC
     src/geometry/sparse_grid.cpp
     src/geometry/sparse_data_block.cpp
     src/geometry/mesh_generation.cpp
+    src/geometry/poisson_reconstruction.cpp
     src/geometry/normals.cpp
     src/geometry/primitives.cpp
     src/geometry/point_ops.cpp

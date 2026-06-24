@@ -269,6 +269,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         ecs::treeViewInputSystem(world_, input_, window_.width(), window_.height());
         ecs::cameraControlsInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::crossSectionInputSystem(world_, input_, window_.width(), window_.height());
+        ecs::poissonDialogInputSystem(world_, input_, window_.width(), window_.height());
         ecs::axisGizmoInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::selectionToolbarInputSystem(world_, input_, window_.width(), window_.height());
         ecs::cameraManipulatorSystem(world_, input_, dt);
@@ -511,6 +512,11 @@ void Application::applyMenuAction(int action) {
             auto& ctx = world_.ctx();
             if (!ctx.contains<ecs::SpatialViz>()) ctx.emplace<ecs::SpatialViz>();
             ctx.get<ecs::SpatialViz>().kind = k;
+            break;
+        }
+        case A::PoissonDialogToggle: {
+            auto v = world_.view<ecs::PoissonDialog>();
+            for (auto ent : v) { auto& pd = v.get<ecs::PoissonDialog>(ent); pd.visible = !pd.visible; break; }
             break;
         }
         case A::None:  break;
