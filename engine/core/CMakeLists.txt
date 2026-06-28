@@ -13,7 +13,12 @@ add_library(orange_core STATIC
     src/geometry/sparse_data_block.cpp
     src/geometry/mesh_generation.cpp
     src/geometry/poisson_reconstruction.cpp
+    src/geometry/half_edge.cpp
     src/geometry/normals.cpp
+    src/geometry/occlusal_plane.cpp
+    src/geometry/occlusal_render.cpp
+    src/geometry/tooth_segment.cpp
+    src/ml/sam_segment.cpp
     src/geometry/primitives.cpp
     src/geometry/point_ops.cpp
     src/io/serialization.cpp
@@ -50,6 +55,26 @@ endif()
 # DbgHelp backs the crash handler's stack walk + minidump on Windows.
 if(WIN32)
     target_link_libraries(orange_core PUBLIC dbghelp)
+endif()
+
+# ONNX Runtime (optional): enables the MobileSAM 2D segmentation. Auto-detected
+# from the vendored prebuilt; sam_segment.cpp is a no-op stub when absent.
+set(ORANGE_ONNX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/onnx/onnxruntime-win-x64-1.27.0")
+if(WIN32 AND EXISTS "${ORANGE_ONNX_DIR}/lib/onnxruntime.lib")
+    message(STATUS "Orange: ONNX Runtime found -> MobileSAM segmentation enabled")
+    target_include_directories(orange_core PRIVATE "${ORANGE_ONNX_DIR}/include")
+    target_link_libraries(orange_core PUBLIC "${ORANGE_ONNX_DIR}/lib/onnxruntime.lib")
+    target_compile_definitions(orange_core PUBLIC ORANGE_ENABLE_ONNX=1
+        ORANGE_ONNX_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/onnx/models")
+    # Copy the runtime DLL next to every consumer exe.
+    file(COPY "${ORANGE_ONNX_DIR}/lib/onnxruntime.dll" DESTINATION "${ORANGE_BIN_DIR}")
+    if(DEFINED CMAKE_CONFIGURATION_TYPES)
+        foreach(cfg ${CMAKE_CONFIGURATION_TYPES})
+            file(COPY "${ORANGE_ONNX_DIR}/lib/onnxruntime.dll" DESTINATION "${ORANGE_BIN_DIR}/${cfg}")
+        endforeach()
+    endif()
+else()
+    message(STATUS "Orange: ONNX Runtime not found -> MobileSAM segmentation stubbed")
 endif()
 
 target_compile_features(orange_core PUBLIC cxx_std_17)

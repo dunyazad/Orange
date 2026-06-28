@@ -380,35 +380,6 @@ int main(int argc, char** argv) {
         world.emplace<ecs::CameraManipulator>(cam, manip);
     }
 
-    // A unit cube as type-safe buffer objects. Declared *after* `app` so they
-    // are destroyed (freeing the GPU buffers) before the renderer shuts down.
-    const std::vector<render::Vertex> vertices = {
-        {{-0.5f, -0.5f, -0.5f}, {0, 0, 0}},
-        {{ 0.5f, -0.5f, -0.5f}, {1, 0, 0}},
-        {{ 0.5f,  0.5f, -0.5f}, {1, 1, 0}},
-        {{-0.5f,  0.5f, -0.5f}, {0, 1, 0}},
-        {{-0.5f, -0.5f,  0.5f}, {0, 0, 1}},
-        {{ 0.5f, -0.5f,  0.5f}, {1, 0, 1}},
-        {{ 0.5f,  0.5f,  0.5f}, {1, 1, 1}},
-        {{-0.5f,  0.5f,  0.5f}, {0, 1, 1}},
-    };
-    const std::vector<uint32_t> indices = {
-        0, 1, 2, 2, 3, 0,  4, 6, 5, 6, 4, 7,  // back, front
-        4, 5, 1, 1, 0, 4,  3, 2, 6, 6, 7, 3,  // bottom, top
-        4, 0, 3, 3, 7, 4,  1, 5, 6, 6, 2, 1,  // left, right
-    };
-
-    core::VertexBuffer<render::Vertex> vbo(*app.renderer(), vertices);
-    core::IndexBuffer                  ibo(*app.renderer(), indices);
-
-    render::MeshDesc meshDesc;
-    meshDesc.vertexBuffer = vbo.handle();
-    meshDesc.indexBuffer  = ibo.handle();
-    meshDesc.layout       = render::Vertex::layout();
-    meshDesc.vertexCount  = static_cast<uint32_t>(vbo.count());
-    meshDesc.indexCount   = static_cast<uint32_t>(ibo.count());
-    render::MeshHandle cube = app.renderer()->createMesh(meshDesc);
-
     // --- Axis gizmo cube: a [-1,1] cube with one solid color per face -------
     std::vector<render::Vertex> gVerts;
     std::vector<uint32_t>       gIdx;
@@ -597,6 +568,8 @@ int main(int argc, char** argv) {
     const char* uiBase = SDL_GetBasePath();  // owned by SDL, do not free
     const std::string uiLayoutPath =
         (uiBase ? std::string(uiBase) : std::string()) + "orange_ui_layout.txt";
+    const std::string lastMeshFile =
+        (uiBase ? std::string(uiBase) : std::string()) + "orange_last_mesh.txt";
     core::loadWidgetLayout(world, uiLayoutPath);
 
     // Camera controls panel (projection toggle + FOV/size), under the gizmo.
@@ -680,6 +653,54 @@ int main(int argc, char** argv) {
         world.emplace<ecs::PoissonDialog>(e, pd);
     }
 
+    // Confirm (Yes/No) dialog -- in-app modal used by the "load last mesh" prompt.
+    const int kConfirmQ = 192, kConfirmV = kConfirmQ * 4;  // must match kConfirmQuads in systems.cpp
+    const std::vector<render::Vertex> cdInit(kConfirmV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
+    std::vector<uint32_t> cdIdx;
+    for (uint32_t q = 0; q < static_cast<uint32_t>(kConfirmQ); ++q) {
+        uint32_t b = q * 4;
+        cdIdx.insert(cdIdx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+    }
+    core::VertexBuffer<render::Vertex> cdVbo(*app.renderer(), cdInit,
+                                             render::BufferUsage::Dynamic);
+    core::IndexBuffer                  cdIbo(*app.renderer(), cdIdx);
+    render::MeshDesc cdMeshDesc;
+    cdMeshDesc.vertexBuffer = cdVbo.handle();
+    cdMeshDesc.indexBuffer  = cdIbo.handle();
+    cdMeshDesc.layout       = render::Vertex::layout();
+    cdMeshDesc.vertexCount  = static_cast<uint32_t>(kConfirmV);
+    cdMeshDesc.indexCount   = static_cast<uint32_t>(kConfirmQ * 6);
+    {
+        auto e = world.create();
+        ecs::ConfirmDialog cd;
+        cd.font  = &uiFont;
+        cd.atlas = uiFont.texture;
+        cd.mesh  = app.renderer()->createMesh(cdMeshDesc);
+        cd.vbo   = cdVbo.handle();
+        world.emplace<ecs::ConfirmDialog>(e, cd);
+    }
+
+    // Occlusal 2D render: a shared unit quad (uv 0..1) for the channel panels.
+    const std::vector<render::Vertex> orQuad = {
+        {{0, 0, 0}, {1, 1, 1}, {0, 1}}, {{1, 0, 0}, {1, 1, 1}, {1, 1}},
+        {{1, 1, 0}, {1, 1, 1}, {1, 0}}, {{0, 1, 0}, {1, 1, 1}, {0, 0}},
+    };
+    const std::vector<uint32_t> orQuadIdx = {0, 1, 2, 0, 2, 3};
+    core::VertexBuffer<render::Vertex> orVbo(*app.renderer(), orQuad);
+    core::IndexBuffer                  orIbo(*app.renderer(), orQuadIdx);
+    render::MeshDesc orMeshDesc;
+    orMeshDesc.vertexBuffer = orVbo.handle();
+    orMeshDesc.indexBuffer  = orIbo.handle();
+    orMeshDesc.layout       = render::Vertex::layout();
+    orMeshDesc.vertexCount  = 4;
+    orMeshDesc.indexCount   = 6;
+    {
+        auto e = world.create();
+        ecs::OcclusalRenderViz orv;
+        orv.quad = app.renderer()->createMesh(orMeshDesc);
+        world.emplace<ecs::OcclusalRenderViz>(e, orv);
+    }
+
     // Top menu bar (multi-menu). Dynamic vertex buffer rewritten each frame.
     const int kMenuQ = 1024, kMenuV = kMenuQ * 4;  // must match kMenuQuads in systems.cpp
     const std::vector<render::Vertex> menuInit(kMenuV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
@@ -736,27 +757,6 @@ int main(int argc, char** argv) {
         world.emplace<ecs::SelectionToolbar>(e, tb);
     }
     world.ctx().emplace<ecs::SelectionMode>();
-
-    // CPU triangle soup of the cube for accurate (per-triangle) picking.
-    ecs::PickGeometry cubePick;
-    cubePick.positions.reserve(vertices.size());
-    for (const auto& v : vertices)
-        cubePick.positions.emplace_back(v.position[0], v.position[1], v.position[2]);
-    cubePick.indices = indices;
-
-    // A few spinning cubes, each sharing the same GPU mesh.
-    const float xs[] = {-1.6f, 0.0f, 1.6f};
-    for (float x : xs) {
-        auto e = world.create();
-        ecs::Transform t;
-        t.position = {x, 0.0f, 0.0f};
-        world.emplace<ecs::Transform>(e, t);
-        world.emplace<ecs::Renderable>(e, ecs::Renderable{cube});
-        world.emplace<ecs::PickGeometry>(e, cubePick);
-        ecs::Spin spin;
-        spin.axisRadiansPerSec = {0.4f, 0.9f, 0.0f};
-        world.emplace<ecs::Spin>(e, spin);
-    }
 
     // --- File > Open... -> load a mesh ---------------------------------
     // Buffers for loaded meshes must outlive the renderer, so they live here
@@ -891,6 +891,22 @@ int main(int argc, char** argv) {
                                        kMeshFilters, 2, nullptr, /*allow_many=*/false);
             }
         }
+        // In-app confirm dialog answered? A Yes on the "load last mesh" prompt
+        // queues that path like a normal open.
+        {
+            auto cdv = w.view<ecs::ConfirmDialog>();
+            for (auto e : cdv) {
+                auto& cd = cdv.get<ecs::ConfirmDialog>(e);
+                if (cd.answered) {
+                    cd.answered = false;
+                    if (cd.yes && !cd.payload.empty()) {
+                        std::lock_guard<std::mutex> lk(fileDrop.mtx);
+                        fileDrop.paths.push_back(cd.payload);
+                    }
+                }
+                break;
+            }
+        }
         // Drain whatever the dialog callback handed back (it runs on a platform
         // thread). Only one load runs at a time -- a pick while busy is dropped.
         std::string path;
@@ -933,7 +949,10 @@ int main(int argc, char** argv) {
             } else {
                 loadJob.worker.join();
                 bool ok = loadJob.ok.load();
-                if (ok) finalizeMesh(loadJob.path, loadJob.verts, loadJob.indices);
+                if (ok) {
+                    finalizeMesh(loadJob.path, loadJob.verts, loadJob.indices);
+                    std::ofstream(lastMeshFile, std::ios::trunc) << loadJob.path;  // remember for next launch
+                }
                 loadJob.verts.clear();   loadJob.verts.shrink_to_fit();
                 loadJob.indices.clear(); loadJob.indices.shrink_to_fit();
                 loadJob.active = false;
@@ -1066,6 +1085,28 @@ int main(int argc, char** argv) {
             "Delete removes); Tab cycles the selection's drawing mode (H reveals None-hidden meshes); "
             "+/- resize point-cloud sprites.");
     SDL_Log("appOrange: ESC or close the window to quit.");
+
+    // Offer to reload the mesh from the previous session via the in-app dialog;
+    // a Yes is handled in onUpdate (queues the load like a normal open).
+    {
+        std::ifstream in(lastMeshFile);
+        std::string last;
+        std::getline(in, last);
+        in.close();
+        std::ifstream test(last, std::ios::binary);
+        if (!last.empty() && test.good()) {
+            test.close();
+            auto cdv = world.view<ecs::ConfirmDialog>();
+            for (auto e : cdv) {
+                auto& cd  = cdv.get<ecs::ConfirmDialog>(e);
+                cd.line1   = "Load last mesh?";
+                cd.line2   = last;
+                cd.payload = last;
+                cd.visible = true;
+                break;
+            }
+        }
+    }
 
     // Watch for a main-thread hang (shorter timeout in the hang self-test).
     core::installWatchdog(hangMode ? 2.0 : 10.0);

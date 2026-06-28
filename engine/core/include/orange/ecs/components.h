@@ -48,6 +48,11 @@ struct Renderable {
     // each mesh keeps its own. Selected meshes also get a silhouette outline.
     core::DrawMode drawMode = core::DrawMode::Solid;
 
+    // Per-mesh scene-coloring mode (0 = original vertex color, 1 = height,
+    // 2 = position, 3 = grayscale). The menu / Shift+` set it for the selection
+    // only; renderSystem pushes it per drawable, so each mesh keeps its own.
+    uint32_t colorMode = 0;
+
     // A non-indexed point cloud (drawn as points). Selection shows a bounding-box
     // wireframe instead of the stencil silhouette (which needs a solid surface).
     bool pointCloud = false;
@@ -351,6 +356,29 @@ struct PoissonDialog {
     render::BufferHandle   vbo  = render::kInvalidBuffer;
 };
 
+// A centered in-app Yes/No confirmation dialog (replaces native modal popups).
+// confirmDialogInputSystem hit-tests the two buttons; on a click it raises
+// `answered` (+ `yes`) and hides. The app reads the edge, acts on `payload`, then
+// clears it. renderSystem draws it as an overlay while `visible`.
+struct ConfirmDialog {
+    bool visible = false;
+    std::string title = "appOrange";
+    std::string line1;    // message (line 1)
+    std::string line2;    // message (line 2, e.g. a path)
+    std::string payload;  // app-defined data carried with a Yes (e.g. file path)
+
+    bool yes      = false;  // last answer (valid when `answered`)
+    bool answered = false;  // edge: a button was clicked; app consumes + clears
+
+    int  w = 460, h = 130, x = 0, y = 0;
+    bool placed = false;    // centered once
+
+    const core::Font*     font  = nullptr;
+    render::TextureHandle atlas = render::kInvalidTexture;
+    render::MeshHandle     mesh = render::kInvalidMesh;
+    render::BufferHandle   vbo  = render::kInvalidBuffer;
+};
+
 // --- Selection modes (driven by the left selection toolbar) ----------------
 // What a click selects, how the region is gathered, which entity types are
 // eligible, and how the result combines with the existing selection.
@@ -497,6 +525,15 @@ enum class MenuAction : int {
     SpatialNone, SpatialBVH, SpatialOctree, SpatialKDTree,
     SpatialGrid, SpatialLoose, SpatialBSP, SpatialRTree, SpatialBall,
     PoissonDialogToggle,  // open/close the Poisson reconstruction parameter dialog
+    // Pipelines menu (tooth-segmentation). Stage 1 sub-steps.
+    PipelineOcclusalEstimate,      // occlusal plane: full pipeline (cusps -> fit) in one click
+    PipelineOcclusalWholePCA,      // occlusal plane: coarse whole-mesh PCA, viz plane + normal
+    PipelineOcclusalFindCusp,      // occlusal plane: detect cusp candidates, viz markers
+    PipelineOcclusalPlaneFromCusps, // occlusal plane: PCA-fit the cusp tips -> refined plane
+    PipelineOcclusal2DRender,      // stage 2: multi-channel orthographic render (depth/normal/curvature)
+    PipelineSegment2DClassical,    // stage 3a: classical watershed 2D segmentation (+ segment panel)
+    PipelineSegment2DSAM,          // stage 3b: SAM (ONNX) 2D segmentation (requires ONNX build)
+    PipelineSegment3D,             // stage 5: direct 3D per-tooth segmentation (colours the mesh)
 };
 
 // One row in a dropdown. kind: Action = clickable command; Check = command that
@@ -508,6 +545,10 @@ struct MenuItem {
     MenuAction  action  = MenuAction::None;
     Kind        kind    = Action;
     bool        checked = false;          // tick state for Check items (synced by app)
+    // Non-empty => this item is a submenu parent: hovering it opens a flyout
+    // panel of these child items to the right (one nesting level supported).
+    // std::vector of an incomplete type is valid (C++17).
+    std::vector<MenuItem> submenu;
 };
 
 // One top-level menu (a title in the bar + its dropdown items).
@@ -527,6 +568,8 @@ struct MenuBar {
     std::vector<Menu> menus;        // populated by defaultAppMenus()
     int  openMenu  = -1;            // index of the expanded menu (-1 = none)
     int  hoverItem = -1;            // hovered dropdown item index (-1 = none)
+    int  openSub   = -1;            // dropdown item whose submenu flyout is open (-1 = none)
+    int  hoverSub  = -1;            // hovered item index within the open flyout (-1 = none)
 
     // Action raised by the most recent item click; Application clears it after
     // dispatch. MenuAction::None = nothing pending this frame.
@@ -549,6 +592,50 @@ struct MenuBar {
     // opaque bar + dropdown fills).
     const core::Font*     font  = nullptr;
     render::TextureHandle atlas = render::kInvalidTexture;
+};
+
+// Result of the occlusal-plane pipeline step, latched for visualization. While
+// `active`, renderSystem re-emits a plane quad + a normal arrow into the
+// immediate-mode DebugDraw each frame (in the same world frame as the meshes).
+// Stored as a registry ctx singleton; set by Application::applyMenuAction.
+struct OcclusalPlaneViz {
+    bool            active   = false;
+    Eigen::Vector3f position = Eigen::Vector3f::Zero();  // point on the plane
+    Eigen::Vector3f normal   = Eigen::Vector3f::UnitY(); // unit plane normal
+    float           size     = 1.0f;                     // quad half-extent / arrow length scale
+};
+
+// Result of the cusp-detection pipeline step, latched for visualization. While
+// `active`, renderSystem re-emits a small sphere marker per cusp into DebugDraw
+// each frame. Stored as a registry ctx singleton; set by applyMenuAction.
+struct CuspViz {
+    bool                         active = false;
+    std::vector<Eigen::Vector3f> points;        // cusp positions (world frame)
+    std::vector<uint8_t>         outlier;        // 1 = far from the tip centroid (drawn red)
+    float                        size   = 1.0f;  // scene scale for the marker radius
+};
+
+// Cached input + live tunable for the cusp-detection step, so the prominence
+// threshold can be dialled with [ / ] and re-run without re-picking the mesh.
+// Stored as a registry ctx singleton; set when Find Cusp runs.
+struct CuspParams {
+    std::vector<Eigen::Vector3f> points;       // selected mesh vertices (world frame)
+    std::vector<uint32_t>        indices;      // its triangle list
+    float                        diag      = 0.0f;
+    float                        heightGate = 0.30f;  // drop tips below this fraction of height band
+    bool                         ready     = false;
+};
+
+// Multi-channel occlusal 2D render (pipeline stage 2): three RGBA textures
+// (depth / normal / curvature) shown as thumbnail panels along the bottom of the
+// screen. `quad` is a shared unit-quad mesh (uv 0..1) created at startup; the app
+// (re)creates the textures when the render runs. renderSystem draws the panels.
+struct OcclusalRenderViz {
+    bool                  visible = false;
+    int                   count   = 0;  // panels to draw (3 = channels, 4 = + segmentation)
+    render::TextureHandle tex[4]  = {render::kInvalidTexture, render::kInvalidTexture,
+                                     render::kInvalidTexture, render::kInvalidTexture};
+    render::MeshHandle    quad    = render::kInvalidMesh;
 };
 
 // Demo behavior: continuous rotation, consumed by SpinSystem.

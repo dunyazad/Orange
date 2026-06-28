@@ -32,6 +32,11 @@
 namespace orange::ecs {
 
 namespace {
+// Shared GUI text height (px) for every overlay widget -- menu bar, toolbar,
+// tree view, and all dialogs render at this one size so the chrome is uniform.
+// (The FPS graph's tiny internal labels are the one intentional exception.)
+constexpr float kUiTextPx = 20.0f;
+
 // Persistent GPU resources for immediate-mode debug drawing. Raw handles (like
 // the overlay widgets) so the registry's teardown never outlives the renderer.
 struct DebugMeshState {
@@ -86,6 +91,75 @@ void drawDebugGeometry(entt::registry& world, render::IRenderer& renderer,
     renderer.submit(item);
 
     dd.clear();
+}
+
+// Re-emit the latched occlusal-plane result (a plane quad + a normal arrow) into
+// the immediate-mode DebugDraw each frame while active. Built in the same world
+// frame as the meshes (renderSystem applies Mworld when it uploads the debug
+// geometry). Set by Application::applyMenuAction; cleared geometry is re-added
+// every frame because DebugDraw is flushed after each upload.
+void emitOcclusalPlaneViz(entt::registry& world) {
+    if (!world.ctx().contains<OcclusalPlaneViz>()) return;
+    const auto& v = world.ctx().get<OcclusalPlaneViz>();
+    if (!v.active) return;
+
+    auto& dd = debug::DebugDraw::instance();
+    const Eigen::Vector3f n = v.normal.normalized();
+    const float s = v.size > 0.0f ? v.size : 1.0f;
+
+    // In-plane orthonormal basis (an arbitrary rotation about the normal).
+    Eigen::Vector3f a = (std::abs(n.x()) < 0.9f) ? Eigen::Vector3f::UnitX()
+                                                 : Eigen::Vector3f::UnitY();
+    Eigen::Vector3f u = n.cross(a).normalized();
+    Eigen::Vector3f w = n.cross(u).normalized();
+
+    const float hs = s * 0.6f;  // quad half-extent
+    Eigen::Vector3f p0 = v.position - u * hs - w * hs;
+    Eigen::Vector3f p1 = v.position + u * hs - w * hs;
+    Eigen::Vector3f p2 = v.position + u * hs + w * hs;
+    Eigen::Vector3f p3 = v.position - u * hs + w * hs;
+    const Eigen::Vector3f fill(0.20f, 0.55f, 0.85f);
+    dd.addQuad(p0, p1, p2, p3, fill);  // front
+    dd.addQuad(p0, p3, p2, p1, fill);  // back (single-sided quads -> draw both)
+
+    // Plane border for readability.
+    const Eigen::Vector3f edge(0.55f, 0.85f, 1.0f);
+    const float t = s * 0.004f;
+    dd.addLine(p0, p1, edge, t); dd.addLine(p1, p2, edge, t);
+    dd.addLine(p2, p3, edge, t); dd.addLine(p3, p0, edge, t);
+
+    // Normal arrow: shaft + cone head.
+    const Eigen::Vector3f arrow(1.0f, 0.55f, 0.15f);
+    const float len = s * 0.8f;
+    Eigen::Vector3f neck = v.position + n * len * 0.8f;
+    Eigen::Vector3f tip  = v.position + n * len;
+    dd.addLine(v.position, neck, arrow, s * 0.01f);
+    const float r = len * 0.06f;
+    const int seg = 12;
+    for (int i = 0; i < seg; ++i) {
+        float a0 = (float)i / seg * 6.2831853f;
+        float a1 = (float)(i + 1) / seg * 6.2831853f;
+        Eigen::Vector3f c0 = neck + (u * std::cos(a0) + w * std::sin(a0)) * r;
+        Eigen::Vector3f c1 = neck + (u * std::cos(a1) + w * std::sin(a1)) * r;
+        dd.addTriangle(c0, c1, tip, arrow);
+    }
+}
+
+// Re-emit the latched cusp-detection result (one sphere marker per cusp) into
+// DebugDraw each frame while active. Same world frame as the meshes.
+void emitCuspViz(entt::registry& world) {
+    if (!world.ctx().contains<CuspViz>()) return;
+    const auto& c = world.ctx().get<CuspViz>();
+    if (!c.active || c.points.empty()) return;
+
+    auto& dd = debug::DebugDraw::instance();
+    const Eigen::Vector3f yellow(1.0f, 0.85f, 0.1f);  // normal cusp
+    const Eigen::Vector3f red(0.95f, 0.15f, 0.12f);   // outlier (far from centroid)
+    const float r = (c.size > 0.0f ? c.size : 1.0f) * 0.006f;
+    for (size_t i = 0; i < c.points.size(); ++i) {
+        bool out = i < c.outlier.size() && c.outlier[i];
+        dd.addSphere(c.points[i], r, out ? red : yellow, 8);
+    }
 }
 
 // A background computation of one processing-mode result. The worker thread fills
@@ -672,7 +746,7 @@ constexpr int   kTreeQuads  = 600;            // dynamic mesh capacity
 constexpr int   kTreeVerts  = kTreeQuads * 4;
 constexpr float kTreeTitleH = 34.0f;          // title bar (drag handle) height, px
 constexpr float kTreeRowH   = 30.0f;          // row height, px
-constexpr float kTreeTextPx = 20.0f;          // glyph height, px (large & readable)
+constexpr float kTreeTextPx = kUiTextPx;       // glyph height, px (large & readable)
 
 // One row of the outliner -- a group header or an entity leaf. Rebuilt from the
 // world each frame (shared by the input hit-test and the geometry builder so they
@@ -956,7 +1030,7 @@ void buildCrossSectionGeometry(const CrossSection& cs, render::Vertex* out) {
 
     // Title. Match the camera-controls panel label size above (~20px: that panel's
     // h=76, button 0.42 tall, text 0.64 of the button).
-    float th = 20.0f / cs.h;
+    float th = kUiTextPx / cs.h;
     text("Section", 10.0f / cs.w, 1.0f - 8.0f / cs.h - th, th, 0.85f, 0.88f, 0.92f, 0.6f);
 
     // Enable checkbox (green tick when on).
@@ -986,7 +1060,7 @@ void buildCrossSectionGeometry(const CrossSection& cs, render::Vertex* out) {
     // Value readout (between the two buttons).
     char buf[24];
     std::snprintf(buf, sizeof(buf), "%.2f", cs.pos);
-    float vh = 17.0f / cs.h;  // match the controls value (FOV) size above
+    float vh = kUiTextPx / cs.h;  // match the controls value (FOV) size above
     float vMid = (R.axis.x + R.axis.w + R.flip.x) * 0.5f;  // pixel midpoint of the gap
     text(buf, (vMid - cs.x) / cs.w - textW(buf, vh) * 0.5f,
          1.0f - (R.axis.y + R.axis.h * 0.5f - cs.y) / cs.h - vh * 0.35f, vh,
@@ -1099,7 +1173,7 @@ void buildPoissonDialogGeometry(const PoissonDialog& d, render::Vertex* out) {
     float x0, y0, x1, y1;
 
     // Title. Match the cross-section panel's 20px title.
-    float th = 20.0f / d.h;
+    float th = kUiTextPx / d.h;
     text("Poisson Reconstruction", 12.0f / d.w, 1.0f - 7.0f / d.h - th, th,
          0.88f, 0.90f, 0.94f, 0.6f);
 
@@ -1118,7 +1192,7 @@ void buildPoissonDialogGeometry(const PoissonDialog& d, render::Vertex* out) {
         float val = poissonSliderValue(d, i);
 
         // Label (left) at the row top, above the groove. 17px (panel default).
-        float lh = 17.0f / d.h;
+        float lh = kUiTextPx / d.h;
         float labelY = 1.0f - (trk.y - 18.0f - d.y) / d.h;
         text(s.label, (trk.x - d.x) / d.w, labelY, lh, 0.80f, 0.84f, 0.90f, 0.6f);
 
@@ -1150,6 +1224,79 @@ void buildPoissonDialogGeometry(const PoissonDialog& d, render::Vertex* out) {
     for (int i = q * 4; i < kPoissonVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
 
+// --- Confirm (Yes/No) dialog -----------------------------------------------
+constexpr int kConfirmQuads = 192;
+constexpr int kConfirmVerts = kConfirmQuads * 4;
+
+struct ConfirmRects { CRect yes; CRect no; };
+ConfirmRects confirmRects(const ConfirmDialog& d) {
+    const float bw = 92.0f, bh = 30.0f, pad = 16.0f, gap = 10.0f;
+    float by = (float)(d.y + d.h) - pad - bh;
+    ConfirmRects r;
+    r.yes = {(float)(d.x + d.w) - pad - bw, by, bw, bh};
+    r.no  = {r.yes.x - gap - bw, by, bw, bh};
+    return r;
+}
+
+void buildConfirmDialogGeometry(const ConfirmDialog& d, render::Vertex* out) {
+    const core::Font& f = *d.font;
+    int q = 0;
+    const float wu = f.whiteU, wv = f.whiteV;
+    auto quad = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                    float u0, float v0, float u1, float v1, float z) {
+        if (q >= kConfirmQuads) return;
+        out[q * 4 + 0] = {{x0, y0, z}, {r, g, b}, {u0, v1}};
+        out[q * 4 + 1] = {{x1, y0, z}, {r, g, b}, {u1, v1}};
+        out[q * 4 + 2] = {{x1, y1, z}, {r, g, b}, {u1, v0}};
+        out[q * 4 + 3] = {{x0, y1, z}, {r, g, b}, {u0, v0}};
+        ++q;
+    };
+    auto solid = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                     float z) { quad(x0, y0, x1, y1, r, g, b, wu, wv, wu, wv, z); };
+    const float xs = (float)d.h / (float)d.w;
+    auto text = [&](const char* s, float penX, float baseY, float h, float r, float g,
+                    float b, float z) {
+        for (; *s; ++s) {
+            const core::Glyph& gl = f.glyph(*s);
+            if (gl.w > 0 && gl.h > 0) {
+                float x0 = penX + gl.xoff * h * xs, y1 = baseY - gl.yoff * h;
+                float x1 = x0 + gl.w * h * xs, y0 = y1 - gl.h * h;
+                quad(x0, y0, x1, y1, r, g, b, gl.u0, gl.v0, gl.u1, gl.v1, z);
+            }
+            penX += gl.advance * h * xs;
+        }
+    };
+    auto textW = [&](const char* s, float h) { return f.textWidth(s, h) * xs; };
+    auto toN = [&](const CRect& rr, float& x0, float& y0, float& x1, float& y1) {
+        x0 = (rr.x - d.x) / d.w;         x1 = (rr.x + rr.w - d.x) / d.w;
+        y1 = 1.0f - (rr.y - d.y) / d.h;  y0 = 1.0f - (rr.y + rr.h - d.y) / d.h;
+    };
+
+    solid(0, 0, 1, 1, 0.10f, 0.11f, 0.13f, 0.0f);                    // panel
+    solid(0, 1.0f - 28.0f / d.h, 1, 1, 0.16f, 0.18f, 0.22f, 0.05f);  // title bar
+    float th = kUiTextPx / d.h;
+    text(d.title.c_str(), 12.0f / d.w, 1.0f - 7.0f / d.h - th, th, 0.88f, 0.90f, 0.94f, 0.6f);
+
+    float mh = kUiTextPx / d.h;
+    text(d.line1.c_str(), 16.0f / d.w, 1.0f - 46.0f / d.h, mh, 0.85f, 0.88f, 0.92f, 0.6f);
+    if (!d.line2.empty())
+        text(d.line2.c_str(), 16.0f / d.w, 1.0f - 68.0f / d.h, mh, 0.70f, 0.82f, 0.98f, 0.6f);
+
+    ConfirmRects R = confirmRects(d);
+    float x0, y0, x1, y1;
+    toN(R.no, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.28f, 0.29f, 0.33f, 0.3f);
+    float bbh = (y1 - y0) * 0.5f;
+    text("No", (x0 + x1) * 0.5f - textW("No", bbh) * 0.5f, (y0 + y1) * 0.5f - bbh * 0.35f,
+         bbh, 0.92f, 0.92f, 0.92f, 0.6f);
+    toN(R.yes, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.20f, 0.42f, 0.30f, 0.3f);
+    text("Yes", (x0 + x1) * 0.5f - textW("Yes", bbh) * 0.5f, (y0 + y1) * 0.5f - bbh * 0.35f,
+         bbh, 0.90f, 0.96f, 0.92f, 0.6f);
+
+    for (int i = q * 4; i < kConfirmVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
+}
+
 // --- Top menu bar ----------------------------------------------------------
 constexpr int   kMenuQuads = 1024;          // must match kMenuQ in main.cpp
 constexpr int   kMenuVerts = kMenuQuads * 4;
@@ -1160,7 +1307,7 @@ constexpr float kMenuCheckW   = 24.0f;      // left gutter holding the check tic
 constexpr float kMenuPadX     = 14.0f;      // dropdown left/right padding
 constexpr float kMenuShortGap = 28.0f;      // gap between label and the shortcut
 constexpr float kMenuMinDropW = 190.0f;     // minimum dropdown width (px)
-constexpr float kMenuTextH    = 26.0f;      // dropdown/title text px height
+constexpr float kMenuTextH    = kUiTextPx;  // dropdown/title text px height
 
 // Left edge (px) of menu title `i` and (via out_x1) its right edge. Titles are laid
 // out left to right, each `textWidth + 2*pad` wide. Identical maths in the builder
@@ -1177,37 +1324,74 @@ float menuTitleRect(const MenuBar& mb, const core::Font& f, float th, int i,
     return x;
 }
 
-// Dropdown panel width for a menu: the widest item (check gutter + label + optional
-// shortcut), clamped to a minimum.
-float menuDropWidth(const Menu& m, const core::Font& f, float th) {
+// Panel width for a list of items: the widest item (check gutter + label +
+// optional shortcut + submenu arrow), clamped to a minimum.
+float menuItemsWidth(const std::vector<MenuItem>& items, const core::Font& f, float th) {
     float w = kMenuMinDropW;
-    for (const auto& it : m.items) {
+    for (const auto& it : items) {
         if (it.kind == MenuItem::Separator) continue;
         float row = kMenuCheckW + f.textWidth(it.label.c_str(), th) + kMenuPadX;
         if (!it.shortcut.empty())
             row += kMenuShortGap + f.textWidth(it.shortcut.c_str(), th);
+        if (!it.submenu.empty())
+            row += kMenuShortGap + f.textWidth(">", th);
         w = (std::max)(w, row);
     }
     return w;
 }
 
-// Total dropdown height (sum of row heights; separators are shorter).
-float menuDropHeight(const Menu& m) {
+// Total panel height (sum of row heights; separators are shorter).
+float menuItemsHeight(const std::vector<MenuItem>& items) {
     float h = 0.0f;
-    for (const auto& it : m.items) h += (it.kind == MenuItem::Separator ? kMenuSepH : kMenuItemH);
+    for (const auto& it : items) h += (it.kind == MenuItem::Separator ? kMenuSepH : kMenuItemH);
     return h;
 }
 
-// Top edge (px, relative to the bar bottom) of item `i`, and its height via out_h.
-float menuItemTop(const Menu& m, int i, float* out_h) {
+// Top edge (px, relative to the panel top) of item `i`, and its height via out_h.
+float menuItemTopIn(const std::vector<MenuItem>& items, int i, float* out_h) {
     float y = 0.0f;
-    for (int k = 0; k < static_cast<int>(m.items.size()); ++k) {
-        float h = (m.items[k].kind == MenuItem::Separator ? kMenuSepH : kMenuItemH);
+    for (int k = 0; k < static_cast<int>(items.size()); ++k) {
+        float h = (items[k].kind == MenuItem::Separator ? kMenuSepH : kMenuItemH);
         if (k == i) { if (out_h) *out_h = h; return y; }
         y += h;
     }
     if (out_h) *out_h = 0.0f;
     return y;
+}
+
+// Menu-level wrappers (operate on a Menu's item list).
+float menuDropWidth(const Menu& m, const core::Font& f, float th) {
+    return menuItemsWidth(m.items, f, th);
+}
+float menuDropHeight(const Menu& m) { return menuItemsHeight(m.items); }
+float menuItemTop(const Menu& m, int i, float* out_h) {
+    return menuItemTopIn(m.items, i, out_h);
+}
+
+// If a dropdown item with a submenu is currently open, return its flyout panel
+// rect in pixels (fx0/fy0 top-left, fw/fh size) and the child item list; else
+// return null. The flyout sits to the right of the dropdown, aligned to the
+// parent item's top, and flips to the left if it would run off-screen.
+const std::vector<MenuItem>* openFlyoutRect(const MenuBar& mb, const core::Font& f,
+                                            float th, float W, float barH, float& fx0,
+                                            float& fy0, float& fw, float& fh) {
+    if (mb.openMenu < 0 || mb.openMenu >= static_cast<int>(mb.menus.size())) return nullptr;
+    const Menu& m = mb.menus[mb.openMenu];
+    if (mb.openSub < 0 || mb.openSub >= static_cast<int>(m.items.size())) return nullptr;
+    const MenuItem& parent = m.items[mb.openSub];
+    if (parent.submenu.empty()) return nullptr;
+
+    float tx1, tx0 = menuTitleRect(mb, f, th, mb.openMenu, &tx1);
+    float dw  = menuDropWidth(m, f, th);
+    float dx0 = clampf(tx0, 0.0f, (std::max)(0.0f, W - dw));
+    float ih, iy = barH + menuItemTop(m, mb.openSub, &ih);
+
+    fw = menuItemsWidth(parent.submenu, f, th);
+    fh = menuItemsHeight(parent.submenu);
+    fx0 = dx0 + dw;
+    if (fx0 + fw > W) fx0 = (std::max)(0.0f, dx0 - fw);  // flip left if off-screen
+    fy0 = iy;
+    return &parent.submenu;
 }
 
 // Builds the bar in normalized [0,1]^2 (y-up) over an overlay whose pixel size is
@@ -1265,35 +1449,50 @@ void buildMenuGeometry(const MenuBar& mb, render::Vertex* out, uint32_t viewport
         text(st, W - stw - 14.0f, (barH + th) * 0.5f - 2.0f, th, stCol, 0.5f);
     }
 
+    // Draw one dropdown/flyout panel of items at pixel rect (px0, pyTop) sized
+    // (pw x its content height). Shared by the main dropdown and the flyout.
+    auto drawPanel = [&](const std::vector<MenuItem>& items, float px0, float pw,
+                         float pyTop, int hoverIdx) {
+        float ph = menuItemsHeight(items);
+        solid(px0, pyTop, px0 + pw, pyTop + ph, 0.13f, 0.14f, 0.17f, 0.2f);  // panel
+        for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+            const MenuItem& it = items[i];
+            float ih, iy = pyTop + menuItemTopIn(items, i, &ih);
+            if (it.kind == MenuItem::Separator) {
+                solid(px0 + kMenuPadX, iy + ih * 0.5f - 1.0f, px0 + pw - kMenuPadX,
+                      iy + ih * 0.5f + 1.0f, 0.30f, 0.32f, 0.38f, 0.25f);
+                continue;
+            }
+            if (i == hoverIdx)
+                solid(px0, iy, px0 + pw, iy + ih, 0.24f, 0.30f, 0.42f, 0.25f);
+            float baseY = iy + (ih + th) * 0.5f - 2.0f;
+            if (it.kind == MenuItem::Check && it.checked)  // tick in the left gutter
+                solid(px0 + 9.0f, iy + ih * 0.5f - 5.0f, px0 + 19.0f,
+                      iy + ih * 0.5f + 5.0f, 0.55f, 0.85f, 1.0f, 0.3f);
+            text(it.label.c_str(), px0 + kMenuCheckW, baseY, th, txt, 0.5f);
+            if (!it.submenu.empty()) {                       // submenu arrow
+                float aw = f.textWidth(">", th);
+                text(">", px0 + pw - kMenuPadX - aw, baseY, th, dim, 0.5f);
+            } else if (!it.shortcut.empty()) {
+                float sw = f.textWidth(it.shortcut.c_str(), th);
+                text(it.shortcut.c_str(), px0 + pw - kMenuPadX - sw, baseY, th, dim, 0.5f);
+            }
+        }
+    };
+
     // Open dropdown.
     if (mb.openMenu >= 0 && mb.openMenu < static_cast<int>(mb.menus.size())) {
         const Menu& m = mb.menus[mb.openMenu];
         float tx1, tx0 = menuTitleRect(mb, f, th, mb.openMenu, &tx1);
         float dw = menuDropWidth(m, f, th);
         float dx0 = clampf(tx0, 0.0f, (std::max)(0.0f, W - dw));  // keep on screen
-        float dh = menuDropHeight(m);
-        solid(dx0, barH, dx0 + dw, barH + dh, 0.13f, 0.14f, 0.17f, 0.2f);  // panel
+        drawPanel(m.items, dx0, dw, barH, mb.hoverItem);
 
-        for (int i = 0; i < static_cast<int>(m.items.size()); ++i) {
-            const MenuItem& it = m.items[i];
-            float ih, iy = barH + menuItemTop(m, i, &ih);
-            if (it.kind == MenuItem::Separator) {
-                solid(dx0 + kMenuPadX, iy + ih * 0.5f - 1.0f, dx0 + dw - kMenuPadX,
-                      iy + ih * 0.5f + 1.0f, 0.30f, 0.32f, 0.38f, 0.25f);
-                continue;
-            }
-            if (i == mb.hoverItem)
-                solid(dx0, iy, dx0 + dw, iy + ih, 0.24f, 0.30f, 0.42f, 0.25f);
-            float baseY = iy + (ih + th) * 0.5f - 2.0f;
-            if (it.kind == MenuItem::Check && it.checked)  // tick in the left gutter
-                solid(dx0 + 9.0f, iy + ih * 0.5f - 5.0f, dx0 + 19.0f,
-                      iy + ih * 0.5f + 5.0f, 0.55f, 0.85f, 1.0f, 0.3f);
-            text(it.label.c_str(), dx0 + kMenuCheckW, baseY, th, txt, 0.5f);
-            if (!it.shortcut.empty()) {
-                float sw = f.textWidth(it.shortcut.c_str(), th);
-                text(it.shortcut.c_str(), dx0 + dw - kMenuPadX - sw, baseY, th, dim, 0.5f);
-            }
-        }
+        // Submenu flyout (one nesting level), to the right of the open item.
+        float fx0, fy0, fw, fh;
+        const std::vector<MenuItem>* sub =
+            openFlyoutRect(mb, f, th, W, barH, fx0, fy0, fw, fh);
+        if (sub) drawPanel(*sub, fx0, fw, fy0, mb.hoverSub);
     }
 
     for (int i = q * 4; i < kMenuVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
@@ -1307,7 +1506,7 @@ constexpr float kTbTop     = kMenuBarHeight + 10.0f;
 constexpr float kTbBtn     = 46.0f;                // button size (px, square)
 constexpr float kTbGap     = 4.0f;                 // gap between buttons in a group
 constexpr float kTbGroupGap= 14.0f;               // gap between groups
-constexpr float kTbText    = 22.0f;               // button caption px height
+constexpr float kTbText    = kUiTextPx;           // button caption px height
 constexpr int   kTbQuads   = 512;
 constexpr int   kTbVerts   = kTbQuads * 4;
 
@@ -1524,26 +1723,71 @@ void menuBarInputSystem(entt::registry& world, core::Input& input,
         }
     }
 
-    // Hovering a different title while a menu is open switches to it (classic UX).
-    if (mb->openMenu >= 0 && onTitle >= 0 && onTitle != mb->openMenu)
-        mb->openMenu = onTitle;
+    // Submenu flyout: hovering a dropdown item with a submenu opens its flyout;
+    // hovering a non-submenu item closes any flyout. While the pointer is inside
+    // the flyout itself, hoverItem is -1 (it is outside the main panel) so
+    // openSub is left untouched and the flyout stays open.
+    if (mb->openMenu >= 0 && mb->openMenu < nMenus && mb->hoverItem >= 0) {
+        const Menu& m = mb->menus[mb->openMenu];
+        mb->openSub = m.items[mb->hoverItem].submenu.empty() ? -1 : mb->hoverItem;
+    }
+    mb->hoverSub = -1;
+    bool inFlyout = false;
+    {
+        float fx0, fy0, fw, fh;
+        const std::vector<MenuItem>* sub =
+            openFlyoutRect(*mb, f, th, W, barH, fx0, fy0, fw, fh);
+        if (sub && mx >= fx0 && mx < fx0 + fw && my >= fy0 && my < fy0 + fh) {
+            inFlyout = true;
+            inDrop   = true;  // treat the flyout as part of the dropdown
+            float local = my - fy0;
+            for (int i = 0; i < static_cast<int>(sub->size()); ++i) {
+                float ih, iy = menuItemTopIn(*sub, i, &ih);
+                if (local >= iy && local < iy + ih) {
+                    if ((*sub)[i].kind != MenuItem::Separator) mb->hoverSub = i;
+                    break;
+                }
+            }
+        }
+    }
 
-    // The bar (and an open dropdown) own their pixels: suppress orbit/picking.
+    // Hovering a different title while a menu is open switches to it (classic UX).
+    if (mb->openMenu >= 0 && onTitle >= 0 && onTitle != mb->openMenu) {
+        mb->openMenu = onTitle;
+        mb->openSub = -1; mb->hoverSub = -1;
+    }
+
+    // The bar (and an open dropdown/flyout) own their pixels: suppress orbit/picking.
     if (inBar || inDrop) input.captured = true;
 
     if (input.leftClicked) {
         if (onTitle >= 0) {
             mb->openMenu   = (mb->openMenu == onTitle) ? -1 : onTitle;  // toggle
+            mb->openSub = -1; mb->hoverSub = -1;
+            input.captured = true;
+        } else if (inFlyout) {
+            if (mb->hoverSub >= 0) {
+                float fx0, fy0, fw, fh;
+                const std::vector<MenuItem>* sub =
+                    openFlyoutRect(*mb, f, th, W, barH, fx0, fy0, fw, fh);
+                if (sub) mb->triggered = (*sub)[mb->hoverSub].action;
+            }
+            mb->openMenu = -1; mb->openSub = -1; mb->hoverSub = -1;
             input.captured = true;
         } else if (inDrop) {
             if (mb->hoverItem >= 0) {
                 const Menu& m = mb->menus[mb->openMenu];
-                mb->triggered = m.items[mb->hoverItem].action;  // dispatched by the app
+                const MenuItem& it = m.items[mb->hoverItem];
+                if (!it.submenu.empty()) {
+                    mb->openSub = mb->hoverItem;   // parent: open flyout, don't trigger
+                } else {
+                    mb->triggered = it.action;     // dispatched by the app
+                    mb->openMenu = -1; mb->openSub = -1; mb->hoverSub = -1;
+                }
             }
-            mb->openMenu   = -1;
             input.captured = true;
         } else {
-            mb->openMenu = -1;                // click elsewhere closes the menu
+            mb->openMenu = -1; mb->openSub = -1; mb->hoverSub = -1;  // elsewhere closes
         }
     }
 }
@@ -1619,6 +1863,23 @@ std::vector<Menu> defaultAppMenus() {
         geo.items.push_back(sep());
         geo.items.push_back(act("Poisson Reconstruction...", A::PoissonDialogToggle));
         menus.push_back(std::move(geo));
+    }
+    {  // Pipelines: multi-step geometry pipelines, with nested sub-steps.
+        MenuItem occlusal{"Estimate Occlusal Plane", "", A::None, K::Action, false};
+        occlusal.submenu = {
+            act("Estimate Occlusal Plane", A::PipelineOcclusalEstimate),  // full pipeline
+            sep(),
+            act("Whole-mesh PCA",   A::PipelineOcclusalWholePCA),
+            act("Find Cusp",        A::PipelineOcclusalFindCusp),
+            act("Plane from Cusps", A::PipelineOcclusalPlaneFromCusps),
+        };
+        Menu pipe{"Pipelines", {}};
+        pipe.items.push_back(occlusal);
+        pipe.items.push_back(act("Occlusal 2D Render", A::PipelineOcclusal2DRender));
+        pipe.items.push_back(act("Segment 2D (Classical)", A::PipelineSegment2DClassical));
+        pipe.items.push_back(act("Segment 2D (SAM/AI)",    A::PipelineSegment2DSAM));
+        pipe.items.push_back(act("Segment 3D (Teeth)",     A::PipelineSegment3D));
+        menus.push_back(std::move(pipe));
     }
     menus.push_back({"Create", {
         act("Plane",    A::CreatePlane),
@@ -2642,6 +2903,33 @@ void poissonDialogInputSystem(entt::registry& world, core::Input& input,
     if (inPanel) input.captured = true;
 }
 
+void confirmDialogInputSystem(entt::registry& world, core::Input& input,
+                              uint32_t viewportW, uint32_t viewportH) {
+    ConfirmDialog* d = nullptr;
+    auto view = world.view<ConfirmDialog>();
+    for (auto e : view) { d = &view.get<ConfirmDialog>(e); break; }
+    if (!d || !d->visible) return;
+
+    if (!d->placed) {
+        d->x = ((int)viewportW - d->w) / 2;
+        d->y = ((int)viewportH - d->h) / 2;
+        d->placed = true;
+    }
+
+    float mx = input.mousePosX, my = input.mousePosY;
+    bool inPanel = mx >= d->x && mx <= d->x + d->w && my >= d->y && my <= d->y + d->h;
+    if (inPanel) input.captured = true;  // soft-modal: eat clicks over the panel
+
+    auto hit = [&](const CRect& r) {
+        return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
+    };
+    ConfirmRects R = confirmRects(*d);
+    if (input.leftClicked) {
+        if (hit(R.yes)) { d->yes = true;  d->answered = true; d->visible = false; input.captured = true; }
+        else if (hit(R.no)) { d->yes = false; d->answered = true; d->visible = false; input.captured = true; }
+    }
+}
+
 // Build the wireframe vertices for a spatial structure over `P` (and `indices`
 // for the triangle BVH). Self-contained (no GPU, no registry) so it runs on a
 // worker thread; the caller uploads `outVerts` to the GPU. `progress` reports
@@ -2861,12 +3149,14 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
 
         Eigen::Matrix4f model = Mworld * t.matrix();
 
-        // 1) Visible pass, in this mesh's own drawing mode.
+        // 1) Visible pass, in this mesh's own drawing + coloring mode.
         renderer.setDrawMode(static_cast<uint32_t>(r.drawMode));
+        renderer.setColorMode(r.colorMode);
         render::DrawItem item;
         item.mesh = r.mesh;
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);
+        renderer.setColorMode(0);  // selection silhouette/box stays its own color
 
         if (r.selected && r.pointCloud) {
             // A point cloud has no solid surface for a stencil silhouette, so mark
@@ -2907,7 +3197,8 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
             renderer.submit(outline);
         }
     }
-    renderer.setDrawMode(kSolid);  // scene only: rest stays solid
+    renderer.setDrawMode(kSolid);   // scene only: rest stays solid
+    renderer.setColorMode(0);       // overlays/grid/debug use original color
 
     // --- Element selection highlights (vertex/edge/face) ---------------
     // Baked ONCE into a static, per-entity GPU mesh (local space) when the
@@ -3079,6 +3370,8 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     }
 
     // --- Immediate-mode debug geometry (world space, behind the grid) --
+    emitOcclusalPlaneViz(world);  // re-add the latched occlusal plane/arrow
+    emitCuspViz(world);           // re-add the latched cusp markers
     drawDebugGeometry(world, renderer, Mworld);
 
     // --- Infinite ground grid (depth-tested against the scene) ---------
@@ -3362,6 +3655,61 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         break;
     }
 
+    // --- Confirm (Yes/No) dialog overlay ------------------------------
+    auto cdview = world.view<ConfirmDialog>();
+    for (auto entity : cdview) {
+        const auto& cd = cdview.get<ConfirmDialog>(entity);
+        if (!cd.visible || !cd.font || cd.mesh == render::kInvalidMesh) break;
+
+        render::Vertex verts[kConfirmVerts];
+        buildConfirmDialogGeometry(cd, verts);
+        renderer.updateBuffer(cd.vbo, verts, sizeof(verts));
+
+        render::OverlayContext ov;
+        ov.x = cd.x; ov.y = cd.y; ov.width = cd.w; ov.height = cd.h;
+        ov.clearDepth = true;
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+        std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+        renderer.beginOverlay(ov);
+
+        render::DrawItem item;
+        item.mesh    = cd.mesh;
+        item.texture = cd.atlas;
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
+        std::memcpy(item.model, model.data(), sizeof(item.model));
+        renderer.submit(item);
+        break;
+    }
+
+    // --- Occlusal 2D render: depth / normal / curvature panels ---------
+    auto orview = world.view<OcclusalRenderViz>();
+    for (auto entity : orview) {
+        const auto& orv = orview.get<OcclusalRenderViz>(entity);
+        if (!orv.visible || orv.quad == render::kInvalidMesh) break;
+        const int sz = 200, pad = 10;
+        int y = (int)viewportH - sz - pad;
+        for (int c = 0; c < orv.count; ++c) {
+            if (orv.tex[c] == render::kInvalidTexture) continue;
+            render::OverlayContext ov;
+            ov.x = pad + c * (sz + pad); ov.y = y; ov.width = sz; ov.height = sz;
+            ov.clearDepth = true;
+            Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+            Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+            std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+            std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+            renderer.beginOverlay(ov);
+            render::DrawItem item;
+            item.mesh    = orv.quad;
+            item.texture = orv.tex[c];
+            Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
+            std::memcpy(item.model, model.data(), sizeof(item.model));
+            renderer.submit(item);
+        }
+        break;
+    }
+
     // --- Left selection toolbar overlay -------------------------------
     auto tbs = world.view<SelectionToolbar>();
     for (auto entity : tbs) {
@@ -3409,6 +3757,14 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
                           ? menuDropHeight(mb.menus[mb.openMenu])
                           : 0.0f;
         float overlayH = static_cast<float>(mb.height) + dropH;
+        // Grow further if an open submenu flyout extends past the dropdown bottom.
+        if (mb.font) {
+            float fx0, fy0, fw, fh;
+            const float W = static_cast<float>(viewportW);
+            if (openFlyoutRect(mb, *mb.font, kMenuTextH, W, static_cast<float>(mb.height),
+                               fx0, fy0, fw, fh))
+                overlayH = (std::max)(overlayH, fy0 + fh);
+        }
 
         render::Vertex verts[kMenuVerts];
         buildMenuGeometry(mb, verts, viewportW, overlayH);
