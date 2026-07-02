@@ -48,6 +48,11 @@ void crossSectionInputSystem(entt::registry& world, core::Input& input,
 void poissonDialogInputSystem(entt::registry& world, core::Input& input,
                               uint32_t viewportW, uint32_t viewportH);
 
+// Centered Yes/No confirmation dialog: hit-tests the two buttons, raises the
+// `answered`/`yes` edge and hides on a click. Captures input over the panel.
+void confirmDialogInputSystem(entt::registry& world, core::Input& input,
+                              uint32_t viewportW, uint32_t viewportH);
+
 // Axis gizmo input: each frame, ray-picks the gizmo cube under the cursor to
 // update the hover region; on click, classifies the hit as face/edge/corner and
 // starts a smooth camera snap toward that view (plus a click-flash). Runs before

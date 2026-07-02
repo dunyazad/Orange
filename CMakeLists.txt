@@ -64,5 +64,6 @@ add_subdirectory(engine)              # the reusable engine (core + render plugi
 
 # Apps built on the engine. Add more here, each a thin orange_add_app().
 add_subdirectory(app/appOrange)
+add_subdirectory(app/cusp_probe)      # CLI diagnostic for findCusps tuning
 
 message(STATUS "Orange: output dir = ${ORANGE_BIN_DIR}")

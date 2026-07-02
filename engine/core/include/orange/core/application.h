@@ -53,13 +53,22 @@ private:
     bool                          capture_ = false;  // 'C' pressed -> screenshot
     float                         pointSize_ = 6.0f; // point-cloud sprite size (+/- keys)
     bool                          lighting_  = true; // point-sprite shading (` toggles)
-    uint32_t                      colorMode_ = 3;    // scene coloring (3 = grayscale default; Shift+` cycles)
+    uint32_t                      colorMode_ = 0;    // legacy base; per-mesh Renderable.colorMode drives the scene now
     bool                          vsync_     = true; // swap interval (menu toggles it)
+
+    // 3D tooth-segmentation view: a per-tooth-coloured copy of the source mesh,
+    // spawned while the source is hidden. Tracked so a re-run cleans up the old one.
+    entt::entity         segEntity_ = entt::null;
+    entt::entity         segSource_ = entt::null;
+    render::MeshHandle   segMesh_   = render::kInvalidMesh;
+    render::BufferHandle segVbo_    = render::kInvalidBuffer;
 
     // Dispatch a MenuBar action (mirrors the keyboard shortcuts); set checkmarks on
     // the menu items from the live state before drawing. Both run each frame.
     void applyMenuAction(int action);
     void syncMenu();
+    void recomputeCusps();      // re-run findCusps from cached CuspParams, refresh CuspViz
+    bool fitPlaneFromCusps();   // PCA-fit the (non-outlier) cusp tips -> OcclusalPlaneViz
 
     static std::string defaultPluginName(render::Backend backend);
     static std::string executableDir();

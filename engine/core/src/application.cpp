@@ -7,7 +7,11 @@
 
 #include "orange/core/draw_mode.h"
 #include "orange/core/modes.h"
+#include "orange/core/occlusal_plane.h"
+#include "orange/core/occlusal_render.h"
 #include "orange/core/primitives.h"
+#include "orange/core/sam_segment.h"
+#include "orange/core/tooth_segment.h"
 #include "orange/core/screenshot.h"
 #include "orange/ecs/components.h"
 #include "orange/ecs/systems.h"
@@ -151,16 +155,39 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                         SDL_Log("Application: point size = %.0f", pointSize_);
                     }
                     if (e.key.scancode == SDL_SCANCODE_GRAVE) {
-                        if (e.key.mod & SDL_KMOD_SHIFT) {  // Shift+` cycles scene coloring
-                            colorMode_ = (colorMode_ + 1) % 4;  // default/height/position/gray
-                            plugin_->renderer()->setColorMode(colorMode_);
+                        if (e.key.mod & SDL_KMOD_SHIFT) {  // Shift+` cycles the selection's coloring
+                            auto v = world_.view<ecs::Renderable>();
+                            size_t count = 0; for (auto e2 : v) { (void)e2; ++count; }
+                            uint32_t base = 0;
+                            for (auto e2 : v) {
+                                auto& rr = v.get<ecs::Renderable>(e2);
+                                if (rr.selected || count == 1) { base = rr.colorMode; break; }
+                            }
+                            uint32_t next = (base + 1) % 4;  // default/height/position/gray
+                            for (auto e2 : v) {
+                                auto& rr = v.get<ecs::Renderable>(e2);
+                                if (rr.selected || count == 1) rr.colorMode = next;
+                            }
                             static const char* kColorNames[4] = {"default", "height",
                                                                  "position", "grayscale"};
-                            SDL_Log("Application: color mode = %s", kColorNames[colorMode_]);
+                            SDL_Log("Application: color mode = %s", kColorNames[next]);
                         } else {                           // ` toggles point-sprite lighting
                             lighting_ = !lighting_;
                             plugin_->renderer()->setLighting(lighting_);
                             SDL_Log("Application: lighting = %s", lighting_ ? "on" : "off");
+                        }
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_LEFTBRACKET ||
+                        e.key.scancode == SDL_SCANCODE_RIGHTBRACKET) {  // [ / ] tune cusp prominence
+                        auto& ctx = world_.ctx();
+                        if (ctx.contains<ecs::CuspParams>() && ctx.get<ecs::CuspParams>().ready) {
+                            auto& cp = ctx.get<ecs::CuspParams>();
+                            cp.heightGate += (e.key.scancode == SDL_SCANCODE_RIGHTBRACKET) ? 0.05f : -0.05f;
+                            if (cp.heightGate < 0.0f) cp.heightGate = 0.0f;
+                            if (cp.heightGate > 0.9f) cp.heightGate = 0.9f;
+                            recomputeCusps();
+                            SDL_Log("Application: cusp height gate = %.2f (%zu cusps)",
+                                    cp.heightGate, ctx.get<ecs::CuspViz>().points.size());
                         }
                     }
                     if (e.key.scancode == SDL_SCANCODE_SPACE) {  // Space toggles the grid
@@ -270,6 +297,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         ecs::cameraControlsInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::crossSectionInputSystem(world_, input_, window_.width(), window_.height());
         ecs::poissonDialogInputSystem(world_, input_, window_.width(), window_.height());
+        ecs::confirmDialogInputSystem(world_, input_, window_.width(), window_.height());
         ecs::axisGizmoInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::selectionToolbarInputSystem(world_, input_, window_.width(), window_.height());
         ecs::cameraManipulatorSystem(world_, input_, dt);
@@ -301,9 +329,17 @@ void Application::applyMenuAction(int action) {
             rr.drawMode = dm;
         }
     };
+    // Apply a scene-coloring mode to the selected meshes (or the only mesh).
     auto setColor = [&](uint32_t mode) {
         colorMode_ = mode;
-        if (r) r->setColorMode(colorMode_);
+        auto v = world_.view<ecs::Renderable>();
+        size_t count = 0;
+        for (auto ent : v) { (void)ent; ++count; }
+        for (auto ent : v) {
+            auto& rr = v.get<ecs::Renderable>(ent);
+            if (!rr.selected && count != 1) continue;
+            rr.colorMode = mode;
+        }
     };
     auto setMode = [&](int idx) {
         auto& ctx = world_.ctx();
@@ -372,6 +408,84 @@ void Application::applyMenuAction(int action) {
         world_.emplace<ecs::PickGeometry>(e, std::move(pick));
     };
     const Eigen::Vector3f kPrimColor(0.72f, 0.74f, 0.78f);  // neutral (recolored by color mode)
+
+    // Pull the first selected mesh's vertices into world space (for the pipeline
+    // steps), along with its triangle index list. Returns false if nothing
+    // suitable is selected; reports the world bbox diagonal for marker sizing.
+    auto selectedWorldPoints = [&](std::vector<Eigen::Vector3f>& out,
+                                   std::vector<uint32_t>& outIdx, float& diag) -> bool {
+        entt::entity src = entt::null, only = entt::null;
+        size_t count = 0;
+        auto v = world_.view<ecs::Renderable, ecs::PickGeometry, ecs::Transform>();
+        for (auto ent : v) {
+            ++count; only = ent;
+            if (v.get<ecs::Renderable>(ent).selected) { src = ent; break; }
+        }
+        if (src == entt::null && count == 1) src = only;  // single mesh: run without selecting
+        if (src == entt::null) return false;
+        const auto& pick = world_.get<ecs::PickGeometry>(src);
+        const Eigen::Matrix4f M = world_.get<ecs::Transform>(src).matrix();
+        out.clear();
+        out.reserve(pick.positions.size());
+        Eigen::Vector3f mn = Eigen::Vector3f::Constant(FLT_MAX);
+        Eigen::Vector3f mx = Eigen::Vector3f::Constant(-FLT_MAX);
+        for (const auto& p : pick.positions) {
+            Eigen::Vector4f wp = M * Eigen::Vector4f(p.x(), p.y(), p.z(), 1.0f);
+            Eigen::Vector3f w(wp.x(), wp.y(), wp.z());
+            out.push_back(w);
+            mn = mn.cwiseMin(w); mx = mx.cwiseMax(w);
+        }
+        outIdx = pick.indices;  // triangle list shares the position indexing
+        diag = out.empty() ? 0.0f : (mx - mn).norm();
+        return !out.empty();
+    };
+
+    // Compute the occlusal channels for the current plane + cached mesh, then
+    // upload `count` of them (3 = channels, 4 = + segmentation) as the bottom
+    // panels. Returns false if there is no plane/mesh yet.
+    auto showChannels = [&](int count) -> bool {
+        auto& ctx = world_.ctx();
+        if (!ctx.contains<ecs::OcclusalPlaneViz>() || !ctx.contains<ecs::CuspParams>() || !r)
+            return false;
+        auto& pv = ctx.get<ecs::OcclusalPlaneViz>();  // position/normal persist even if hidden
+        auto& cp = ctx.get<ecs::CuspParams>();
+        if (!cp.ready || cp.points.empty()) return false;
+
+        geometry::OcclusalChannels ch =
+            geometry::renderOcclusalChannels(cp.points, pv.position, pv.normal, 256);
+        if (!ch.valid) return false;
+
+        auto rv = world_.view<ecs::OcclusalRenderViz>();
+        for (auto e : rv) {
+            auto& orv = rv.get<ecs::OcclusalRenderViz>(e);
+            for (int c = 0; c < 4; ++c)
+                if (orv.tex[c] != render::kInvalidTexture) {
+                    r->destroyTexture(orv.tex[c]); orv.tex[c] = render::kInvalidTexture;
+                }
+            auto mk = [&](const std::vector<uint8_t>& px) {
+                render::TextureDesc td;
+                td.width = ch.width; td.height = ch.height; td.pixels = px.data();
+                return r->createTexture(td);
+            };
+            orv.tex[0] = mk(ch.depth);
+            orv.tex[1] = mk(ch.normal);
+            orv.tex[2] = mk(ch.curvature);
+            if (count >= 4) orv.tex[3] = mk(ch.segment);
+            orv.count   = count;
+            orv.visible = true;
+            return true;
+        }
+        return false;
+    };
+
+    // Any menu action clears the pipeline overlays (occlusal plane / cusp
+    // markers); the pipeline steps below re-activate their own when they run.
+    {
+        auto& c = world_.ctx();
+        if (c.contains<ecs::OcclusalPlaneViz>())  c.get<ecs::OcclusalPlaneViz>().active = false;
+        if (c.contains<ecs::CuspViz>())           c.get<ecs::CuspViz>().active = false;
+        if (c.contains<ecs::OcclusalRenderViz>()) c.get<ecs::OcclusalRenderViz>().visible = false;
+    }
 
     switch (static_cast<A>(action)) {
         case A::OpenFile: {
@@ -519,8 +633,283 @@ void Application::applyMenuAction(int action) {
             for (auto ent : v) { auto& pd = v.get<ecs::PoissonDialog>(ent); pd.visible = !pd.visible; break; }
             break;
         }
+
+        case A::PipelineOcclusalWholePCA: {
+            // Coarse whole-mesh PCA plane of the selected mesh, latched for viz.
+            std::vector<Eigen::Vector3f> pts;
+            std::vector<uint32_t> idx;
+            float diag = 0.0f;
+            if (!selectedWorldPoints(pts, idx, diag)) break;
+            geometry::OcclusalPlane plane = geometry::wholeMeshPCA(pts);
+            if (!plane.valid) break;
+
+            auto& ctx = world_.ctx();
+            if (!ctx.contains<ecs::OcclusalPlaneViz>()) ctx.emplace<ecs::OcclusalPlaneViz>();
+            auto& viz = ctx.get<ecs::OcclusalPlaneViz>();
+            viz.active   = true;
+            viz.position = plane.position;
+            viz.normal   = plane.normal;
+            viz.size     = diag * 0.5f;
+            break;
+        }
+        case A::PipelineOcclusalFindCusp: {
+            // Detect cusp tips on the selected mesh (mesh-graph local maxima).
+            // Cache the input so [ / ] can re-tune the prominence threshold live.
+            std::vector<Eigen::Vector3f> pts;
+            std::vector<uint32_t> idx;
+            float diag = 0.0f;
+            if (!selectedWorldPoints(pts, idx, diag)) break;
+
+            auto& ctx = world_.ctx();
+            if (!ctx.contains<ecs::CuspParams>()) ctx.emplace<ecs::CuspParams>();
+            auto& cp = ctx.get<ecs::CuspParams>();
+            cp.points  = std::move(pts);
+            cp.indices = std::move(idx);
+            cp.diag    = diag;
+            cp.ready   = true;
+            recomputeCusps();  // uses cp.prominence (persists across runs)
+            break;
+        }
+        case A::PipelineOcclusalPlaneFromCusps:
+            fitPlaneFromCusps();  // needs cusps from a prior Find Cusp
+            break;
+        case A::PipelineOcclusalEstimate: {
+            // Full pipeline in one click: detect cusps on the selected mesh, then
+            // fit the occlusal plane to them. Shows plane + cusp markers together.
+            std::vector<Eigen::Vector3f> pts;
+            std::vector<uint32_t> idx;
+            float diag = 0.0f;
+            if (!selectedWorldPoints(pts, idx, diag)) break;
+
+            auto& ctx = world_.ctx();
+            if (!ctx.contains<ecs::CuspParams>()) ctx.emplace<ecs::CuspParams>();
+            auto& cp = ctx.get<ecs::CuspParams>();
+            cp.points  = std::move(pts);
+            cp.indices = std::move(idx);
+            cp.diag    = diag;
+            cp.ready   = true;
+            recomputeCusps();     // -> CuspViz (markers + outliers)
+            fitPlaneFromCusps();  // -> OcclusalPlaneViz (refined plane)
+            break;
+        }
+        case A::PipelineOcclusal2DRender:
+            // Stage 2: depth / normal / curvature panels (needs a plane first).
+            showChannels(3);
+            break;
+        case A::PipelineSegment2DClassical:
+            // Stage 3a: + the classical watershed segmentation panel.
+            showChannels(4);
+            break;
+        case A::PipelineSegment2DSAM: {
+            // Stage 3b: on-device MobileSAM. Encode the occlusal normal image, run
+            // the mask decoder per cusp tip (prompt), merge into per-tooth masks.
+            auto setStatus = [&](const std::string& s) {
+                auto mv = world_.view<ecs::MenuBar>();
+                for (auto e : mv) { mv.get<ecs::MenuBar>(e).statusText = s; break; }
+            };
+            if (!orange::ml::samAvailable()) { setStatus("SAM: ONNX runtime not built"); break; }
+
+            auto& ctx = world_.ctx();
+            if (!ctx.contains<ecs::OcclusalPlaneViz>() || !ctx.contains<ecs::CuspParams>() ||
+                !ctx.contains<ecs::CuspViz>() || !r) { setStatus("SAM: run Estimate first"); break; }
+            auto& pv  = ctx.get<ecs::OcclusalPlaneViz>();
+            auto& cp  = ctx.get<ecs::CuspParams>();
+            auto& cvz = ctx.get<ecs::CuspViz>();
+            if (!cp.ready || cp.points.empty() || cvz.points.empty()) { setStatus("SAM: run Estimate first"); break; }
+
+            geometry::OcclusalChannels ch =
+                geometry::renderOcclusalChannels(cp.points, pv.position, pv.normal, 256);
+            if (!ch.valid) break;
+
+            // SAM input image = the normal channel (RGB), prompts = non-outlier cusps.
+            std::vector<uint8_t> rgb((size_t)ch.width * ch.height * 3);
+            for (size_t i = 0; i < (size_t)ch.width * ch.height; ++i) {
+                rgb[i * 3 + 0] = ch.normal[i * 4 + 0];
+                rgb[i * 3 + 1] = ch.normal[i * 4 + 1];
+                rgb[i * 3 + 2] = ch.normal[i * 4 + 2];
+            }
+            std::vector<std::pair<float, float>> pts;
+            for (size_t j = 0; j < cvz.points.size(); ++j) {
+                if (j < cvz.outlier.size() && cvz.outlier[j]) continue;
+                Eigen::Vector3f d = cvz.points[j] - ch.origin;
+                float px = (d.dot(ch.u) - ch.aOff) / ch.cell;
+                float row = (float)(ch.height - 1) - (d.dot(ch.v) - ch.bOff) / ch.cell;
+                if (px >= 0 && px < ch.width && row >= 0 && row < ch.height)
+                    pts.emplace_back(px, row);
+            }
+
+            orange::ml::SamResult sam = orange::ml::samSegment(rgb, ch.width, ch.height, pts);
+
+            auto rv = world_.view<ecs::OcclusalRenderViz>();
+            for (auto e : rv) {
+                auto& orv = rv.get<ecs::OcclusalRenderViz>(e);
+                for (int c = 0; c < 4; ++c)
+                    if (orv.tex[c] != render::kInvalidTexture) {
+                        r->destroyTexture(orv.tex[c]); orv.tex[c] = render::kInvalidTexture;
+                    }
+                auto mk = [&](const std::vector<uint8_t>& pxs) {
+                    render::TextureDesc td;
+                    td.width = ch.width; td.height = ch.height; td.pixels = pxs.data();
+                    return r->createTexture(td);
+                };
+                orv.tex[0] = mk(ch.depth);
+                orv.tex[1] = mk(ch.normal);
+                orv.tex[2] = mk(ch.curvature);
+                orv.tex[3] = mk(sam.valid ? sam.rgba : ch.segment);
+                orv.count   = 4;
+                orv.visible = true;
+                break;
+            }
+            setStatus(sam.valid ? ("SAM: " + std::to_string(sam.regions) + " teeth")
+                                : "SAM: inference failed");
+            break;
+        }
+        case A::PipelineSegment3D: {
+            // Stage 5: per-tooth watershed on the mesh itself; spawn a colour-coded
+            // copy and hide the source. Runs on the selected (or only) mesh.
+            if (!r) break;
+            entt::entity src = entt::null, only = entt::null;
+            size_t cnt = 0;
+            auto v = world_.view<ecs::Renderable, ecs::PickGeometry, ecs::Transform>();
+            for (auto ent : v) { ++cnt; only = ent; if (v.get<ecs::Renderable>(ent).selected) { src = ent; break; } }
+            if (src == entt::null && cnt == 1) src = only;
+            if (src == entt::null) break;
+
+            const auto& pick = world_.get<ecs::PickGeometry>(src);
+            const Eigen::Matrix4f M = world_.get<ecs::Transform>(src).matrix();
+            std::vector<Eigen::Vector3f> wv;
+            wv.reserve(pick.positions.size());
+            for (const auto& p : pick.positions) {
+                Eigen::Vector4f w = M * Eigen::Vector4f(p.x(), p.y(), p.z(), 1.0f);
+                wv.emplace_back(w.x(), w.y(), w.z());
+            }
+            geometry::ToothSegResult seg = geometry::segmentTeeth(wv, pick.indices);
+            if (!seg.valid) break;
+
+            // Clean up a previous run + restore the previously-hidden source.
+            if (segEntity_ != entt::null && world_.valid(segEntity_)) world_.destroy(segEntity_);
+            if (segMesh_ != render::kInvalidMesh) r->destroyMesh(segMesh_);
+            if (segVbo_ != render::kInvalidBuffer) r->destroyBuffer(segVbo_);
+            if (segSource_ != entt::null && world_.valid(segSource_) && world_.all_of<ecs::Renderable>(segSource_))
+                world_.get<ecs::Renderable>(segSource_).visible = true;
+
+            auto toothColor = [](int lbl) -> Eigen::Vector3f {
+                if (lbl < 0) return Eigen::Vector3f(0.55f, 0.55f, 0.58f);  // gingiva/base: grey
+                uint32_t h = (uint32_t)(lbl + 1) * 2654435761u;
+                float hue = (float)(h & 0xFFFF) / 65535.0f * 6.0f;
+                float x = 1.0f - std::fabs(std::fmod(hue, 2.0f) - 1.0f);
+                Eigen::Vector3f c;
+                if (hue < 1) c = {1, x, 0}; else if (hue < 2) c = {x, 1, 0};
+                else if (hue < 3) c = {0, 1, x}; else if (hue < 4) c = {0, x, 1};
+                else if (hue < 5) c = {x, 0, 1}; else c = {1, 0, x};
+                return c * 0.65f + Eigen::Vector3f(0.18f, 0.18f, 0.18f);
+            };
+
+            // Colour-coded triangle soup (world coords; spawned at identity).
+            std::vector<render::Vertex> verts;
+            verts.reserve(pick.indices.size());
+            Eigen::Vector3f mn = Eigen::Vector3f::Constant(FLT_MAX), mx = Eigen::Vector3f::Constant(-FLT_MAX);
+            for (uint32_t ii : pick.indices) {
+                if (ii >= wv.size()) continue;
+                const Eigen::Vector3f& p = wv[ii];
+                Eigen::Vector3f col = toothColor(ii < seg.label.size() ? seg.label[ii] : -1);
+                render::Vertex vv{};
+                vv.position[0] = p.x(); vv.position[1] = p.y(); vv.position[2] = p.z();
+                vv.color[0] = col.x(); vv.color[1] = col.y(); vv.color[2] = col.z();
+                verts.push_back(vv);
+                mn = mn.cwiseMin(p); mx = mx.cwiseMax(p);
+            }
+
+            render::BufferDesc bd;
+            bd.type = render::BufferType::Vertex; bd.usage = render::BufferUsage::Static;
+            bd.data = verts.data(); bd.size = verts.size() * sizeof(render::Vertex);
+            segVbo_ = r->createBuffer(bd);
+            render::MeshDesc md;
+            md.vertexBuffer = segVbo_; md.indexBuffer = render::kInvalidBuffer;
+            md.layout = render::Vertex::layout(); md.vertexCount = (uint32_t)verts.size();
+            segMesh_ = r->createMesh(md);
+
+            auto e = world_.create();
+            world_.emplace<ecs::Transform>(e, ecs::Transform{});
+            ecs::Renderable rr;
+            rr.mesh = segMesh_; rr.boundsMin = mn; rr.boundsMax = mx;
+            rr.colorMode = 0;  // show the per-tooth vertex colours, not a height map
+            world_.emplace<ecs::Renderable>(e, rr);
+
+            world_.get<ecs::Renderable>(src).visible = false;  // hide the original
+            segEntity_ = e; segSource_ = src;
+
+            auto mvb = world_.view<ecs::MenuBar>();
+            for (auto me : mvb) { mvb.get<ecs::MenuBar>(me).statusText =
+                "3D segmentation: " + std::to_string(seg.regions) + " teeth"; break; }
+            break;
+        }
         case A::None:  break;
     }
+}
+
+void Application::recomputeCusps() {
+    auto& ctx = world_.ctx();
+    if (!ctx.contains<ecs::CuspParams>()) return;
+    auto& cp = ctx.get<ecs::CuspParams>();
+    if (!cp.ready) return;
+
+    geometry::OcclusalPlaneParams params;
+    params.cuspHeightGate = cp.heightGate;
+    std::vector<Eigen::Vector3f> cusps = geometry::findCusps(cp.points, cp.indices, params);
+
+    // Flag tips whose HEIGHT along the occlusal axis deviates far from the mean
+    // tip height (drawn red) -- only the axis projection matters, not distance in
+    // the occlusal plane (the arch spreads tips out in-plane on purpose).
+    std::vector<uint8_t> outlier(cusps.size(), 0);
+    if (cusps.size() >= 3) {
+        geometry::OcclusalPlane plane = geometry::wholeMeshPCA(cp.points);
+        const Eigen::Vector3f n = plane.normal, o = plane.position;
+        std::vector<float> h(cusps.size());
+        double sum = 0.0, sum2 = 0.0;
+        for (size_t i = 0; i < cusps.size(); ++i) {
+            h[i] = (cusps[i] - o).dot(n);
+            sum += h[i]; sum2 += (double)h[i] * h[i];
+        }
+        double mean = sum / cusps.size();
+        double sd = std::sqrt(std::max(0.0, sum2 / cusps.size() - mean * mean));
+        for (size_t i = 0; i < cusps.size(); ++i)
+            outlier[i] = std::abs((double)h[i] - mean) > 2.0 * sd ? 1 : 0;
+    }
+
+    if (!ctx.contains<ecs::CuspViz>()) ctx.emplace<ecs::CuspViz>();
+    auto& cv = ctx.get<ecs::CuspViz>();
+    cv.active  = true;
+    cv.points  = std::move(cusps);
+    cv.outlier = std::move(outlier);
+    cv.size    = cp.diag;
+}
+
+bool Application::fitPlaneFromCusps() {
+    // Fit the occlusal plane to the (non-outlier) cusp tips -- the design doc's
+    // refined estimate. Keeps the cusp markers visible alongside the plane.
+    auto& ctx = world_.ctx();
+    if (!ctx.contains<ecs::CuspViz>()) return false;
+    auto& cv = ctx.get<ecs::CuspViz>();
+    if (cv.points.empty()) return false;  // run Find Cusp first
+
+    std::vector<Eigen::Vector3f> tips;
+    tips.reserve(cv.points.size());
+    for (size_t i = 0; i < cv.points.size(); ++i)
+        if (i >= cv.outlier.size() || !cv.outlier[i]) tips.push_back(cv.points[i]);
+    if (tips.size() < 3) return false;
+
+    geometry::OcclusalPlane plane = geometry::wholeMeshPCA(tips);
+    if (!plane.valid) return false;
+
+    if (!ctx.contains<ecs::OcclusalPlaneViz>()) ctx.emplace<ecs::OcclusalPlaneViz>();
+    auto& pv = ctx.get<ecs::OcclusalPlaneViz>();
+    pv.active   = true;
+    pv.position = plane.position;
+    pv.normal   = plane.normal;
+    pv.size     = (cv.size > 0.0f ? cv.size : 1.0f) * 0.5f;
+    cv.active   = true;  // keep the cusp markers on screen with the plane
+    return true;
 }
 
 void Application::syncMenu() {
@@ -537,6 +926,12 @@ void Application::syncMenu() {
       for (auto e : v) { csOn = v.get<ecs::CrossSection>(e).enabled; break; } }
     int viz = 0;
     if (world_.ctx().contains<ecs::SpatialViz>()) viz = world_.ctx().get<ecs::SpatialViz>().kind;
+    // Color-menu ticks reflect the selected mesh (or the only mesh).
+    uint32_t colorSel = colorMode_;
+    { auto v = world_.view<ecs::Renderable>();
+      size_t count = 0; for (auto e : v) { (void)e; ++count; }
+      for (auto e : v) { auto& rr = v.get<ecs::Renderable>(e);
+                         if (rr.selected || count == 1) { colorSel = rr.colorMode; break; } } }
 
     for (auto& menu : mb->menus)
         for (auto& it : menu.items) {
@@ -545,10 +940,10 @@ void Application::syncMenu() {
                 case A::ToggleLighting:     it.checked = lighting_;       break;
                 case A::ToggleVsync:        it.checked = vsync_;          break;
                 case A::ToggleCrossSection: it.checked = csOn;            break;
-                case A::ColorOriginal:      it.checked = colorMode_ == 0; break;
-                case A::ColorHeight:        it.checked = colorMode_ == 1; break;
-                case A::ColorPosition:      it.checked = colorMode_ == 2; break;
-                case A::ColorGray:          it.checked = colorMode_ == 3; break;
+                case A::ColorOriginal:      it.checked = colorSel == 0;   break;
+                case A::ColorHeight:        it.checked = colorSel == 1;   break;
+                case A::ColorPosition:      it.checked = colorSel == 2;   break;
+                case A::ColorGray:          it.checked = colorSel == 3;   break;
                 case A::SpatialNone:        it.checked = viz == 0;        break;
                 case A::SpatialBVH:         it.checked = viz == 1;        break;
                 case A::SpatialOctree:      it.checked = viz == 2;        break;
