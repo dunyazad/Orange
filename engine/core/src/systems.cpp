@@ -29,6 +29,7 @@
 #include "orange/core/math.h"
 #include "orange/core/modes.h"
 #include "orange/ecs/components.h"
+#include "orange/ecs/undo.h"
 
 namespace orange::ecs {
 
@@ -170,9 +171,10 @@ void emitCuspViz(entt::registry& world) {
 struct ModeJob {
     std::atomic<bool>           done{false};
     std::atomic<float>          progress{0.0f};  // [0,1], updated by the worker
-    std::vector<render::Vertex> verts;
-    std::vector<uint8_t>        mask;             // per-point flags (mask modes only)
-    modes::MaskKind             maskKind = modes::MaskKind::None;
+    std::vector<render::Vertex> verts;            // debug geometry (Draw / Recolor extras)
+    std::vector<uint8_t>        mask;              // per-point delete flags (Remove)
+    std::vector<Eigen::Vector3f> colors;           // per-point colors (Recolor; x<0 = keep)
+    modes::ApplyKind            applyKind = modes::ApplyKind::Draw;
     uint64_t                    gen = 0, sig = 0;
     int                         index = -1;       // which mode (for the status label)
 };
@@ -185,6 +187,7 @@ struct ModeCache {
     uint64_t generation = 0;
     uint64_t selSig     = 0;   // signature of the selection the displayed result was built from
     std::vector<render::Vertex> verts;
+    bool hideSource = false;   // hide the source while the displayed result is a Draw overlay
 
     std::shared_ptr<ModeJob> job;     // running computation (null if idle)
     std::thread              worker;
@@ -206,6 +209,47 @@ struct ModeCache {
         if (worker.joinable()) worker.detach();
     }
 };
+
+// Replace a point cloud's vertex set: new GPU buffer + mesh (the old buffer may
+// be smaller than a restore), refreshed bounds and pick positions. Shared by the
+// bump-remove apply and its undo/redo closures.
+void applyCloudVertices(entt::registry& world, render::IRenderer& renderer, entt::entity e,
+                        const std::vector<render::Vertex>& verts) {
+    if (!world.valid(e) || !world.all_of<VertexSource>(e) || !world.all_of<Renderable>(e) ||
+        verts.empty())
+        return;
+    auto& vs    = world.get<VertexSource>(e);
+    vs.vertices = verts;
+    render::BufferDesc bd;
+    bd.type  = render::BufferType::Vertex;
+    bd.usage = render::BufferUsage::Static;
+    bd.data  = vs.vertices.data();
+    bd.size  = vs.vertices.size() * sizeof(render::Vertex);
+    vs.vbo = renderer.createBuffer(bd);
+
+    auto& r = world.get<Renderable>(e);
+    renderer.destroyMesh(r.mesh);
+    render::MeshDesc md;
+    md.vertexBuffer = vs.vbo;
+    md.layout       = render::Vertex::layout();
+    md.vertexCount  = (uint32_t)vs.vertices.size();
+    md.topology     = render::PrimitiveTopology::Points;
+    r.mesh = renderer.createMesh(md);
+
+    Eigen::Vector3f mn = Eigen::Vector3f::Constant(FLT_MAX);
+    Eigen::Vector3f mx = Eigen::Vector3f::Constant(-FLT_MAX);
+    auto& pg = world.get_or_emplace<PickGeometry>(e);
+    pg.positions.clear();
+    pg.positions.reserve(vs.vertices.size());
+    for (const auto& v : vs.vertices) {
+        Eigen::Vector3f p(v.position[0], v.position[1], v.position[2]);
+        pg.positions.push_back(p);
+        mn = mn.cwiseMin(p);
+        mx = mx.cwiseMax(p);
+    }
+    r.boundsMin = mn;
+    r.boundsMax = mx;
+}
 } // namespace
 
 // Runs the active processing mode on the *selected* entity's point cloud. The
@@ -234,16 +278,21 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
         if (hasFixed) {
             selSig = 0xFFFFFFFFFFFFFFFFull;
         } else {
+            // The first selected entity -- or, when nothing is selected and
+            // exactly one cloud/mesh is loaded, that one (no need to select it).
+            entt::entity only = entt::null;
+            size_t count = 0;
             auto v = world.view<Renderable, PickGeometry>();
             for (auto e : v) {
-                if (!v.get<Renderable>(e).selected) continue;
-                const auto& pg = v.get<PickGeometry>(e);
-                if (pg.positions.empty()) break;
-                src = e;
-                selSig = ((uint64_t)(uint32_t)entt::to_integral(e) << 32) ^
-                         (uint64_t)pg.positions.size();
-                break;
+                if (v.get<PickGeometry>(e).positions.empty()) continue;
+                ++count;
+                only = e;
+                if (v.get<Renderable>(e).selected) { src = e; break; }
             }
+            if (src == entt::null && count == 1) src = only;
+            if (src != entt::null)
+                selSig = ((uint64_t)(uint32_t)entt::to_integral(src) << 32) ^
+                         (uint64_t)world.get<PickGeometry>(src).positions.size();
         }
     }
     // What the displayed result should answer. Fold in the mode index so switching
@@ -280,32 +329,34 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
     if (cache.job && cache.job->done.load(std::memory_order_acquire)) {
         if (cache.worker.joinable()) cache.worker.join();
         if (cache.job->gen == want && cache.job->sig == selSig) {  // still relevant
-            if (cache.job->maskKind == modes::MaskKind::Recolor && src != entt::null &&
+            if (cache.job->applyKind == modes::ApplyKind::Recolor && src != entt::null &&
                 world.all_of<VertexSource>(src)) {
-                // Paint the flagged points red IN the source buffer (original
-                // colors stay in VertexSource for the restore).
-                const auto& vs   = world.get<VertexSource>(src);
-                const auto& mask = cache.job->mask;
+                // Paint the mode's per-point colors IN the source buffer (a
+                // color with x < 0 keeps the original; originals stay in
+                // VertexSource for the restore). Extra debug geometry (e.g.
+                // cluster boxes) still displays via cache.verts.
+                const auto& vs     = world.get<VertexSource>(src);
+                const auto& colors = cache.job->colors;
                 std::vector<render::Vertex> painted = vs.vertices;
-                size_t n = std::min(painted.size(), mask.size()), flagged = 0;
-                for (size_t i = 0; i < n; ++i)
-                    if (mask[i]) {
-                        painted[i].color[0] = 1.0f;
-                        painted[i].color[1] = 0.05f;
-                        painted[i].color[2] = 0.05f;
-                        ++flagged;
-                    }
+                size_t n = std::min(painted.size(), colors.size());
+                for (size_t i = 0; i < n; ++i) {
+                    if (colors[i].x() < 0.0f) continue;
+                    painted[i].color[0] = colors[i].x();
+                    painted[i].color[1] = colors[i].y();
+                    painted[i].color[2] = colors[i].z();
+                }
                 renderer.updateBuffer(vs.vbo, painted.data(),
                                       painted.size() * sizeof(render::Vertex));
                 cache.recoloredSrc = src;
-                cache.verts.clear();
-                SDL_Log("processingModeSystem: %s done (%zu/%zu points flagged)",
-                        modes::modeName(state.index), flagged, n);
-            } else if (cache.job->maskKind == modes::MaskKind::Remove && src != entt::null &&
+                cache.verts        = std::move(cache.job->verts);
+                cache.hideSource   = false;
+                SDL_Log("processingModeSystem: %s done (recolored %zu points)",
+                        modes::modeName(state.index), n);
+            } else if (cache.job->applyKind == modes::ApplyKind::Remove && src != entt::null &&
                        world.all_of<VertexSource>(src)) {
-                // Delete the flagged points: compact the CPU copy, re-upload,
-                // and rebuild the mesh with the smaller count. Deactivate the
-                // mode afterwards so the shrunk cloud isn't reprocessed.
+                // Delete the flagged points: compact the CPU copy and swap in a
+                // new buffer/mesh (undoable). Deactivate the mode afterwards so
+                // the shrunk cloud isn't reprocessed.
                 auto&       vs   = world.get<VertexSource>(src);
                 const auto& mask = cache.job->mask;
                 std::vector<render::Vertex> kept;
@@ -314,41 +365,33 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
                     if (i >= mask.size() || !mask[i]) kept.push_back(vs.vertices[i]);
                 size_t removed = vs.vertices.size() - kept.size();
                 if (removed > 0 && !kept.empty()) {
-                    vs.vertices = std::move(kept);
-                    renderer.updateBuffer(vs.vbo, vs.vertices.data(),
-                                          vs.vertices.size() * sizeof(render::Vertex));
-                    auto& r = world.get<Renderable>(src);
-                    renderer.destroyMesh(r.mesh);
-                    render::MeshDesc md;
-                    md.vertexBuffer = vs.vbo;
-                    md.layout       = render::Vertex::layout();
-                    md.vertexCount  = (uint32_t)vs.vertices.size();
-                    md.topology     = render::PrimitiveTopology::Points;
-                    r.mesh          = renderer.createMesh(md);
-                    Eigen::Vector3f mn = Eigen::Vector3f::Constant(FLT_MAX);
-                    Eigen::Vector3f mx = Eigen::Vector3f::Constant(-FLT_MAX);
-                    auto& pg = world.get<PickGeometry>(src);
-                    pg.positions.clear();
-                    pg.positions.reserve(vs.vertices.size());
-                    for (const auto& v : vs.vertices) {
-                        Eigen::Vector3f p(v.position[0], v.position[1], v.position[2]);
-                        pg.positions.push_back(p);
-                        mn = mn.cwiseMin(p);
-                        mx = mx.cwiseMax(p);
-                    }
-                    r.boundsMin = mn;
-                    r.boundsMax = mx;
+                    auto oldVerts =
+                        std::make_shared<std::vector<render::Vertex>>(vs.vertices);
+                    auto newVerts =
+                        std::make_shared<std::vector<render::Vertex>>(std::move(kept));
+                    applyCloudVertices(world, renderer, src, *newVerts);
+                    UndoOp op;
+                    op.label = "Bump: Remove";
+                    op.undo  = [e = src, oldVerts](entt::registry& w, render::IRenderer& r) {
+                        applyCloudVertices(w, r, e, *oldVerts);
+                    };
+                    op.redo = [e = src, newVerts](entt::registry& w, render::IRenderer& r) {
+                        applyCloudVertices(w, r, e, *newVerts);
+                    };
+                    undoStack(world).push(std::move(op));
                 }
                 SDL_Log("processingModeSystem: %s done (%zu points removed)",
                         modes::modeName(state.index), removed);
                 cache.verts.clear();
+                cache.hideSource = false;
                 if (ctx.contains<modes::ModeState>()) {
                     auto& ms = ctx.get<modes::ModeState>();
                     ms.index = -1;
                     ms.generation++;
                 }
             } else {
-                cache.verts = std::move(cache.job->verts);
+                cache.verts      = std::move(cache.job->verts);
+                cache.hideSource = !cache.verts.empty();
                 SDL_Log("processingModeSystem: %s done (%zu verts)", modes::modeName(state.index),
                         cache.verts.size());
             }
@@ -362,6 +405,7 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
     //    and be discarded above on a later frame).
     if (!active || (!hasFixed && src == entt::null)) {
         if (!cache.verts.empty()) { cache.verts.clear(); cache.generation = 0; cache.selSig = 0; }
+        cache.hideSource = false;
         syncHidden(entt::null);
         restoreRecolor();
         debug::DebugDraw::instance().addRaw(cache.verts);
@@ -389,16 +433,31 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
             if (world.all_of<Transform>(src)) M = world.get<Transform>(src).matrix();
         }
 
+        // Current parameter values from the mode-params dialog (if it is
+        // editing this mode); modes fall back to their defaults otherwise.
+        std::vector<float> params;
+        {
+            auto dv = world.view<ModeParamsDialog>();
+            for (auto de : dv) {
+                const auto& d = dv.get<ModeParamsDialog>(de);
+                if (d.modeIndex == state.index) {
+                    int n = modes::modeParamCount(state.index);
+                    params.assign(d.values, d.values + (n < 8 ? n : 8));
+                }
+                break;
+            }
+        }
+
         auto job = std::make_shared<ModeJob>();
         job->gen   = want;
         job->sig   = selSig;
         job->index = state.index;
-        // Mask modes edit the source buffer instead of drawing -- only possible
-        // when the source is a real entity with a CPU vertex copy (not a fixed
-        // ctx input); otherwise they fall back to their drawing implementation.
-        job->maskKind = (!hasFixed && src != entt::null && world.all_of<VertexSource>(src))
-                            ? modes::modeMaskKind(state.index)
-                            : modes::MaskKind::None;
+        // Recolor/Remove modes edit the source buffer instead of drawing --
+        // only possible when the source is a real entity with a CPU vertex
+        // copy (not a fixed ctx input); otherwise fall back to drawing.
+        job->applyKind = (!hasFixed && src != entt::null && world.all_of<VertexSource>(src))
+                             ? modes::modeApplyKind(state.index)
+                             : modes::ApplyKind::Draw;
         cache.job  = job;
         SDL_Log("processingModeSystem: %s running in background on %zu points...",
                 modes::modeName(state.index),
@@ -406,7 +465,8 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
         int  idx = state.index;
         bool useFixed = hasFixed;
         cache.worker = std::thread(
-            [job, idx, useFixed, fixed = std::move(fixedInput), raw = std::move(raw), M]() mutable {
+            [job, idx, useFixed, fixed = std::move(fixedInput), raw = std::move(raw), M,
+             params = std::move(params)]() mutable {
                 modes::ModeInput in;
                 if (useFixed) {
                     in = std::move(fixed);
@@ -417,11 +477,16 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
                         in.points[i]      = Eigen::Vector3f(w.x(), w.y(), w.z());
                     }
                 }
+                in.params = std::move(params);
                 auto onProgress = [job](float f) {
                     job->progress.store(f, std::memory_order_relaxed);
                 };
-                if (job->maskKind != modes::MaskKind::None) {
+                if (job->applyKind == modes::ApplyKind::Remove) {
                     modes::runModeMask(idx, in, job->mask, onProgress);
+                } else if (job->applyKind == modes::ApplyKind::Recolor) {
+                    debug::DebugDraw extras;
+                    modes::runModeColors(idx, in, job->colors, extras, onProgress);
+                    job->verts = extras.vertices();
                 } else {
                     debug::DebugDraw tmp;
                     modes::runMode(idx, in, tmp, onProgress);
@@ -431,10 +496,10 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
             });
     }
 
-    // Hide the source only once ITS result is the one on screen (a stale result
-    // from a previous selection keeps drawing until the new job lands; don't
-    // hide the new source under someone else's result).
-    syncHidden(!cache.verts.empty() && !hasFixed && cache.selSig == selSig ? src : entt::null);
+    // Hide the source only while a Draw-overlay result of ITS OWN is on screen
+    // (Recolor results paint the source itself, so it must stay visible; a
+    // stale result from a previous selection must not hide the new source).
+    syncHidden(cache.hideSource && !hasFixed && cache.selSig == selSig ? src : entt::null);
 
     debug::DebugDraw::instance().addRaw(cache.verts);
 }
@@ -446,6 +511,148 @@ bool processingModeProgress(entt::registry& world, float& outProgress, std::stri
     if (!cache.job || cache.job->done.load(std::memory_order_acquire)) return false;
     outProgress = cache.job->progress.load(std::memory_order_relaxed);
     outName     = modes::modeName(cache.job->index);
+    return true;
+}
+
+// --- Undo / redo (see orange/ecs/undo.h) -------------------------------------
+
+UndoStack& undoStack(entt::registry& world) {
+    auto& ctx = world.ctx();
+    if (!ctx.contains<UndoStack>()) ctx.emplace<UndoStack>();
+    return ctx.get<UndoStack>();
+}
+
+EntitySnapshotPtr captureEntity(entt::registry& world, entt::entity e) {
+    if (!world.valid(e) || !world.all_of<Renderable>(e) || !world.all_of<VertexSource>(e))
+        return nullptr;
+    EntitySnapshotPtr snap;
+    if (world.all_of<UndoRef>(e) && world.get<UndoRef>(e).snap)
+        snap = world.get<UndoRef>(e).snap;
+    else {
+        snap = std::make_shared<EntitySnapshot>();
+        world.emplace_or_replace<UndoRef>(e, UndoRef{snap});
+    }
+    const auto& r = world.get<Renderable>(e);
+    snap->entity     = e;
+    snap->vertices   = world.get<VertexSource>(e).vertices;
+    snap->indices    = world.all_of<PickGeometry>(e) ? world.get<PickGeometry>(e).indices
+                                                     : std::vector<uint32_t>{};
+    snap->transform  = world.all_of<Transform>(e) ? world.get<Transform>(e) : Transform{};
+    snap->drawMode   = r.drawMode;
+    snap->colorMode  = r.colorMode;
+    snap->pointCloud = r.pointCloud;
+    return snap;
+}
+
+void rebuildEntity(entt::registry& world, render::IRenderer& renderer,
+                   const EntitySnapshotPtr& snap) {
+    if (!snap || snap->vertices.empty()) return;
+    if (world.valid(snap->entity)) return;  // already alive (double-redo guard)
+
+    render::BufferDesc bd;
+    bd.type  = render::BufferType::Vertex;
+    bd.usage = render::BufferUsage::Static;
+    bd.data  = snap->vertices.data();
+    bd.size  = snap->vertices.size() * sizeof(render::Vertex);
+    render::BufferHandle vbo = renderer.createBuffer(bd);
+
+    render::MeshDesc md;
+    md.vertexBuffer = vbo;
+    md.layout       = render::Vertex::layout();
+    md.vertexCount  = (uint32_t)snap->vertices.size();
+    if (snap->pointCloud) {
+        md.topology = render::PrimitiveTopology::Points;
+    } else if (!snap->indices.empty()) {
+        render::BufferDesc id;
+        id.type  = render::BufferType::Index;
+        id.usage = render::BufferUsage::Static;
+        id.data  = snap->indices.data();
+        id.size  = snap->indices.size() * sizeof(uint32_t);
+        md.indexBuffer = renderer.createBuffer(id);
+        md.indexCount  = (uint32_t)snap->indices.size();
+    }
+
+    auto e = world.create();
+    world.emplace<Transform>(e, snap->transform);
+    Renderable r;
+    r.mesh       = renderer.createMesh(md);
+    r.drawMode   = snap->drawMode;
+    r.colorMode  = snap->colorMode;
+    r.pointCloud = snap->pointCloud;
+    Eigen::Vector3f mn = Eigen::Vector3f::Constant(FLT_MAX);
+    Eigen::Vector3f mx = Eigen::Vector3f::Constant(-FLT_MAX);
+    PickGeometry pick;
+    pick.positions.reserve(snap->vertices.size());
+    for (const auto& v : snap->vertices) {
+        Eigen::Vector3f p(v.position[0], v.position[1], v.position[2]);
+        pick.positions.push_back(p);
+        mn = mn.cwiseMin(p);
+        mx = mx.cwiseMax(p);
+    }
+    if (!snap->pointCloud) pick.indices = snap->indices;
+    r.boundsMin = mn;
+    r.boundsMax = mx;
+    world.emplace<Renderable>(e, r);
+    world.emplace<PickGeometry>(e, std::move(pick));
+    world.emplace<VertexSource>(e, VertexSource{vbo, snap->vertices});
+    world.emplace<UndoRef>(e, UndoRef{snap});
+    snap->entity = e;
+}
+
+void pushSpawnOp(entt::registry& world, entt::entity e, const char* label) {
+    auto snap = captureEntity(world, e);
+    if (!snap) return;
+    UndoOp op;
+    op.label = label;
+    op.undo  = [snap](entt::registry& w, render::IRenderer&) {
+        if (w.valid(snap->entity)) w.destroy(snap->entity);
+        snap->entity = entt::null;
+    };
+    op.redo = [snap](entt::registry& w, render::IRenderer& r) { rebuildEntity(w, r, snap); };
+    undoStack(world).push(std::move(op));
+}
+
+void pushDeleteOp(entt::registry& world, const std::vector<entt::entity>& dead,
+                  const char* label) {
+    std::vector<EntitySnapshotPtr> snaps;
+    for (auto e : dead) {
+        auto s = captureEntity(world, e);
+        if (s) snaps.push_back(std::move(s));
+    }
+    if (snaps.empty()) return;
+    UndoOp op;
+    op.label = label;
+    op.undo  = [snaps](entt::registry& w, render::IRenderer& r) {
+        for (const auto& s : snaps) rebuildEntity(w, r, s);
+    };
+    op.redo = [snaps](entt::registry& w, render::IRenderer&) {
+        for (const auto& s : snaps) {
+            if (w.valid(s->entity)) w.destroy(s->entity);
+            s->entity = entt::null;
+        }
+    };
+    undoStack(world).push(std::move(op));
+}
+
+bool undoLast(entt::registry& world, render::IRenderer& renderer) {
+    auto& st = undoStack(world);
+    if (st.done.empty()) return false;
+    UndoOp op = std::move(st.done.back());
+    st.done.pop_back();
+    if (op.undo) op.undo(world, renderer);
+    SDL_Log("undo: %s", op.label.c_str());
+    st.undone.push_back(std::move(op));
+    return true;
+}
+
+bool redoLast(entt::registry& world, render::IRenderer& renderer) {
+    auto& st = undoStack(world);
+    if (st.undone.empty()) return false;
+    UndoOp op = std::move(st.undone.back());
+    st.undone.pop_back();
+    if (op.redo) op.redo(world, renderer);
+    SDL_Log("redo: %s", op.label.c_str());
+    st.done.push_back(std::move(op));
     return true;
 }
 
@@ -1355,6 +1562,146 @@ void buildPoissonDialogGeometry(const PoissonDialog& d, render::Vertex* out) {
     for (int i = q * 4; i < kPoissonVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
 
+// --- Mode-parameters dialog (generic sliders for the active geometry mode) ----
+// Same visual language as the Poisson dialog, but the rows come from the modes
+// registry (modes::modeParam) so every parameterised mode shares one panel.
+constexpr int kModeDlgQuads = 256;
+constexpr int kModeDlgVerts = kModeDlgQuads * 4;
+
+struct ModeDlgRects { CRect track[8]; CRect minus[8]; CRect plus[8]; CRect apply; CRect close; };
+ModeDlgRects modeDlgRects(const ModeParamsDialog& d, int nParams) {
+    ModeDlgRects r;
+    const float pad = 16.0f, btn = 18.0f, gap = 6.0f;
+    for (int i = 0; i < nParams && i < 8; ++i) {
+        float rowTop = d.y + 42.0f + i * 36.0f;
+        // Track leaves room for the -/+ nudge buttons on its right.
+        float trackW = d.w - 2 * pad - 2 * (btn + gap);
+        r.track[i] = {d.x + pad, rowTop + 22.0f, trackW, 6.0f};
+        float by = rowTop + 22.0f + 3.0f - btn * 0.5f;  // centered on the groove
+        r.minus[i] = {d.x + pad + trackW + gap, by, btn, btn};
+        r.plus[i]  = {d.x + pad + trackW + gap + btn + gap, by, btn, btn};
+    }
+    r.apply = {d.x + pad, (float)(d.y + d.h) - 38.0f, d.w - 2 * pad, 28.0f};
+    r.close = {(float)(d.x + d.w) - 24.0f, (float)d.y + 7.0f, 16.0f, 16.0f};
+    return r;
+}
+
+// One increment of param `s` for the -/+ buttons and slider snapping.
+float modeParamStep(const modes::ModeParam& s) {
+    if (s.step > 0.0f) return s.step;
+    if (s.isInt) return 1.0f;
+    return (s.maxV - s.minV) / 100.0f;
+}
+// Clamp + snap a raw value to the param's range/step grid.
+float modeParamSnap(const modes::ModeParam& s, float v) {
+    float st = modeParamStep(s);
+    if (s.step > 0.0f || s.isInt)
+        v = s.minV + std::round((v - s.minV) / st) * st;
+    return clampf(v, s.minV, s.maxV);
+}
+
+void buildModeParamsDialogGeometry(const ModeParamsDialog& d, render::Vertex* out) {
+    const core::Font& f = *d.font;
+    int q = 0;
+    const float wu = f.whiteU, wv = f.whiteV;
+    auto quad = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                    float u0, float v0, float u1, float v1, float z) {
+        if (q >= kModeDlgQuads) return;
+        out[q * 4 + 0] = {{x0, y0, z}, {r, g, b}, {u0, v1}};
+        out[q * 4 + 1] = {{x1, y0, z}, {r, g, b}, {u1, v1}};
+        out[q * 4 + 2] = {{x1, y1, z}, {r, g, b}, {u1, v0}};
+        out[q * 4 + 3] = {{x0, y1, z}, {r, g, b}, {u0, v0}};
+        ++q;
+    };
+    auto solid = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                     float z) { quad(x0, y0, x1, y1, r, g, b, wu, wv, wu, wv, z); };
+    const float xs = static_cast<float>(d.h) / static_cast<float>(d.w);  // aspect fix
+    auto text = [&](const char* s, float penX, float baseY, float h, float r, float g,
+                    float b, float z) {
+        for (; *s; ++s) {
+            const core::Glyph& gl = f.glyph(*s);
+            if (gl.w > 0 && gl.h > 0) {
+                float x0 = penX + gl.xoff * h * xs, y1 = baseY - gl.yoff * h;
+                float x1 = x0 + gl.w * h * xs, y0 = y1 - gl.h * h;
+                quad(x0, y0, x1, y1, r, g, b, gl.u0, gl.v0, gl.u1, gl.v1, z);
+            }
+            penX += gl.advance * h * xs;
+        }
+    };
+    auto textW = [&](const char* s, float h) { return f.textWidth(s, h) * xs; };
+    auto toN = [&](const CRect& rr, float& x0, float& y0, float& x1, float& y1) {
+        x0 = (rr.x - d.x) / d.w;            x1 = (rr.x + rr.w - d.x) / d.w;
+        y1 = 1.0f - (rr.y - d.y) / d.h;     y0 = 1.0f - (rr.y + rr.h - d.y) / d.h;
+    };
+
+    solid(0, 0, 1, 1, 0.10f, 0.11f, 0.13f, 0.0f);                       // panel background
+    solid(0, 1.0f - 28.0f / d.h, 1, 1, 0.16f, 0.18f, 0.22f, 0.05f);     // title bar
+
+    const int nParams = modes::modeParamCount(d.modeIndex);
+    ModeDlgRects R = modeDlgRects(d, nParams);
+    float x0, y0, x1, y1;
+
+    float th = kUiTextPx / d.h;
+    text(modes::modeName(d.modeIndex), 12.0f / d.w, 1.0f - 7.0f / d.h - th, th,
+         0.88f, 0.90f, 0.94f, 0.6f);
+
+    // Close button (x).
+    toN(R.close, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.34f, 0.20f, 0.22f, 0.5f);
+    float ch = (y1 - y0) * 0.7f;
+    text("x", (x0 + x1) * 0.5f - textW("x", ch) * 0.5f, (y0 + y1) * 0.5f - ch * 0.35f, ch,
+         0.92f, 0.86f, 0.86f, 0.6f);
+
+    // Sliders.
+    char buf[32];
+    for (int i = 0; i < nParams && i < 8; ++i) {
+        modes::ModeParam s = modes::modeParam(d.modeIndex, i);
+        const CRect& trk = R.track[i];
+        float val = d.values[i];
+
+        float lh = kUiTextPx / d.h;
+        float labelY = 1.0f - (trk.y - 18.0f - d.y) / d.h;
+        text(s.name, (trk.x - d.x) / d.w, labelY, lh, 0.80f, 0.84f, 0.90f, 0.6f);
+
+        if (s.isInt)                              std::snprintf(buf, sizeof(buf), "%d", (int)std::lround(val));
+        else if (s.step > 0.0f && s.step < 0.01f) std::snprintf(buf, sizeof(buf), "%.3f", val);
+        else                                      std::snprintf(buf, sizeof(buf), "%.2f", val);
+        text(buf, (R.plus[i].x + R.plus[i].w - d.x) / d.w - textW(buf, lh), labelY, lh,
+             0.70f, 0.85f, 1.0f, 0.6f);
+
+        float t = s.maxV > s.minV ? (val - s.minV) / (s.maxV - s.minV) : 0.5f;
+        float hx = trk.x + clampf(t, 0.0f, 1.0f) * trk.w;
+        toN(trk, x0, y0, x1, y1);
+        solid(x0, y0, x1, y1, 0.20f, 0.21f, 0.25f, 0.3f);              // groove
+        float hxn = (hx - d.x) / d.w;
+        solid(x0, y0, hxn, y1, 0.30f, 0.55f, 0.95f, 0.35f);            // filled
+        float hw = 5.0f / d.w;
+        float hy0 = 1.0f - (trk.y + trk.h * 0.5f + 9.0f - d.y) / d.h;
+        float hy1 = 1.0f - (trk.y + trk.h * 0.5f - 9.0f - d.y) / d.h;
+        solid(hxn - hw, hy0, hxn + hw, hy1, 0.95f, 0.95f, 0.95f, 0.5f);  // handle
+
+        // -/+ nudge buttons (one step per click).
+        const char* signs[2] = {"-", "+"};
+        const CRect* brc[2]  = {&R.minus[i], &R.plus[i]};
+        for (int b = 0; b < 2; ++b) {
+            toN(*brc[b], x0, y0, x1, y1);
+            solid(x0, y0, x1, y1, 0.20f, 0.24f, 0.30f, 0.4f);
+            float sh = (y1 - y0) * 0.7f;
+            text(signs[b], (x0 + x1) * 0.5f - textW(signs[b], sh) * 0.5f,
+                 (y0 + y1) * 0.5f - sh * 0.35f, sh, 0.85f, 0.90f, 0.95f, 0.6f);
+        }
+    }
+
+    // Apply button.
+    toN(R.apply, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.20f, 0.42f, 0.30f, 0.3f);
+    float bh = (y1 - y0) * 0.62f;
+    text("Apply", (x0 + x1) * 0.5f - textW("Apply", bh) * 0.5f,
+         (y0 + y1) * 0.5f - bh * 0.35f, bh, 0.90f, 0.96f, 0.92f, 0.6f);
+
+    for (int i = q * 4; i < kModeDlgVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
+}
+
 // --- Confirm (Yes/No) dialog -----------------------------------------------
 constexpr int kConfirmQuads = 192;
 constexpr int kConfirmVerts = kConfirmQuads * 4;
@@ -1940,6 +2287,10 @@ std::vector<Menu> defaultAppMenus() {
         act("Screenshot", A::Screenshot, "C"),
         sep(),
         act("Quit",       A::Quit, "Esc"),
+    }});
+    menus.push_back({"Edit", {
+        act("Undo", A::Undo, "Ctrl+Z"),
+        act("Redo", A::Redo, "Ctrl+Y"),
     }});
     menus.push_back({"View", {
         chk("Ground Grid",   A::ToggleGrid, "Space"),
@@ -3034,6 +3385,95 @@ void poissonDialogInputSystem(entt::registry& world, core::Input& input,
     if (inPanel) input.captured = true;
 }
 
+void modeParamsDialogInputSystem(entt::registry& world, core::Input& input,
+                                 uint32_t viewportW, uint32_t viewportH) {
+    ModeParamsDialog* d = nullptr;
+    auto view = world.view<ModeParamsDialog>();
+    for (auto e : view) { d = &view.get<ModeParamsDialog>(e); break; }
+    if (!d || !d->visible) { if (d) { d->dragSlider = -1; d->dragging = false; } return; }
+
+    const int nParams = modes::modeParamCount(d->modeIndex);
+    if (nParams <= 0) { d->visible = false; return; }
+
+    // Place once beside the center (so it doesn't cover the Poisson dialog).
+    if (!d->placed) {
+        d->x = (static_cast<int>(viewportW) - d->w) / 2 + d->w;
+        d->y = (static_cast<int>(viewportH) - d->h) / 2;
+        d->placed = true;
+    }
+
+    float mx = input.mousePosX, my = input.mousePosY;
+    auto  hit = [&](const CRect& r) {
+        return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
+    };
+    ModeDlgRects R = modeDlgRects(*d, nParams);
+    bool inPanel = mx >= d->x && mx <= d->x + d->w && my >= d->y && my <= d->y + d->h;
+
+    if (input.leftClicked && hit(R.close)) {
+        d->visible = false; d->dragging = false; input.captured = true; return;
+    }
+
+    CRect titleBar = {(float)d->x, (float)d->y, (float)d->w - 28.0f, 28.0f};
+    if (input.leftClicked && hit(titleBar)) {
+        d->dragging = true;
+        d->dragDX = mx - d->x;
+        d->dragDY = my - d->y;
+    }
+    if (!input.buttonLeft) d->dragging = false;
+    if (d->dragging) {
+        d->x = static_cast<int>(mx - d->dragDX);
+        d->y = static_cast<int>(my - d->dragDY);
+        int maxX = static_cast<int>(viewportW) - d->w, maxY = static_cast<int>(viewportH) - d->h;
+        d->x = d->x < 0 ? 0 : (d->x > maxX ? (maxX < 0 ? 0 : maxX) : d->x);
+        d->y = d->y < 0 ? 0 : (d->y > maxY ? (maxY < 0 ? 0 : maxY) : d->y);
+        input.captured = true;
+        return;
+    }
+
+    if (input.leftClicked && hit(R.apply)) {
+        d->requestApply = true;
+        input.captured = true;
+        return;
+    }
+
+    // -/+ nudge buttons: one step per click.
+    if (input.leftClicked) {
+        for (int i = 0; i < nParams && i < 8; ++i) {
+            modes::ModeParam s = modes::modeParam(d->modeIndex, i);
+            float st = modeParamStep(s);
+            if (hit(R.minus[i])) {
+                d->values[i] = modeParamSnap(s, d->values[i] - st);
+                input.captured = true;
+                return;
+            }
+            if (hit(R.plus[i])) {
+                d->values[i] = modeParamSnap(s, d->values[i] + st);
+                input.captured = true;
+                return;
+            }
+        }
+    }
+
+    if (input.leftClicked) {
+        for (int i = 0; i < nParams && i < 8; ++i) {
+            const CRect& t = R.track[i];
+            CRect band = {t.x - 6.0f, t.y - 11.0f, t.w + 12.0f, t.h + 22.0f};
+            if (hit(band)) { d->dragSlider = i; break; }
+        }
+    }
+    if (!input.buttonLeft) d->dragSlider = -1;
+    if (d->dragSlider >= 0 && d->dragSlider < nParams) {
+        modes::ModeParam s = modes::modeParam(d->modeIndex, d->dragSlider);
+        const CRect& t = R.track[d->dragSlider];
+        float u = t.w > 0.0f ? (mx - t.x) / t.w : 0.0f;
+        u = clampf(u, 0.0f, 1.0f);
+        d->values[d->dragSlider] = modeParamSnap(s, s.minV + u * (s.maxV - s.minV));
+        input.captured = true;
+    }
+
+    if (inPanel) input.captured = true;
+}
+
 void confirmDialogInputSystem(entt::registry& world, core::Input& input,
                               uint32_t viewportW, uint32_t viewportH) {
     ConfirmDialog* d = nullptr;
@@ -3432,9 +3872,23 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         if (world.ctx().contains<SpatialViz>()) vizKind = world.ctx().get<SpatialViz>().kind;
         if (vizKind > 0) {
             auto sv = world.view<Transform, Renderable, PickGeometry>();
+            // No selection + exactly one loaded mesh => visualize that one.
+            entt::entity fallback = entt::null;
+            {
+                entt::entity only = entt::null;
+                size_t count = 0;
+                bool anySelected = false;
+                for (auto e : sv) {
+                    if (sv.get<PickGeometry>(e).positions.empty()) continue;
+                    ++count;
+                    only = e;
+                    if (sv.get<Renderable>(e).selected) { anySelected = true; break; }
+                }
+                if (!anySelected && count == 1) fallback = only;
+            }
             for (auto e : sv) {
                 const auto& r = sv.get<Renderable>(e);
-                if (!r.selected) continue;
+                if (!r.selected && e != fallback) continue;
                 const auto& pg = sv.get<PickGeometry>(e);
                 if (pg.positions.empty()) continue;
                 auto& cache = world.get_or_emplace<SpatialVizCache>(e);
@@ -3780,6 +4234,34 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         render::DrawItem item;
         item.mesh    = pd.mesh;
         item.texture = pd.atlas;
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
+        std::memcpy(item.model, model.data(), sizeof(item.model));
+        renderer.submit(item);
+        break;
+    }
+
+    // --- Mode-parameters dialog overlay -------------------------------
+    auto mdview = world.view<ModeParamsDialog>();
+    for (auto entity : mdview) {
+        const auto& md = mdview.get<ModeParamsDialog>(entity);
+        if (!md.visible || !md.font || md.mesh == render::kInvalidMesh) break;
+
+        render::Vertex verts[kModeDlgVerts];
+        buildModeParamsDialogGeometry(md, verts);
+        renderer.updateBuffer(md.vbo, verts, sizeof(verts));
+
+        render::OverlayContext ov;
+        ov.x = md.x; ov.y = md.y; ov.width = md.w; ov.height = md.h;
+        ov.clearDepth = true;
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+        std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+        renderer.beginOverlay(ov);
+
+        render::DrawItem item;
+        item.mesh    = md.mesh;
+        item.texture = md.atlas;
         Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);

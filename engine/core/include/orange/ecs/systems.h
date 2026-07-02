@@ -48,6 +48,12 @@ void crossSectionInputSystem(entt::registry& world, core::Input& input,
 void poissonDialogInputSystem(entt::registry& world, core::Input& input,
                               uint32_t viewportW, uint32_t viewportH);
 
+// Generic mode-parameters dialog: one slider per modes::modeParam of the active
+// mode plus an Apply button (raises ModeParamsDialog::requestApply). Captures
+// input over the panel. No-op while hidden.
+void modeParamsDialogInputSystem(entt::registry& world, core::Input& input,
+                                 uint32_t viewportW, uint32_t viewportH);
+
 // Centered Yes/No confirmation dialog: hit-tests the two buttons, raises the
 // `answered`/`yes` edge and hides on a click. Captures input over the panel.
 void confirmDialogInputSystem(entt::registry& world, core::Input& input,

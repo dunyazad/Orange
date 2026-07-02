@@ -24,6 +24,7 @@ namespace orange::modes {
 struct ModeInput {
     std::vector<Eigen::Vector3f> points;
     std::vector<Eigen::Vector3f> normals;  // optional (used by reconstruction)
+    std::vector<float> params;  // per-mode tunables (see modeParam); empty => defaults
 };
 
 // Active-mode selector, stored in the registry ctx. The host bumps `generation`
@@ -57,15 +58,35 @@ using ProgressFn = std::function<void(float)>;
 void runMode(int index, const ModeInput& in, debug::DebugDraw& out,
              const ProgressFn& progress = {});
 
-// Some modes classify each input point instead of drawing a visualization; the
-// host applies the result to the source cloud itself -- Recolor paints flagged
-// points (restoring on mode end), Remove deletes them from the buffer. Modes
-// with MaskKind::None only draw (and mask modes fall back to their drawing
-// implementation when the host can't edit the source, e.g. a fixed ctx input).
-enum class MaskKind { None = 0, Recolor, Remove };
-MaskKind modeMaskKind(int index);
+// How the host applies a mode's result. Draw modes emit standalone debug
+// geometry (new/moved geometry: reconstruction, smoothing, ICP). Recolor modes
+// classify each input point -- the host paints the source cloud's own vertex
+// colors in place (restored when the mode ends) instead of overlaying debug
+// points. Remove modes delete the flagged points from the source buffer.
+// Recolor/Remove fall back to a drawn visualization when the host can't edit
+// the source (e.g. a fixed ctx input).
+enum class ApplyKind { Draw = 0, Recolor, Remove };
+ApplyKind modeApplyKind(int index);
 
-// Run a mask mode: fills `mask` (one entry per input point, 1 = flagged).
+// A tunable parameter of a mode, edited in the ModeParamsDialog. Values reach
+// the mode through ModeInput::params (index-aligned with modeParam order);
+// "%" parameters are percentages of the input's bounding-box diagonal.
+struct ModeParam {
+    const char* name;
+    float minV, maxV, defV;
+    bool  isInt;
+    float step = 0.0f;  // slider/(+/-) increment; 0 => continuous (int params step 1)
+};
+int       modeParamCount(int index);
+ModeParam modeParam(int index, int p);
+
+// Run a Recolor mode: fills `colors` (one entry per input point; a color with
+// x < 0 keeps that point's original color). Extra non-point visualization
+// (e.g. cluster boxes) lands in `extras`.
+void runModeColors(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                   debug::DebugDraw& extras, const ProgressFn& progress = {});
+
+// Run a Remove mode: fills `mask` (one entry per input point, 1 = delete).
 void runModeMask(int index, const ModeInput& in, std::vector<uint8_t>& mask,
                  const ProgressFn& progress = {});
 

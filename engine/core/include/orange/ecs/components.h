@@ -367,6 +367,31 @@ struct PoissonDialog {
     render::BufferHandle   vbo  = render::kInvalidBuffer;
 };
 
+// Generic parameter dialog for the geometry-processing modes: one slider per
+// modes::modeParam of the active mode, plus an "Apply" button that re-runs it.
+// modeParamsDialogInputSystem handles drags/clicks; Application shows it when a
+// mode with parameters is activated (and hides it on ModeOff). renderSystem
+// draws it as an overlay when `visible`. Values reach the mode through
+// ModeInput::params (processingModeSystem reads them off this component).
+struct ModeParamsDialog {
+    bool visible   = false;
+    int  modeIndex = -1;      // which mode the sliders edit
+    float values[8] = {};     // current values (modes::modeParamCount entries used)
+    bool requestApply = false;  // edge: "Apply" clicked -> app re-runs the mode
+
+    int  w = 280, h = 232;    // h recomputed from the param count when opened
+    int  x = 0, y = 0;
+    bool placed     = false;
+    int  dragSlider = -1;
+    bool dragging   = false;
+    float dragDX = 0, dragDY = 0;
+
+    const core::Font*     font  = nullptr;
+    render::TextureHandle atlas = render::kInvalidTexture;
+    render::MeshHandle     mesh = render::kInvalidMesh;
+    render::BufferHandle   vbo  = render::kInvalidBuffer;
+};
+
 // A centered in-app Yes/No confirmation dialog (replaces native modal popups).
 // confirmDialogInputSystem hit-tests the two buttons; on a click it raises
 // `answered` (+ `yes`) and hides. The app reads the edge, acts on `payload`, then
@@ -545,6 +570,7 @@ enum class MenuAction : int {
     PipelineSegment2DClassical,    // stage 3a: classical watershed 2D segmentation (+ segment panel)
     PipelineSegment2DSAM,          // stage 3b: SAM (ONNX) 2D segmentation (requires ONNX build)
     PipelineSegment3D,             // stage 5: direct 3D per-tooth segmentation (colours the mesh)
+    Undo, Redo,                    // Edit menu / Ctrl+Z / Ctrl+Y (ecs::undoStack)
 };
 
 // One row in a dropdown. kind: Action = clickable command; Check = command that

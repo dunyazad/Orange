@@ -37,6 +37,7 @@
 #include "orange/core/poisson_reconstruction.h"
 #include "orange/ecs/components.h"
 #include "orange/ecs/systems.h"
+#include "orange/ecs/undo.h"
 #include "orange/render/types.h"
 
 using namespace orange;
@@ -653,6 +654,33 @@ int main(int argc, char** argv) {
         world.emplace<ecs::PoissonDialog>(e, pd);
     }
 
+    // Mode-parameters dialog (generic sliders for the active geometry mode).
+    const int kModeDlgQ = 256, kModeDlgV = kModeDlgQ * 4;  // must match kModeDlgQuads in systems.cpp
+    const std::vector<render::Vertex> mdInit(kModeDlgV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
+    std::vector<uint32_t> mdIdx;
+    for (uint32_t q = 0; q < static_cast<uint32_t>(kModeDlgQ); ++q) {
+        uint32_t b = q * 4;
+        mdIdx.insert(mdIdx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+    }
+    core::VertexBuffer<render::Vertex> mdVbo(*app.renderer(), mdInit,
+                                             render::BufferUsage::Dynamic);
+    core::IndexBuffer                  mdIbo(*app.renderer(), mdIdx);
+    render::MeshDesc mdMeshDesc;
+    mdMeshDesc.vertexBuffer = mdVbo.handle();
+    mdMeshDesc.indexBuffer  = mdIbo.handle();
+    mdMeshDesc.layout       = render::Vertex::layout();
+    mdMeshDesc.vertexCount  = static_cast<uint32_t>(kModeDlgV);
+    mdMeshDesc.indexCount   = static_cast<uint32_t>(kModeDlgQ * 6);
+    {
+        auto e = world.create();
+        ecs::ModeParamsDialog md;
+        md.font  = &uiFont;
+        md.atlas = uiFont.texture;
+        md.mesh  = app.renderer()->createMesh(mdMeshDesc);
+        md.vbo   = mdVbo.handle();
+        world.emplace<ecs::ModeParamsDialog>(e, md);
+    }
+
     // Confirm (Yes/No) dialog -- in-app modal used by the "load last mesh" prompt.
     const int kConfirmQ = 192, kConfirmV = kConfirmQ * 4;  // must match kConfirmQuads in systems.cpp
     const std::vector<render::Vertex> cdInit(kConfirmV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
@@ -826,14 +854,15 @@ int main(int argc, char** argv) {
         if (!isPoints) pick.indices = mi;
         world.emplace<ecs::PickGeometry>(e, std::move(pick));
 
-        // Point clouds keep a CPU copy of their vertex buffer so mask modes
-        // (bump detect/remove) can recolor or delete points in place.
-        if (isPoints) {
+        // CPU copy of the vertex buffer: lets mask modes (bump detect/remove)
+        // recolor or delete points in place, and undo/redo rebuild the entity.
+        {
             ecs::VertexSource vsrc;
             vsrc.vbo      = loadedVbos.back()->handle();
             vsrc.vertices = mv;
             world.emplace<ecs::VertexSource>(e, std::move(vsrc));
         }
+        ecs::pushSpawnOp(world, e, ("Load " + path).c_str());
 
         // Frame the camera on the just-loaded mesh: orbit pivot -> bounds center,
         // distance -> fit the bounding sphere to the vertical FOV (+ margin). Also
@@ -1095,8 +1124,9 @@ int main(int argc, char** argv) {
             "+/- resize point-cloud sprites.");
     SDL_Log("appOrange: ESC or close the window to quit.");
 
-    // Offer to reload the mesh from the previous session via the in-app dialog;
-    // a Yes is handled in onUpdate (queues the load like a normal open).
+    // Offer to reload the data (mesh or point cloud) from the previous session
+    // via the in-app dialog; a Yes is handled in onUpdate (queues the load like
+    // a normal open). Enter answers Yes, Esc answers No (see application.cpp).
     {
         std::ifstream in(lastMeshFile);
         std::string last;
@@ -1108,7 +1138,7 @@ int main(int argc, char** argv) {
             auto cdv = world.view<ecs::ConfirmDialog>();
             for (auto e : cdv) {
                 auto& cd  = cdv.get<ecs::ConfirmDialog>(e);
-                cd.line1   = "Load last mesh?";
+                cd.line1   = "Load last data?";
                 cd.line2   = last;
                 cd.payload = last;
                 cd.visible = true;

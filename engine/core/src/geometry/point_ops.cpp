@@ -1,8 +1,11 @@
 #include "orange/core/point_ops.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
+#include <execution>
+#include <numeric>
 
 #include <Eigen/SVD>
 
@@ -17,6 +20,17 @@ float boundsDiag(const std::vector<Eigen::Vector3f>& pts) {
     Eigen::Vector3f mx = Eigen::Vector3f::Constant(-FLT_MAX);
     for (const auto& p : pts) { mn = mn.cwiseMin(p); mx = mx.cwiseMax(p); }
     return (mx - mn).norm();
+}
+
+// Parallel index loop (std::execution::par). fn must only write its own output
+// slot; SparseGrid queries are const and safe to share across threads.
+template <typename F>
+void parallelFor(size_t n, F&& fn) {
+    if (n == 0) return;
+    std::vector<uint32_t> idx(n);
+    std::iota(idx.begin(), idx.end(), 0u);
+    std::for_each(std::execution::par, idx.begin(), idx.end(),
+                  [&](uint32_t i) { fn((size_t)i); });
 }
 } // namespace
 
@@ -41,19 +55,17 @@ std::vector<Eigen::Vector3f> smoothPoints(const std::vector<Eigen::Vector3f>& po
     if (edgePreserving)
         normals = estimateNormals(pts, k, [&](float f) { if (progress) progress(f * nrmEnd); });
 
-    const size_t step = pts.size() / 100 + 1;
-    std::vector<unsigned int> nbr;
-    std::vector<float> dist;
     for (int it = 0; it < iterations; ++it) {
         // Rebuild the grid each iteration since points move.
         SparseGrid grid;
         grid.build(pts, cell);
         std::vector<Eigen::Vector3f> next = pts;
-        for (size_t i = 0; i < pts.size(); ++i) {
-            if (progress && (i % step == 0)) {
-                float frac = ((float)it + (float)i / (float)pts.size()) / (float)iterations;
-                progress(nrmEnd + (1.0f - nrmEnd) * frac);
-            }
+        // Parallel: reads pts/normals, each thread writes only next[i].
+        std::atomic<size_t> done{0};
+        const size_t step = pts.size() / 100 + 1;
+        parallelFor(pts.size(), [&](size_t i) {
+            thread_local std::vector<unsigned int> nbr;
+            thread_local std::vector<float> dist;
             grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
             Eigen::Vector3f acc = Eigen::Vector3f::Zero();
             float wsum = 0.0f;
@@ -72,7 +84,12 @@ std::vector<Eigen::Vector3f> smoothPoints(const std::vector<Eigen::Vector3f>& po
                 Eigen::Vector3f target = acc / wsum;
                 next[i] = pts[i] + lambda * (target - pts[i]);
             }
-        }
+            size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (progress && d % step == 0) {
+                float frac = ((float)it + (float)d / (float)pts.size()) / (float)iterations;
+                progress(nrmEnd + (1.0f - nrmEnd) * frac);
+            }
+        });
         pts.swap(next);
     }
     if (progress) progress(1.0f);
@@ -95,18 +112,23 @@ Eigen::Matrix4f icpAlign(const std::vector<Eigen::Vector3f>& src,
     float prevRmse = FLT_MAX;
     for (int iter = 0; iter < maxIterations; ++iter) {
         if (progress) progress((float)iter / (float)maxIterations);
-        // Closest-point correspondences cur[i] -> dst[match].
-        Eigen::Vector3f meanS = Eigen::Vector3f::Zero(), meanD = Eigen::Vector3f::Zero();
+        // Closest-point correspondences cur[i] -> dst[match]. The queries are
+        // the dominant cost -- parallel per point, serial reductions after.
         std::vector<Eigen::Vector3f> corrD(cur.size());
-        double sse = 0.0;
-        for (size_t i = 0; i < cur.size(); ++i) {
+        std::vector<float> d2s(cur.size());
+        parallelFor(cur.size(), [&](size_t i) {
             float d2 = 0.0f;
             int m = grid.closestPoint(dst, cur[i], d2);
             if (m < 0) m = 0;
             corrD[i] = dst[m];
+            d2s[i]   = d2;
+        });
+        Eigen::Vector3f meanS = Eigen::Vector3f::Zero(), meanD = Eigen::Vector3f::Zero();
+        double sse = 0.0;
+        for (size_t i = 0; i < cur.size(); ++i) {
             meanS += cur[i];
-            meanD += dst[m];
-            sse += d2;
+            meanD += corrD[i];
+            sse += d2s[i];
         }
         meanS /= (float)cur.size();
         meanD /= (float)cur.size();

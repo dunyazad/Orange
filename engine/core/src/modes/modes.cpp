@@ -1,9 +1,12 @@
 #include "orange/core/modes.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
+#include <execution>
 #include <functional>
+#include <numeric>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,17 +40,44 @@ Eigen::Vector3f boundsExtent(const std::vector<Eigen::Vector3f>& pts, Eigen::Vec
 // A distinct color per integer index (golden-ratio hue spread).
 Eigen::Vector3f indexColor(int i) { return color::RandomFromIndex((size_t)i).head<3>(); }
 
+// Read tunable `i` from the input (falls back to the mode's registered default).
+float P(const ModeInput& in, size_t i, float def) {
+    return i < in.params.size() ? in.params[i] : def;
+}
+
+// Sentinel color: keep the point's original color (see runModeColors).
+const Eigen::Vector3f kKeepColor(-1.0f, -1.0f, -1.0f);
+
 // Throttled progress report (fraction in [0,1]).
 inline void report(const ProgressFn& p, float f) { if (p) p(f); }
 
+// Run fn(i) for i in [0,n) with std::execution::par, reporting progress from
+// lo..hi through the (thread-safe) sink. fn must only write its own output
+// slot; SparseGrid queries are const and safe to share across threads. Use
+// thread_local scratch vectors inside fn for the kNN/radius outputs.
+template <typename F>
+void parallelFor(size_t n, const ProgressFn& progress, float lo, float hi, F&& fn) {
+    if (n == 0) return;
+    std::vector<uint32_t> idx(n);
+    std::iota(idx.begin(), idx.end(), 0u);
+    std::atomic<size_t> done{0};
+    const size_t step = n / 100 + 1;
+    std::for_each(std::execution::par, idx.begin(), idx.end(), [&](uint32_t i) {
+        fn((size_t)i);
+        size_t d = done.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (progress && d % step == 0) progress(lo + (hi - lo) * (float)d / (float)n);
+    });
+}
+
 // --- Mode 0: Euclidean clustering (SparseGrid radius + union-find) -----------
-void runClustering(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+void clusteringColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                      debug::DebugDraw& extras, const ProgressFn& progress) {
     const auto& pts = in.points;
     if (pts.empty()) return;
 
     Eigen::Vector3f mn, mx;
     float diag = boundsExtent(pts, mn, mx).norm();
-    float radius = diag * 0.02f;
+    float radius = diag * P(in, 0, 2.0f) * 0.01f;
     if (radius <= 0.0f) return;
 
     geometry::SparseGrid grid;
@@ -61,14 +91,26 @@ void runClustering(const ModeInput& in, debug::DebugDraw& out, const ProgressFn&
     };
     auto unite = [&](int a, int b) { a = find(a); b = find(b); if (a != b) parent[a] = b; };
 
-    std::vector<unsigned int> nbr;
-    std::vector<float> dist;
-    const size_t step = pts.size() / 100 + 1;
-    for (size_t i = 0; i < pts.size(); ++i) {
-        if (i % step == 0) report(progress, (float)i / (float)pts.size());
-        grid.pointsWithinRadius(pts, pts[i], radius, nbr, dist);
-        for (unsigned int j : nbr)
-            if (j > i) unite((int)i, (int)j);
+    // Parallel radius queries (the expensive part) gathered chunk by chunk, so
+    // the cached neighbour lists stay bounded; the union-find pass over each
+    // gathered chunk is serial but cheap.
+    const size_t chunk = 65536;
+    std::vector<std::vector<unsigned int>> gathered(std::min(chunk, pts.size()));
+    for (size_t base = 0; base < pts.size(); base += chunk) {
+        const size_t cnt = std::min(chunk, pts.size() - base);
+        parallelFor(cnt, {}, 0.0f, 0.0f, [&](size_t t) {
+            thread_local std::vector<unsigned int> nbr;
+            thread_local std::vector<float> dist;
+            const size_t i = base + t;
+            grid.pointsWithinRadius(pts, pts[i], radius, nbr, dist);
+            auto& out = gathered[t];
+            out.clear();
+            for (unsigned int j : nbr)
+                if (j > i) out.push_back(j);
+        });
+        for (size_t t = 0; t < cnt; ++t)
+            for (unsigned int j : gathered[t]) unite((int)(base + t), (int)j);
+        report(progress, (float)(base + cnt) / (float)pts.size());
     }
 
     // Relabel roots to dense cluster ids.
@@ -84,15 +126,15 @@ void runClustering(const ModeInput& in, debug::DebugDraw& out, const ProgressFn&
 
     std::vector<Eigen::Vector3f> cmin(nClusters, Eigen::Vector3f::Constant(FLT_MAX));
     std::vector<Eigen::Vector3f> cmax(nClusters, Eigen::Vector3f::Constant(-FLT_MAX));
-    float psize = diag * 0.004f;
+    colors.resize(pts.size());
     for (size_t i = 0; i < pts.size(); ++i) {
         int c = label[i];
         cmin[c] = cmin[c].cwiseMin(pts[i]);
         cmax[c] = cmax[c].cwiseMax(pts[i]);
-        out.addPoint(pts[i], indexColor(c), psize);
+        colors[i] = indexColor(c);
     }
     for (int c = 0; c < nClusters; ++c)
-        out.addWireBox(cmin[c], cmax[c], indexColor(c), diag * 0.0015f);
+        extras.addWireBox(cmin[c], cmax[c], indexColor(c), diag * 0.0015f);
 }
 
 // --- Mode 1: Voxel morphology (erode + largest connected component) ----------
@@ -114,15 +156,17 @@ VoxelKey voxelOf(const Eigen::Vector3f& p, float inv) {
             (int)std::floor(p.z() * inv)};
 }
 
-void runMorphology(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+void morphologyColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                      debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
     const auto& pts = in.points;
     if (pts.empty()) return;
 
     Eigen::Vector3f mn, mx;
     float diag = boundsExtent(pts, mn, mx).norm();
-    float voxelSize = diag * 0.04f;
+    float voxelSize = diag * P(in, 0, 4.0f) * 0.01f;
     if (voxelSize <= 0.0f) return;
-    int erodeIter = 2;
+    int erodeIter = (int)std::lround(P(in, 1, 2.0f));
     float inv = 1.0f / voxelSize;
 
     VoxelSet voxels;
@@ -168,24 +212,20 @@ void runMorphology(const ModeInput& in, debug::DebugDraw& out, const ProgressFn&
         if (comp.size() > largest.size()) largest.swap(comp);
     }
 
-    // Restore original points near the surviving core voxels (faded red removed,
-    // green kept) to show the filtering result.
-    float psize = diag * 0.004f;
+    // Classify original points near the surviving core voxels (red = removed,
+    // green = kept). The (2e+1)^3 hash probes per point dominate -- parallel.
     int expansion = erodeIter;
-    const size_t step = pts.size() / 100 + 1;
-    for (size_t pi = 0; pi < pts.size(); ++pi) {
-        if (pi % step == 0) report(progress, (float)pi / (float)pts.size());
-        const auto& p = pts[pi];
-        VoxelKey k = voxelOf(p, inv);
-        bool keep = false;
-        for (int z = -expansion; z <= expansion && !keep; ++z)
-            for (int y = -expansion; y <= expansion && !keep; ++y)
-                for (int x = -expansion; x <= expansion && !keep; ++x)
-                    if (largest.count({k.x + x, k.y + y, k.z + z})) keep = true;
-        out.addPoint(p, keep ? Eigen::Vector3f(0.1f, 0.9f, 0.2f)
-                             : Eigen::Vector3f(0.5f, 0.12f, 0.12f),
-                     psize);
-    }
+    colors.assign(pts.size(), Eigen::Vector3f(0.5f, 0.12f, 0.12f));
+    parallelFor(pts.size(), progress, 0.0f, 1.0f, [&](size_t pi) {
+        VoxelKey k = voxelOf(pts[pi], inv);
+        for (int z = -expansion; z <= expansion; ++z)
+            for (int y = -expansion; y <= expansion; ++y)
+                for (int x = -expansion; x <= expansion; ++x)
+                    if (largest.count({k.x + x, k.y + y, k.z + z})) {
+                        colors[pi] = Eigen::Vector3f(0.1f, 0.9f, 0.2f);
+                        return;
+                    }
+    });
 }
 
 // --- Mode 2: SDF denoise (UDF splat + box blur + isosurface resample) --------
@@ -215,7 +255,7 @@ void runSdfFilter(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& 
     spacing = spacingN ? spacing / spacingN : diag * 0.01f;
     float voxelSize = std::max(spacing, ext.maxCoeff() / 256.0f);  // cap grid resolution
     if (voxelSize <= 0.0f) return;
-    const int smoothIter = 2;
+    const int smoothIter = (int)std::lround(P(in, 0, 2.0f));
     const float pad = voxelSize * 5.0f;
     const float kFar = 100.0f;
 
@@ -236,6 +276,8 @@ void runSdfFilter(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& 
 
     // Splat: each point writes its distance into nearby voxels (keep the min).
     // A wider range builds a graded distance band that survives the box blur.
+    // Stays serial: concurrent min-writes to overlapping voxels would race
+    // (no std::atomic_ref in C++17); blur + resample below are parallel.
     const int range = 3;
     const size_t splatStep = pts.size() / 100 + 1;
     for (size_t pi = 0; pi < pts.size(); ++pi) {
@@ -253,11 +295,14 @@ void runSdfFilter(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& 
                 }
     }
 
-    // Box blur near the surface (smooths away thin spikes/noise).
+    // Box blur near the surface (smooths away thin spikes/noise). Parallel per
+    // z-slice: reads `data`, writes disjoint rows of `tmp`.
     report(progress, 0.5f);
     std::vector<float> tmp = data;
+    const size_t nz = dim.z() > 2 ? (size_t)dim.z() - 2 : 0;
     for (int it = 0; it < smoothIter; ++it) {
-        for (int z = 1; z < dim.z() - 1; ++z)
+        parallelFor(nz, {}, 0.0f, 0.0f, [&](size_t zi) {
+            const int z = (int)zi + 1;
             for (int y = 1; y < dim.y() - 1; ++y)
                 for (int x = 1; x < dim.x() - 1; ++x) {
                     size_t i = idxOf(x, y, z);
@@ -272,14 +317,20 @@ void runSdfFilter(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& 
                             }
                     if (cnt > 0) tmp[i] = sum / (float)cnt;
                 }
+        });
         data = tmp;
+        report(progress, 0.5f + 0.2f * (float)(it + 1) / (float)smoothIter);
     }
 
     // Resample the iso-surface as points (color by SDF gradient = normal).
+    // Parallel per z-slice into per-slice buckets, then a serial emit
+    // (DebugDraw is not thread-safe).
     float iso = voxelSize * 1.5f;
     float psize = voxelSize * 0.4f;
-    for (int z = 1; z < dim.z() - 1; ++z) {
-        report(progress, 0.7f + 0.3f * (float)z / (float)dim.z());
+    std::vector<std::vector<std::pair<Eigen::Vector3f, Eigen::Vector3f>>> rows(nz);
+    parallelFor(nz, progress, 0.7f, 1.0f, [&](size_t zi) {
+        const int z = (int)zi + 1;
+        auto& row = rows[zi];
         for (int y = 1; y < dim.y() - 1; ++y)
             for (int x = 1; x < dim.x() - 1; ++x) {
                 if (data[idxOf(x, y, z)] >= iso) continue;
@@ -287,9 +338,12 @@ void runSdfFilter(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& 
                                   data[idxOf(x, y + 1, z)] - data[idxOf(x, y - 1, z)],
                                   data[idxOf(x, y, z + 1)] - data[idxOf(x, y, z - 1)]);
                 n = n.squaredNorm() > 1e-6f ? n.normalized() : Eigen::Vector3f::UnitY();
-                out.addPoint(gridToWorld(x, y, z), n * 0.5f + Eigen::Vector3f::Constant(0.5f), psize);
+                row.emplace_back(gridToWorld(x, y, z),
+                                 n * 0.5f + Eigen::Vector3f::Constant(0.5f));
             }
-    }
+    });
+    for (const auto& row : rows)
+        for (const auto& pc : row) out.addPoint(pc.first, pc.second, psize);
     report(progress, 1.0f);
 }
 
@@ -300,7 +354,7 @@ void runReconstruct(const ModeInput& in, debug::DebugDraw& out, const ProgressFn
 
     Eigen::Vector3f mn, mx;
     float diag = boundsExtent(pts, mn, mx).norm();
-    float voxelSize = diag * 0.03f;
+    float voxelSize = diag * P(in, 0, 3.0f) * 0.01f;
 
     // Normal estimation is the first ~60%; the (parallel) meshing the rest.
     std::vector<Eigen::Vector3f> nrm =
@@ -346,114 +400,112 @@ bool neighbourhoodPCA(const std::vector<Eigen::Vector3f>& pts,
     return true;
 }
 
-// Draw a keep/drop result: kept points green, removed points faded red.
-void drawKeepMask(const std::vector<Eigen::Vector3f>& pts, const std::vector<uint8_t>& keep,
-                  float psize, debug::DebugDraw& out) {
+// Keep/drop result as per-point colors: kept green, removed faded red.
+void keepToColors(const std::vector<uint8_t>& keep, std::vector<Eigen::Vector3f>& colors) {
     const Eigen::Vector3f green(0.1f, 0.9f, 0.2f), red(0.5f, 0.12f, 0.12f);
-    for (size_t i = 0; i < pts.size(); ++i)
-        out.addPoint(pts[i], keep[i] ? green : red, psize);
+    colors.resize(keep.size());
+    for (size_t i = 0; i < keep.size(); ++i) colors[i] = keep[i] ? green : red;
 }
 
-// Draw a per-point scalar field as a heatmap (auto-ranged over [p5, p95] so a
+// Per-point scalar field as heatmap colors (auto-ranged over [p5, p95] so a
 // few extreme values don't wash out the gradient).
-void drawScalarField(const std::vector<Eigen::Vector3f>& pts, std::vector<float> scalar,
-                     float psize, debug::DebugDraw& out) {
-    if (pts.empty()) return;
+void scalarToColors(const std::vector<float>& scalar, std::vector<Eigen::Vector3f>& colors) {
+    if (scalar.empty()) return;
     std::vector<float> sorted = scalar;
     std::sort(sorted.begin(), sorted.end());
     float lo = sorted[(size_t)(sorted.size() * 0.05f)];
     float hi = sorted[(size_t)(sorted.size() * 0.95f)];
     if (hi <= lo) hi = lo + 1e-6f;
-    for (size_t i = 0; i < pts.size(); ++i)
-        out.addPoint(pts[i], color::GetHeatMapColor(scalar[i], lo, hi).head<3>(), psize);
+    colors.resize(scalar.size());
+    for (size_t i = 0; i < scalar.size(); ++i)
+        colors[i] = color::GetHeatMapColor(scalar[i], lo, hi).head<3>();
 }
 
 // --- Filter: Statistical Outlier Removal (SOR) -------------------------------
 // Ported from Helium PointCloudSOR. Mark points whose mean distance to their k
 // neighbours is more than mu + alpha*sigma over the whole cloud.
-void runSOR(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+void sorColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+               debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
     const auto& pts = in.points;
     if (pts.size() < 8) return;
     geometry::SparseGrid grid;
     Eigen::Vector3f mn, mx;
-    float diag = buildGrid(pts, grid, mn, mx);
-    const int k = 16;
-    const float alpha = 1.0f;
+    buildGrid(pts, grid, mn, mx);
+    const int k = (int)std::lround(P(in, 0, 16.0f));
+    const float alpha = P(in, 1, 1.0f);
 
     std::vector<float> meanDist(pts.size(), 0.0f);
-    std::vector<unsigned int> nbr;
-    std::vector<float> dist;
-    double sum = 0.0, sum2 = 0.0;
-    const size_t step = pts.size() / 100 + 1;
-    for (size_t i = 0; i < pts.size(); ++i) {
-        if (i % step == 0) report(progress, (float)i / (float)pts.size());
+    parallelFor(pts.size(), progress, 0.0f, 0.95f, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
         grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
         float m = 0.0f; int n = 0;
         for (size_t t = 1; t < dist.size(); ++t) { m += std::sqrt(dist[t]); ++n; }  // [0] self
-        m = n ? m / n : 0.0f;
-        meanDist[i] = m;
-        sum += m; sum2 += (double)m * m;
-    }
+        meanDist[i] = n ? m / n : 0.0f;
+    });
+    double sum = 0.0, sum2 = 0.0;
+    for (float m : meanDist) { sum += m; sum2 += (double)m * m; }
     double mu = sum / pts.size();
     double var = std::max(0.0, sum2 / pts.size() - mu * mu);
     double thresh = mu + alpha * std::sqrt(var);
 
     std::vector<uint8_t> keep(pts.size());
     for (size_t i = 0; i < pts.size(); ++i) keep[i] = meanDist[i] <= (float)thresh;
-    drawKeepMask(pts, keep, diag * 0.004f, out);
+    keepToColors(keep, colors);
 }
 
 // --- Filter: Radius Outlier Removal (ROR) ------------------------------------
 // Ported from Helium PointCloudROR. Drop points with fewer than minN neighbours
 // inside a radius tied to the cloud scale.
-void runROR(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+void rorColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+               debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
     const auto& pts = in.points;
     if (pts.size() < 8) return;
     geometry::SparseGrid grid;
     Eigen::Vector3f mn, mx;
     float diag = buildGrid(pts, grid, mn, mx);
-    const float radius = diag * 0.025f;
-    const int minN = 5;
+    const float radius = diag * P(in, 0, 2.5f) * 0.01f;
+    const int minN = (int)std::lround(P(in, 1, 5.0f));
 
     std::vector<uint8_t> keep(pts.size());
-    std::vector<unsigned int> nbr;
-    std::vector<float> dist;
-    const size_t step = pts.size() / 100 + 1;
-    for (size_t i = 0; i < pts.size(); ++i) {
-        if (i % step == 0) report(progress, (float)i / (float)pts.size());
+    parallelFor(pts.size(), progress, 0.0f, 1.0f, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
         grid.pointsWithinRadius(pts, pts[i], radius, nbr, dist);
         keep[i] = (int)nbr.size() - 1 >= minN;  // exclude self
-    }
-    drawKeepMask(pts, keep, diag * 0.004f, out);
+    });
+    keepToColors(keep, colors);
 }
 
 // --- Filter: Plane-Fitting Outlier Removal (PFOR) ----------------------------
 // Ported from Helium PointCloudPFOR. Fit a local plane (PCA) per point; drop
 // points lying farther than beta * neighbourhood-extent off that plane.
-void runPFOR(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+void pforColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
     const auto& pts = in.points;
     if (pts.size() < 8) return;
     geometry::SparseGrid grid;
     Eigen::Vector3f mn, mx;
-    float diag = buildGrid(pts, grid, mn, mx);
-    const int k = 16;
-    const float beta = 0.6f;
+    buildGrid(pts, grid, mn, mx);
+    const int k = (int)std::lround(P(in, 0, 16.0f));
+    const float beta = P(in, 1, 0.05f);
 
     std::vector<uint8_t> keep(pts.size(), 1);
-    std::vector<unsigned int> nbr;
-    std::vector<float> dist;
-    Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
-    const size_t step = pts.size() / 100 + 1;
-    for (size_t i = 0; i < pts.size(); ++i) {
-        if (i % step == 0) report(progress, (float)i / (float)pts.size());
+    parallelFor(pts.size(), progress, 0.0f, 1.0f, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
+        Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
         grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
-        if (!neighbourhoodPCA(pts, nbr, c, eval, evec)) continue;
+        if (!neighbourhoodPCA(pts, nbr, c, eval, evec)) return;
         Eigen::Vector3f n = evec.col(0);                 // plane normal
         float planeDist = std::abs((pts[i] - c).dot(n));
         float extent = std::sqrt(std::max(eval.y(), 1e-12f));  // in-plane spread
         keep[i] = planeDist <= beta * extent;
-    }
-    drawKeepMask(pts, keep, diag * 0.004f, out);
+    });
+    keepToColors(keep, colors);
 }
 
 // --- Filter: Bump detection / removal (trimmed-plane residual) ----------------
@@ -467,25 +519,24 @@ void runPFOR(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progr
 // hysteresis threshold over radius neighbours so whole blobs are marked, not
 // just their tips. SOR/ROR can't catch these: bump interiors have normal
 // density, so only a surface-residual test separates them.
-std::vector<uint8_t> computeBumpMask(const std::vector<Eigen::Vector3f>& pts, float diag,
+std::vector<uint8_t> computeBumpMask(const ModeInput& in, float diag,
                                      const ProgressFn& progress) {
+    const auto& pts = in.points;
     geometry::SparseGrid grid;
-    const float radius = diag * 0.03f;  // reference-surface scale (≈ 2x bump size)
+    const float radius = diag * P(in, 0, 3.0f) * 0.01f;  // reference scale (≈ 2x bump size)
     grid.build(pts, radius);
 
     std::vector<float> res(pts.size(), 0.0f);
-    std::vector<unsigned int> nbr, sub, trimmedNbr;
-    std::vector<float> dist, planeDist, pd;
-    Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
-    const size_t step = pts.size() / 100 + 1;
-    for (size_t i = 0; i < pts.size(); ++i) {
-        if (i % step == 0) report(progress, 0.85f * (float)i / (float)pts.size());
+    parallelFor(pts.size(), progress, 0.0f, 0.85f, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr, sub, trimmedNbr;
+        thread_local std::vector<float> dist, planeDist, pd;
+        Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
         grid.pointsWithinRadius(pts, pts[i], radius, nbr, dist);
-        if (nbr.size() < 12) continue;  // sparse fringe: no reliable reference plane
-        sub.clear();                    // cap the fit cost on dense clouds
+        if (nbr.size() < 12) return;  // sparse fringe: no reliable reference plane
+        sub.clear();                  // cap the fit cost on dense clouds
         size_t stride = nbr.size() / 64 + 1;
         for (size_t t = 0; t < nbr.size(); t += stride) sub.push_back(nbr[t]);
-        if (!neighbourhoodPCA(pts, sub, c, eval, evec)) continue;
+        if (!neighbourhoodPCA(pts, sub, c, eval, evec)) return;
         Eigen::Vector3f n = evec.col(0);
         planeDist.resize(sub.size());
         for (size_t t = 0; t < sub.size(); ++t)
@@ -499,7 +550,7 @@ std::vector<uint8_t> computeBumpMask(const std::vector<Eigen::Vector3f>& pts, fl
             if (planeDist[t] <= medPd) trimmedNbr.push_back(sub[t]);
         if (neighbourhoodPCA(pts, trimmedNbr, c, eval, evec)) n = evec.col(0);
         res[i] = std::abs((pts[i] - c).dot(n));
-    }
+    });
 
     // LOCAL reference residual, not a global threshold: on a scan whose surface
     // complexity varies (smooth patches next to rough detailed areas) a single
@@ -523,8 +574,8 @@ std::vector<uint8_t> computeBumpMask(const std::vector<Eigen::Vector3f>& pts, fl
     }
     const float refFloor = diag * 1e-5f;
     std::vector<float> score(pts.size(), 0.0f);
-    std::vector<float> nbrMed;
-    for (size_t i = 0; i < pts.size(); ++i) {
+    parallelFor(pts.size(), {}, 0.0f, 0.0f, [&](size_t i) {
+        thread_local std::vector<float> nbrMed;
         VoxelKey k = voxelOf(pts[i], invVox);
         nbrMed.clear();
         for (int z = -1; z <= 1; ++z)
@@ -537,12 +588,14 @@ std::vector<uint8_t> computeBumpMask(const std::vector<Eigen::Vector3f>& pts, fl
         std::nth_element(nbrMed.begin(), nbrMed.begin() + h, nbrMed.end());
         float ref = std::max(nbrMed.empty() ? refFloor : nbrMed[h], refFloor);
         score[i] = res[i] / ref;
-    }
+    });
 
     // Hysteresis region growing: seeds score high, expand through neighbours
-    // scoring above the lower bar.
-    const float hiScore = 5.0f, loScore = 3.0f;
+    // scoring above the lower bar. (Serial: BFS order dependence.)
+    const float hiScore = P(in, 1, 5.0f), loScore = P(in, 2, 3.0f);
     const float growRadius = diag * 0.02f;
+    std::vector<unsigned int> nbr;
+    std::vector<float> dist;
     std::vector<uint8_t> bump(pts.size(), 0);
     std::queue<size_t> q;
     for (size_t i = 0; i < pts.size(); ++i)
@@ -559,7 +612,7 @@ std::vector<uint8_t> computeBumpMask(const std::vector<Eigen::Vector3f>& pts, fl
     // also fit a plane badly at this scale, but they flag as LARGE connected
     // regions while noise bumps are small isolated blobs. BFS the flagged
     // points into components and unflag any component wider than a cap.
-    const float maxBlobExtent = diag * 0.05f;
+    const float maxBlobExtent = diag * P(in, 3, 5.0f) * 0.01f;
     std::vector<uint8_t> visited(pts.size(), 0);
     std::vector<size_t> comp;
     for (size_t i = 0; i < pts.size(); ++i) {
@@ -587,116 +640,106 @@ std::vector<uint8_t> computeBumpMask(const std::vector<Eigen::Vector3f>& pts, fl
     return bump;
 }
 
-void runBumpDetect(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+// Detect visualization: flagged points red, everything else keeps its color.
+void bumpDetectColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                      debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
     const auto& pts = in.points;
     if (pts.size() < 8) return;
     Eigen::Vector3f mn, mx;
     float diag = boundsExtent(pts, mn, mx).norm();
-    std::vector<uint8_t> bump = computeBumpMask(pts, diag, progress);
+    std::vector<uint8_t> bump = computeBumpMask(in, diag, progress);
 
-    const Eigen::Vector3f red(0.95f, 0.08f, 0.08f), gray(0.75f, 0.75f, 0.75f);
-    float psize = diag * 0.004f;
+    const Eigen::Vector3f red(1.0f, 0.05f, 0.05f);
+    colors.assign(pts.size(), kKeepColor);
     for (size_t i = 0; i < pts.size(); ++i)
-        out.addPoint(pts[i], bump[i] ? red : gray, psize);
-}
-
-void runBumpRemove(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
-    const auto& pts = in.points;
-    if (pts.size() < 8) return;
-    Eigen::Vector3f mn, mx;
-    float diag = boundsExtent(pts, mn, mx).norm();
-    std::vector<uint8_t> bump = computeBumpMask(pts, diag, progress);
-
-    float psize = diag * 0.004f;
-    const Eigen::Vector3f white(0.9f, 0.9f, 0.9f);
-    for (size_t i = 0; i < pts.size(); ++i)
-        if (!bump[i]) out.addPoint(pts[i], white, psize);
+        if (bump[i]) colors[i] = red;
 }
 
 // --- Analyze: Kernel Density Estimation (KDE) --------------------------------
 // Ported from Helium PointCloudKDE. Gaussian-kernel local density, shown as a
 // heatmap (dense = warm).
-void runKDE(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+void kdeColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+               debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
     const auto& pts = in.points;
     if (pts.size() < 8) return;
     geometry::SparseGrid grid;
     Eigen::Vector3f mn, mx;
     float diag = buildGrid(pts, grid, mn, mx);
-    const float h = diag * 0.03f;                 // bandwidth
+    const float h = diag * P(in, 0, 3.0f) * 0.01f;  // bandwidth
     const float radius = h * 3.0f;                // truncate the kernel
     const float invH2 = 1.0f / (h * h);
 
     std::vector<float> density(pts.size(), 0.0f);
-    std::vector<unsigned int> nbr;
-    std::vector<float> dist;
-    const size_t step = pts.size() / 100 + 1;
-    for (size_t i = 0; i < pts.size(); ++i) {
-        if (i % step == 0) report(progress, (float)i / (float)pts.size());
+    parallelFor(pts.size(), progress, 0.0f, 1.0f, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
         grid.pointsWithinRadius(pts, pts[i], radius, nbr, dist);
         float d = 0.0f;
         for (float d2 : dist) d += std::exp(-d2 * invH2);  // d2 is squared distance
         density[i] = d;
-    }
-    drawScalarField(pts, std::move(density), diag * 0.004f, out);
+    });
+    scalarToColors(density, colors);
 }
 
 // --- Analyze: Surface curvature ----------------------------------------------
 // Ported from Helium PointCloudCurvatureAnalysis. Surface variation
 // lambda0/(lambda0+lambda1+lambda2) from the neighbourhood PCA, as a heatmap.
-void runCurvature(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+void curvatureColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                     debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
     const auto& pts = in.points;
     if (pts.size() < 8) return;
     geometry::SparseGrid grid;
     Eigen::Vector3f mn, mx;
-    float diag = buildGrid(pts, grid, mn, mx);
-    const int k = 16;
+    buildGrid(pts, grid, mn, mx);
+    const int k = (int)std::lround(P(in, 0, 16.0f));
 
     std::vector<float> curv(pts.size(), 0.0f);
-    std::vector<unsigned int> nbr;
-    std::vector<float> dist;
-    Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
-    const size_t step = pts.size() / 100 + 1;
-    for (size_t i = 0; i < pts.size(); ++i) {
-        if (i % step == 0) report(progress, (float)i / (float)pts.size());
+    parallelFor(pts.size(), progress, 0.0f, 1.0f, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
+        Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
         grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
-        if (!neighbourhoodPCA(pts, nbr, c, eval, evec)) continue;
+        if (!neighbourhoodPCA(pts, nbr, c, eval, evec)) return;
         float s = eval.x() + eval.y() + eval.z();
         curv[i] = s > 1e-12f ? eval.x() / s : 0.0f;
-    }
-    drawScalarField(pts, std::move(curv), diag * 0.004f, out);
+    });
+    scalarToColors(curv, colors);
 }
 
 // --- Analyze: Normal deviation -----------------------------------------------
 // Ported from Helium PointCloudNormalDeviation. Per-point angle between its
 // normal and the mean normal of its neighbourhood (high = creases/noise).
-void runNormalDeviation(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+void normalDeviationColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                           debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
     const auto& pts = in.points;
     if (pts.size() < 8) return;
+    const int k = (int)std::lround(P(in, 0, 16.0f));
     std::vector<Eigen::Vector3f> nrm =
         in.normals.size() == pts.size()
             ? in.normals
-            : geometry::estimateNormals(pts, 16, [&](float f) { report(progress, f * 0.5f); });
+            : geometry::estimateNormals(pts, k, [&](float f) { report(progress, f * 0.5f); });
 
     geometry::SparseGrid grid;
     Eigen::Vector3f mn, mx;
-    float diag = buildGrid(pts, grid, mn, mx);
-    const int k = 16;
+    buildGrid(pts, grid, mn, mx);
 
     std::vector<float> devv(pts.size(), 0.0f);
-    std::vector<unsigned int> nbr;
-    std::vector<float> dist;
-    const size_t step = pts.size() / 100 + 1;
-    for (size_t i = 0; i < pts.size(); ++i) {
-        if (i % step == 0) report(progress, 0.5f + 0.5f * (float)i / (float)pts.size());
+    parallelFor(pts.size(), progress, 0.5f, 1.0f, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
         grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
         Eigen::Vector3f avg = Eigen::Vector3f::Zero();
         for (unsigned int j : nbr) avg += nrm[j];
-        if (avg.squaredNorm() < 1e-12f) continue;
+        if (avg.squaredNorm() < 1e-12f) return;
         avg.normalize();
         float c = std::max(-1.0f, std::min(1.0f, nrm[i].dot(avg)));
         devv[i] = std::acos(c);  // radians
-    }
-    drawScalarField(pts, std::move(devv), diag * 0.004f, out);
+    });
+    scalarToColors(devv, colors);
 }
 
 // --- Transform: Edge-preserving smoothing ------------------------------------
@@ -710,7 +753,8 @@ void runSmooth(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& pro
     float diag = boundsExtent(pts, mn, mx).norm();
 
     std::vector<Eigen::Vector3f> sm = geometry::smoothPoints(
-        pts, 5, 0.5f, true, 12, [&](float f) { report(progress, f); });
+        pts, (int)std::lround(P(in, 0, 5.0f)), P(in, 1, 0.5f), true, 12,
+        [&](float f) { report(progress, f); });
     float psize = diag * 0.004f;
     float maxDisp = diag * 0.02f;
     for (size_t i = 0; i < pts.size(); ++i) {
@@ -738,8 +782,8 @@ void runICP(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progre
     for (size_t i = 0; i < dst.size(); ++i) src[i] = rot * (dst[i] - center) + center + trans;
 
     float rmse = 0.0f; int iters = 0;
-    Eigen::Matrix4f T =
-        geometry::icpAlign(src, dst, 40, rmse, iters, [&](float f) { report(progress, f); });
+    Eigen::Matrix4f T = geometry::icpAlign(src, dst, (int)std::lround(P(in, 0, 40.0f)), rmse,
+                                           iters, [&](float f) { report(progress, f); });
 
     float psize = diag * 0.004f;
     const Eigen::Vector3f blue(0.25f, 0.5f, 1.0f), green(0.1f, 0.9f, 0.2f);
@@ -750,27 +794,54 @@ void runICP(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progre
     }
 }
 
+using DrawFn  = void (*)(const ModeInput&, debug::DebugDraw&, const ProgressFn&);
+using ColorFn = void (*)(const ModeInput&, std::vector<Eigen::Vector3f>&, debug::DebugDraw&,
+                         const ProgressFn&);
 struct ModeEntry {
     const char*  name;
-    void       (*fn)(const ModeInput&, debug::DebugDraw&, const ProgressFn&);
+    DrawFn       fn;        // Draw modes (null for Recolor/Remove)
     ModeCategory category;
-    MaskKind     mask = MaskKind::None;
+    ApplyKind    kind      = ApplyKind::Draw;
+    ColorFn      colorFn   = nullptr;  // Recolor modes (also the Remove fallback viz)
+    int          numParams = 0;
+    ModeParam    params[4] = {};
+};
+const ModeParam kBumpParams[4] = {
+    {"Fit Radius %", 1.0f, 8.0f, 3.0f, false},
+    {"Hi Score", 2.0f, 12.0f, 5.0f, false},
+    {"Lo Score", 1.0f, 8.0f, 3.0f, false},
+    {"Max Blob %", 1.0f, 20.0f, 5.0f, false},
 };
 const ModeEntry kModes[] = {
-    {"Reconstruct",      runReconstruct,     ModeCategory::Generate},
-    {"SDF Filter",       runSdfFilter,       ModeCategory::Generate},
-    {"Clustering",       runClustering,      ModeCategory::Analyze},
-    {"Curvature",        runCurvature,       ModeCategory::Analyze},
-    {"Normal Deviation", runNormalDeviation, ModeCategory::Analyze},
-    {"Density (KDE)",    runKDE,             ModeCategory::Analyze},
-    {"Outlier: SOR",     runSOR,             ModeCategory::Filter},
-    {"Outlier: ROR",     runROR,             ModeCategory::Filter},
-    {"Outlier: PFOR",    runPFOR,            ModeCategory::Filter},
-    {"Morphology",       runMorphology,      ModeCategory::Filter},
-    {"Bump: Detect",     runBumpDetect,      ModeCategory::Filter, MaskKind::Recolor},
-    {"Bump: Remove",     runBumpRemove,      ModeCategory::Filter, MaskKind::Remove},
-    {"Smooth (bilateral)", runSmooth,        ModeCategory::Transform},
-    {"ICP Register",     runICP,             ModeCategory::Transform},
+    {"Reconstruct", runReconstruct, ModeCategory::Generate, ApplyKind::Draw, nullptr, 1,
+     {{"Voxel %", 0.5f, 10.0f, 3.0f, false}}},
+    {"SDF Filter", runSdfFilter, ModeCategory::Generate, ApplyKind::Draw, nullptr, 1,
+     {{"Blur Iters", 0.0f, 5.0f, 2.0f, true}}},
+    {"Clustering", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, clusteringColors, 1,
+     {{"Radius %", 0.5f, 10.0f, 2.0f, false}}},
+    {"Curvature", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, curvatureColors, 1,
+     {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}}},
+    {"Normal Deviation", nullptr, ModeCategory::Analyze, ApplyKind::Recolor,
+     normalDeviationColors, 1, {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}}},
+    {"Density (KDE)", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, kdeColors, 1,
+     {{"Bandwidth %", 0.5f, 10.0f, 3.0f, false}}},
+    {"Outlier: SOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, sorColors, 2,
+     {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}, {"Alpha", 0.25f, 4.0f, 1.0f, false}}},
+    {"Outlier: ROR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, rorColors, 2,
+     {{"Radius %", 0.5f, 10.0f, 2.5f, false}, {"Min Nbrs", 1.0f, 32.0f, 5.0f, true}}},
+    {"Outlier: PFOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, pforColors, 2,
+     {{"K Neighbors", 4.0f, 256.0f, 16.0f, true},
+      {"Beta", 0.0f, 0.1f, 0.05f, false, 0.001f}}},
+    {"Morphology", nullptr, ModeCategory::Filter, ApplyKind::Recolor, morphologyColors, 2,
+     {{"Voxel %", 1.0f, 10.0f, 4.0f, false}, {"Erode Iters", 1.0f, 4.0f, 2.0f, true}}},
+    {"Bump: Detect", nullptr, ModeCategory::Filter, ApplyKind::Recolor, bumpDetectColors, 4,
+     {kBumpParams[0], kBumpParams[1], kBumpParams[2], kBumpParams[3]}},
+    {"Bump: Remove", nullptr, ModeCategory::Filter, ApplyKind::Remove, bumpDetectColors, 4,
+     {kBumpParams[0], kBumpParams[1], kBumpParams[2], kBumpParams[3]}},
+    {"Smooth (bilateral)", runSmooth, ModeCategory::Transform, ApplyKind::Draw, nullptr, 2,
+     {{"Iterations", 1.0f, 20.0f, 5.0f, true}, {"Lambda", 0.1f, 1.0f, 0.5f, false}}},
+    {"ICP Register", runICP, ModeCategory::Transform, ApplyKind::Draw, nullptr, 1,
+     {{"Iterations", 5.0f, 100.0f, 40.0f, true}}},
 };
 constexpr int kModeCount = (int)(sizeof(kModes) / sizeof(kModes[0]));
 
@@ -800,22 +871,55 @@ const char* modeCategoryName(ModeCategory c) {
 
 void runMode(int index, const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
     if (index < 0 || index >= kModeCount) return;
-    kModes[index].fn(in, out, progress);
+    const ModeEntry& m = kModes[index];
+    if (m.colorFn) {
+        // Fallback drawing path (fixed ctx inputs / tests): compute the colors,
+        // then draw them as debug points.
+        std::vector<Eigen::Vector3f> colors;
+        m.colorFn(in, colors, out, progress);
+        Eigen::Vector3f mn, mx;
+        float diag  = boundsExtent(in.points, mn, mx).norm();
+        float psize = diag * 0.004f;
+        const Eigen::Vector3f gray(0.75f, 0.75f, 0.75f);
+        size_t n = std::min(colors.size(), in.points.size());
+        for (size_t i = 0; i < n; ++i)
+            out.addPoint(in.points[i], colors[i].x() < 0.0f ? gray : colors[i], psize);
+    } else if (m.fn) {
+        m.fn(in, out, progress);
+    }
 }
 
-MaskKind modeMaskKind(int index) {
-    if (index < 0 || index >= kModeCount) return MaskKind::None;
-    return kModes[index].mask;
+ApplyKind modeApplyKind(int index) {
+    if (index < 0 || index >= kModeCount) return ApplyKind::Draw;
+    return kModes[index].kind;
+}
+
+int modeParamCount(int index) {
+    if (index < 0 || index >= kModeCount) return 0;
+    return kModes[index].numParams;
+}
+
+ModeParam modeParam(int index, int p) {
+    if (index < 0 || index >= kModeCount || p < 0 || p >= kModes[index].numParams)
+        return {"?", 0.0f, 1.0f, 0.0f, false};
+    return kModes[index].params[p];
+}
+
+void runModeColors(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                   debug::DebugDraw& extras, const ProgressFn& progress) {
+    colors.clear();
+    if (index < 0 || index >= kModeCount || !kModes[index].colorFn) return;
+    kModes[index].colorFn(in, colors, extras, progress);
 }
 
 void runModeMask(int index, const ModeInput& in, std::vector<uint8_t>& mask,
                  const ProgressFn& progress) {
     mask.assign(in.points.size(), 0);
-    if (index < 0 || index >= kModeCount || kModes[index].mask == MaskKind::None) return;
+    if (index < 0 || index >= kModeCount || kModes[index].kind != ApplyKind::Remove) return;
     if (in.points.size() < 8) return;
     Eigen::Vector3f mn, mx;
     float diag = boundsExtent(in.points, mn, mx).norm();
-    mask = computeBumpMask(in.points, diag, progress);
+    mask = computeBumpMask(in, diag, progress);
 }
 
 } // namespace orange::modes

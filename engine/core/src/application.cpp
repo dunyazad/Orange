@@ -15,8 +15,62 @@
 #include "orange/core/screenshot.h"
 #include "orange/ecs/components.h"
 #include "orange/ecs/systems.h"
+#include "orange/ecs/undo.h"
 
 namespace orange::core {
+
+namespace {
+// One entity's before/after value for an undoable Renderable field change.
+struct ModeChange {
+    entt::entity e;
+    uint32_t     oldV, newV;
+};
+
+// Push an undo op for a batch of draw-mode (isDraw) or color-mode changes.
+// Entities deleted (and possibly rebuilt under a new id) later simply no-op.
+void pushRenderableChangeOp(entt::registry& world, std::vector<ModeChange> changes,
+                            bool isDraw, const char* label) {
+    if (changes.empty()) return;
+    auto apply = [isDraw](entt::registry& w, const std::vector<ModeChange>& ch, bool useOld) {
+        for (const auto& c : ch) {
+            if (!w.valid(c.e) || !w.all_of<ecs::Renderable>(c.e)) continue;
+            auto&    r = w.get<ecs::Renderable>(c.e);
+            uint32_t v = useOld ? c.oldV : c.newV;
+            if (isDraw)
+                r.drawMode = static_cast<DrawMode>(v);
+            else
+                r.colorMode = v;
+        }
+    };
+    ecs::UndoOp op;
+    op.label = label;
+    op.undo  = [changes, apply](entt::registry& w, render::IRenderer&) { apply(w, changes, true); };
+    op.redo  = [changes, apply](entt::registry& w, render::IRenderer&) { apply(w, changes, false); };
+    ecs::undoStack(world).push(std::move(op));
+}
+
+// Show/refresh the mode-parameters dialog for the newly activated mode (or hide
+// it when the mode is off / has no parameters). Switching modes reloads that
+// mode's defaults; re-activating the same mode keeps the edited values.
+void syncModeParamsDialog(entt::registry& world, int modeIndex) {
+    auto v = world.view<ecs::ModeParamsDialog>();
+    for (auto e : v) {
+        auto& d = v.get<ecs::ModeParamsDialog>(e);
+        int n = modeIndex >= 0 ? modes::modeParamCount(modeIndex) : 0;
+        if (n <= 0) {
+            d.visible = false;
+            break;
+        }
+        if (d.modeIndex != modeIndex) {
+            d.modeIndex = modeIndex;
+            for (int i = 0; i < n && i < 8; ++i) d.values[i] = modes::modeParam(modeIndex, i).defV;
+        }
+        d.h       = 42 + n * 36 + 46;
+        d.visible = true;
+        break;
+    }
+}
+} // namespace
 
 std::string Application::defaultPluginName(render::Backend backend) {
     switch (backend) {
@@ -95,7 +149,34 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                     running_ = false;
                     break;
                 case SDL_EVENT_KEY_DOWN:
-                    if (e.key.key == SDLK_ESCAPE) running_ = false;
+                    // A visible confirm dialog eats Esc as "No" and Enter as
+                    // "Yes"; Esc only quits when no dialog is up.
+                    if (e.key.key == SDLK_ESCAPE || e.key.key == SDLK_RETURN ||
+                        e.key.key == SDLK_KP_ENTER) {
+                        bool dialogAte = false;
+                        auto cdv = world_.view<ecs::ConfirmDialog>();
+                        for (auto ent : cdv) {
+                            auto& cd = cdv.get<ecs::ConfirmDialog>(ent);
+                            if (cd.visible) {
+                                cd.yes      = (e.key.key != SDLK_ESCAPE);
+                                cd.answered = true;
+                                cd.visible  = false;
+                                dialogAte   = true;
+                            }
+                            break;
+                        }
+                        // Enter also applies the mode-params dialog when it is
+                        // the one on screen.
+                        if (!dialogAte && e.key.key != SDLK_ESCAPE) {
+                            auto mdv = world_.view<ecs::ModeParamsDialog>();
+                            for (auto ent : mdv) {
+                                auto& md = mdv.get<ecs::ModeParamsDialog>(ent);
+                                if (md.visible) md.requestApply = true;
+                                break;
+                            }
+                        }
+                        if (!dialogAte && e.key.key == SDLK_ESCAPE) running_ = false;
+                    }
                     if (e.key.scancode == SDL_SCANCODE_C) capture_ = true;  // screenshot
                     if (e.key.scancode == SDL_SCANCODE_TAB) {  // cycle each selected mesh's draw mode
                         auto v = world_.view<ecs::Renderable>();
@@ -103,13 +184,17 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                         // selection (there's nothing else it could mean).
                         size_t count = 0;
                         for (auto ent : v) { (void)ent; ++count; }
+                        std::vector<ModeChange> changes;
                         for (auto ent : v) {
                             auto& r = v.get<ecs::Renderable>(ent);
                             if (!r.selected && count != 1) continue;
+                            uint32_t oldV = static_cast<uint32_t>(r.drawMode);
                             r.drawMode = static_cast<DrawMode>(
                                 (static_cast<uint32_t>(r.drawMode) + 1) %
                                 static_cast<uint32_t>(DrawMode::Count));
+                            changes.push_back({ent, oldV, static_cast<uint32_t>(r.drawMode)});
                         }
+                        pushRenderableChangeOp(world_, std::move(changes), true, "Draw Mode");
                     }
                     if (e.key.scancode == SDL_SCANCODE_M) {                 // cycle processing mode
                         auto& ctx = world_.ctx();
@@ -117,6 +202,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                         auto& ms = ctx.get<modes::ModeState>();
                         ms.index = (ms.index + 1) % modes::modeCount();
                         ms.generation++;
+                        syncModeParamsDialog(world_, ms.index);
                         SDL_Log("Application: processing mode = %s", modes::modeName(ms.index));
                     }
                     if (e.key.scancode == SDL_SCANCODE_O && (e.key.mod & SDL_KMOD_CTRL)) {
@@ -138,9 +224,19 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                         auto v = world_.view<ecs::Renderable>();
                         for (auto ent : v)
                             if (v.get<ecs::Renderable>(ent).selected) dead.push_back(ent);
+                        ecs::pushDeleteOp(world_, dead, "Delete");
                         for (auto ent : dead) world_.destroy(ent);
                         if (!dead.empty())
                             SDL_Log("Application: deleted %zu mesh(es)", dead.size());
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_Z && (e.key.mod & SDL_KMOD_CTRL)) {
+                        if (e.key.mod & SDL_KMOD_SHIFT)
+                            ecs::redoLast(world_, *plugin_->renderer());
+                        else
+                            ecs::undoLast(world_, *plugin_->renderer());
+                    }
+                    if (e.key.scancode == SDL_SCANCODE_Y && (e.key.mod & SDL_KMOD_CTRL)) {
+                        ecs::redoLast(world_, *plugin_->renderer());
                     }
                     if (e.key.scancode == SDL_SCANCODE_EQUALS ||
                         e.key.scancode == SDL_SCANCODE_KP_PLUS) {  // grow point sprites
@@ -164,10 +260,16 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                                 if (rr.selected || count == 1) { base = rr.colorMode; break; }
                             }
                             uint32_t next = (base + 1) % 4;  // default/height/position/gray
+                            std::vector<ModeChange> changes;
                             for (auto e2 : v) {
                                 auto& rr = v.get<ecs::Renderable>(e2);
-                                if (rr.selected || count == 1) rr.colorMode = next;
+                                if (rr.selected || count == 1) {
+                                    changes.push_back({e2, rr.colorMode, next});
+                                    rr.colorMode = next;
+                                }
                             }
+                            pushRenderableChangeOp(world_, std::move(changes), false,
+                                                   "Color Mode");
                             static const char* kColorNames[4] = {"default", "height",
                                                                  "position", "grayscale"};
                             SDL_Log("Application: color mode = %s", kColorNames[next]);
@@ -215,11 +317,18 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                         // Unhide all: reveal meshes hidden by the None draw mode so
                         // they can be seen and selected again.
                         int n = 0;
+                        std::vector<ModeChange> changes;
                         auto v = world_.view<ecs::Renderable>();
                         for (auto ent : v) {
                             auto& r = v.get<ecs::Renderable>(ent);
-                            if (r.drawMode == DrawMode::None) { r.drawMode = DrawMode::Solid; ++n; }
+                            if (r.drawMode == DrawMode::None) {
+                                changes.push_back({ent, (uint32_t)DrawMode::None,
+                                                   (uint32_t)DrawMode::Solid});
+                                r.drawMode = DrawMode::Solid;
+                                ++n;
+                            }
                         }
+                        pushRenderableChangeOp(world_, std::move(changes), true, "Unhide All");
                         if (n) SDL_Log("Application: revealed %d hidden mesh(es)", n);
                     }
                     break;
@@ -297,6 +406,24 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         ecs::cameraControlsInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::crossSectionInputSystem(world_, input_, window_.width(), window_.height());
         ecs::poissonDialogInputSystem(world_, input_, window_.width(), window_.height());
+        ecs::modeParamsDialogInputSystem(world_, input_, window_.width(), window_.height());
+        {
+            // "Apply" on the mode-params dialog: re-run the active mode with
+            // the edited parameter values (a generation bump recomputes).
+            auto mdv = world_.view<ecs::ModeParamsDialog>();
+            for (auto ent : mdv) {
+                auto& md = mdv.get<ecs::ModeParamsDialog>(ent);
+                if (md.requestApply) {
+                    md.requestApply = false;
+                    auto& ctx = world_.ctx();
+                    if (ctx.contains<modes::ModeState>()) {
+                        auto& ms = ctx.get<modes::ModeState>();
+                        if (ms.index == md.modeIndex) ms.generation++;
+                    }
+                }
+                break;
+            }
+        }
         ecs::confirmDialogInputSystem(world_, input_, window_.width(), window_.height());
         ecs::axisGizmoInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::selectionToolbarInputSystem(world_, input_, window_.width(), window_.height());
@@ -323,11 +450,15 @@ void Application::applyMenuAction(int action) {
         auto v = world_.view<ecs::Renderable>();
         size_t count = 0;
         for (auto ent : v) { (void)ent; ++count; }
+        std::vector<ModeChange> changes;
         for (auto ent : v) {
             auto& rr = v.get<ecs::Renderable>(ent);
             if (!rr.selected && count != 1) continue;
+            if (rr.drawMode != dm)
+                changes.push_back({ent, (uint32_t)rr.drawMode, (uint32_t)dm});
             rr.drawMode = dm;
         }
+        pushRenderableChangeOp(world_, std::move(changes), true, "Draw Mode");
     };
     // Apply a scene-coloring mode to the selected meshes (or the only mesh).
     auto setColor = [&](uint32_t mode) {
@@ -335,18 +466,22 @@ void Application::applyMenuAction(int action) {
         auto v = world_.view<ecs::Renderable>();
         size_t count = 0;
         for (auto ent : v) { (void)ent; ++count; }
+        std::vector<ModeChange> changes;
         for (auto ent : v) {
             auto& rr = v.get<ecs::Renderable>(ent);
             if (!rr.selected && count != 1) continue;
+            if (rr.colorMode != mode) changes.push_back({ent, rr.colorMode, mode});
             rr.colorMode = mode;
         }
+        pushRenderableChangeOp(world_, std::move(changes), false, "Color Mode");
     };
     auto setMode = [&](int idx) {
         auto& ctx = world_.ctx();
         if (!ctx.contains<modes::ModeState>()) ctx.emplace<modes::ModeState>();
         auto& ms = ctx.get<modes::ModeState>();
-        ms.index = idx % modes::modeCount();
+        ms.index = idx < 0 ? -1 : idx % modes::modeCount();
         ms.generation++;
+        syncModeParamsDialog(world_, ms.index);
     };
     // Upload a primitive triangle soup and spawn a real, pickable entity at the
     // primary camera's pivot, sized to its orbit distance so it is always visible.
@@ -406,6 +541,9 @@ void Application::applyMenuAction(int action) {
         rr.boundsMax = mx;
         world_.emplace<ecs::Renderable>(e, rr);
         world_.emplace<ecs::PickGeometry>(e, std::move(pick));
+        // CPU vertex copy: lets mask modes edit the mesh and undo rebuild it.
+        world_.emplace<ecs::VertexSource>(e, ecs::VertexSource{vbo, std::move(verts)});
+        ecs::pushSpawnOp(world_, e, "Create Primitive");
     };
     const Eigen::Vector3f kPrimColor(0.72f, 0.74f, 0.78f);  // neutral (recolored by color mode)
 
@@ -574,17 +712,29 @@ void Application::applyMenuAction(int action) {
             std::vector<entt::entity> dead;
             auto v = world_.view<ecs::Renderable>();
             for (auto ent : v) if (v.get<ecs::Renderable>(ent).selected) dead.push_back(ent);
+            ecs::pushDeleteOp(world_, dead, "Delete");
             for (auto ent : dead) world_.destroy(ent);
             break;
         }
         case A::UnhideAll: {
             auto v = world_.view<ecs::Renderable>();
+            std::vector<ModeChange> changes;
             for (auto ent : v) {
                 auto& rr = v.get<ecs::Renderable>(ent);
-                if (rr.drawMode == DrawMode::None) rr.drawMode = DrawMode::Solid;
+                if (rr.drawMode == DrawMode::None) {
+                    changes.push_back({ent, (uint32_t)DrawMode::None, (uint32_t)DrawMode::Solid});
+                    rr.drawMode = DrawMode::Solid;
+                }
             }
+            pushRenderableChangeOp(world_, std::move(changes), true, "Unhide All");
             break;
         }
+        case A::Undo:
+            if (r) ecs::undoLast(world_, *r);
+            break;
+        case A::Redo:
+            if (r) ecs::redoLast(world_, *r);
+            break;
         case A::PointSizeUp:
             pointSize_ = pointSize_ + 1.0f > 64.0f ? 64.0f : pointSize_ + 1.0f;
             if (r) r->setPointSize(pointSize_);
