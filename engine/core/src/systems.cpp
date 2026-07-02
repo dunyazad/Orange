@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -96,6 +97,8 @@ struct ModeJob {
     std::atomic<bool>           done{false};
     std::atomic<float>          progress{0.0f};  // [0,1], updated by the worker
     std::vector<render::Vertex> verts;
+    std::vector<uint8_t>        mask;             // per-point flags (mask modes only)
+    modes::MaskKind             maskKind = modes::MaskKind::None;
     uint64_t                    gen = 0, sig = 0;
     int                         index = -1;       // which mode (for the status label)
 };
@@ -111,6 +114,17 @@ struct ModeCache {
 
     std::shared_ptr<ModeJob> job;     // running computation (null if idle)
     std::thread              worker;
+
+    // Source entity hidden while its mode result is displayed (the result
+    // redraws the cloud itself; the original underneath would z-fight the
+    // recolored points and mask any point-removal result). Restored when the
+    // mode goes off or the selection changes.
+    entt::entity hiddenSrc = entt::null;
+
+    // Source entity whose vertex buffer currently holds a recolored copy (bump
+    // detect). Original colors re-uploaded from VertexSource when the mode
+    // ends or the selection/mode changes.
+    entt::entity recoloredSrc = entt::null;
 
     ~ModeCache() {
         // Never join (could block for minutes) nor std::terminate at teardown: a
@@ -128,7 +142,7 @@ struct ModeCache {
 // before its worker finishes is discarded. The input is the first selected entity
 // with a PickGeometry (its vertices, transformed to world space); a ctx
 // modes::ModeInput, if present, overrides it (tests / fixed clouds).
-void processingModeSystem(entt::registry& world) {
+void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
     auto& ctx = world.ctx();
 
     modes::ModeState state;
@@ -164,15 +178,108 @@ void processingModeSystem(entt::registry& world) {
                                     ((uint64_t)(state.index + 1) << 8))
                                  : 0;
 
+    // Hide the source cloud while its mode result is displayed (the result
+    // redraws the points itself; the original underneath would z-fight the
+    // recolored points and mask any point-removal result).
+    auto syncHidden = [&](entt::entity wantHidden) {
+        if (cache.hiddenSrc == wantHidden) return;
+        if (cache.hiddenSrc != entt::null && world.valid(cache.hiddenSrc) &&
+            world.all_of<Renderable>(cache.hiddenSrc))
+            world.get<Renderable>(cache.hiddenSrc).visible = true;
+        if (wantHidden != entt::null) world.get<Renderable>(wantHidden).visible = false;
+        cache.hiddenSrc = wantHidden;
+    };
+
+    // Re-upload the original vertex colors of a recolored cloud (bump detect)
+    // once its result no longer applies.
+    auto restoreRecolor = [&]() {
+        if (cache.recoloredSrc == entt::null) return;
+        if (world.valid(cache.recoloredSrc) && world.all_of<VertexSource>(cache.recoloredSrc)) {
+            const auto& vs = world.get<VertexSource>(cache.recoloredSrc);
+            renderer.updateBuffer(vs.vbo, vs.vertices.data(),
+                                  vs.vertices.size() * sizeof(render::Vertex));
+        }
+        cache.recoloredSrc = entt::null;
+    };
+
     // 1) Harvest a finished background job (non-blocking: only join once done).
     if (cache.job && cache.job->done.load(std::memory_order_acquire)) {
         if (cache.worker.joinable()) cache.worker.join();
         if (cache.job->gen == want && cache.job->sig == selSig) {  // still relevant
-            cache.verts      = std::move(cache.job->verts);
+            if (cache.job->maskKind == modes::MaskKind::Recolor && src != entt::null &&
+                world.all_of<VertexSource>(src)) {
+                // Paint the flagged points red IN the source buffer (original
+                // colors stay in VertexSource for the restore).
+                const auto& vs   = world.get<VertexSource>(src);
+                const auto& mask = cache.job->mask;
+                std::vector<render::Vertex> painted = vs.vertices;
+                size_t n = std::min(painted.size(), mask.size()), flagged = 0;
+                for (size_t i = 0; i < n; ++i)
+                    if (mask[i]) {
+                        painted[i].color[0] = 1.0f;
+                        painted[i].color[1] = 0.05f;
+                        painted[i].color[2] = 0.05f;
+                        ++flagged;
+                    }
+                renderer.updateBuffer(vs.vbo, painted.data(),
+                                      painted.size() * sizeof(render::Vertex));
+                cache.recoloredSrc = src;
+                cache.verts.clear();
+                SDL_Log("processingModeSystem: %s done (%zu/%zu points flagged)",
+                        modes::modeName(state.index), flagged, n);
+            } else if (cache.job->maskKind == modes::MaskKind::Remove && src != entt::null &&
+                       world.all_of<VertexSource>(src)) {
+                // Delete the flagged points: compact the CPU copy, re-upload,
+                // and rebuild the mesh with the smaller count. Deactivate the
+                // mode afterwards so the shrunk cloud isn't reprocessed.
+                auto&       vs   = world.get<VertexSource>(src);
+                const auto& mask = cache.job->mask;
+                std::vector<render::Vertex> kept;
+                kept.reserve(vs.vertices.size());
+                for (size_t i = 0; i < vs.vertices.size(); ++i)
+                    if (i >= mask.size() || !mask[i]) kept.push_back(vs.vertices[i]);
+                size_t removed = vs.vertices.size() - kept.size();
+                if (removed > 0 && !kept.empty()) {
+                    vs.vertices = std::move(kept);
+                    renderer.updateBuffer(vs.vbo, vs.vertices.data(),
+                                          vs.vertices.size() * sizeof(render::Vertex));
+                    auto& r = world.get<Renderable>(src);
+                    renderer.destroyMesh(r.mesh);
+                    render::MeshDesc md;
+                    md.vertexBuffer = vs.vbo;
+                    md.layout       = render::Vertex::layout();
+                    md.vertexCount  = (uint32_t)vs.vertices.size();
+                    md.topology     = render::PrimitiveTopology::Points;
+                    r.mesh          = renderer.createMesh(md);
+                    Eigen::Vector3f mn = Eigen::Vector3f::Constant(FLT_MAX);
+                    Eigen::Vector3f mx = Eigen::Vector3f::Constant(-FLT_MAX);
+                    auto& pg = world.get<PickGeometry>(src);
+                    pg.positions.clear();
+                    pg.positions.reserve(vs.vertices.size());
+                    for (const auto& v : vs.vertices) {
+                        Eigen::Vector3f p(v.position[0], v.position[1], v.position[2]);
+                        pg.positions.push_back(p);
+                        mn = mn.cwiseMin(p);
+                        mx = mx.cwiseMax(p);
+                    }
+                    r.boundsMin = mn;
+                    r.boundsMax = mx;
+                }
+                SDL_Log("processingModeSystem: %s done (%zu points removed)",
+                        modes::modeName(state.index), removed);
+                cache.verts.clear();
+                if (ctx.contains<modes::ModeState>()) {
+                    auto& ms = ctx.get<modes::ModeState>();
+                    ms.index = -1;
+                    ms.generation++;
+                }
+            } else {
+                cache.verts = std::move(cache.job->verts);
+                SDL_Log("processingModeSystem: %s done (%zu verts)", modes::modeName(state.index),
+                        cache.verts.size());
+            }
             cache.generation = want;
             cache.selSig     = selSig;
-            SDL_Log("processingModeSystem: %s done (%zu verts)", modes::modeName(state.index),
-                    cache.verts.size());
         }
         cache.job.reset();
     }
@@ -181,6 +288,8 @@ void processingModeSystem(entt::registry& world) {
     //    and be discarded above on a later frame).
     if (!active || (!hasFixed && src == entt::null)) {
         if (!cache.verts.empty()) { cache.verts.clear(); cache.generation = 0; cache.selSig = 0; }
+        syncHidden(entt::null);
+        restoreRecolor();
         debug::DebugDraw::instance().addRaw(cache.verts);
         return;
     }
@@ -189,6 +298,11 @@ void processingModeSystem(entt::registry& world) {
     //    thread (a cheap copy) and launch the heavy work on a background thread.
     const bool needCompute = (cache.generation != want || cache.selSig != selSig);
     if (needCompute && !cache.job) {
+        // The displayed result is being replaced -- if it was a recolor, put the
+        // original colors back first (the new result may be another mode or
+        // another entity).
+        restoreRecolor();
+
         // Main thread only copies the raw positions (a fast memcpy) + the model
         // matrix; the worker does the world transform AND the heavy operator.
         modes::ModeInput fixedInput;
@@ -205,6 +319,12 @@ void processingModeSystem(entt::registry& world) {
         job->gen   = want;
         job->sig   = selSig;
         job->index = state.index;
+        // Mask modes edit the source buffer instead of drawing -- only possible
+        // when the source is a real entity with a CPU vertex copy (not a fixed
+        // ctx input); otherwise they fall back to their drawing implementation.
+        job->maskKind = (!hasFixed && src != entt::null && world.all_of<VertexSource>(src))
+                            ? modes::modeMaskKind(state.index)
+                            : modes::MaskKind::None;
         cache.job  = job;
         SDL_Log("processingModeSystem: %s running in background on %zu points...",
                 modes::modeName(state.index),
@@ -223,13 +343,24 @@ void processingModeSystem(entt::registry& world) {
                         in.points[i]      = Eigen::Vector3f(w.x(), w.y(), w.z());
                     }
                 }
-                debug::DebugDraw tmp;
-                modes::runMode(idx, in, tmp,
-                               [job](float f) { job->progress.store(f, std::memory_order_relaxed); });
-                job->verts = tmp.vertices();
+                auto onProgress = [job](float f) {
+                    job->progress.store(f, std::memory_order_relaxed);
+                };
+                if (job->maskKind != modes::MaskKind::None) {
+                    modes::runModeMask(idx, in, job->mask, onProgress);
+                } else {
+                    debug::DebugDraw tmp;
+                    modes::runMode(idx, in, tmp, onProgress);
+                    job->verts = tmp.vertices();
+                }
                 job->done.store(true, std::memory_order_release);
             });
     }
+
+    // Hide the source only once ITS result is the one on screen (a stale result
+    // from a previous selection keeps drawing until the new job lands; don't
+    // hide the new source under someone else's result).
+    syncHidden(!cache.verts.empty() && !hasFixed && cache.selSig == selSig ? src : entt::null);
 
     debug::DebugDraw::instance().addRaw(cache.verts);
 }

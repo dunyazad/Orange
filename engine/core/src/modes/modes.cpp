@@ -456,6 +456,163 @@ void runPFOR(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progr
     drawKeepMask(pts, keep, diag * 0.004f, out);
 }
 
+// --- Filter: Bump detection / removal (trimmed-plane residual) ----------------
+// Separate noise-like bump blobs sticking out of an otherwise smooth surface.
+// Per point: gather a bump-sized radius neighbourhood, fit a PCA plane, then
+// REFIT on the closer half of the neighbours -- the trim excludes the bump
+// itself from the reference surface (a plain smoothing residual fails here:
+// the bump drags the local average toward itself and the residual dies). The
+// point's distance to the trimmed plane is its bump height. Threshold robustly
+// (median + k*MAD over the whole cloud), then grow the seeds through a lower
+// hysteresis threshold over radius neighbours so whole blobs are marked, not
+// just their tips. SOR/ROR can't catch these: bump interiors have normal
+// density, so only a surface-residual test separates them.
+std::vector<uint8_t> computeBumpMask(const std::vector<Eigen::Vector3f>& pts, float diag,
+                                     const ProgressFn& progress) {
+    geometry::SparseGrid grid;
+    const float radius = diag * 0.03f;  // reference-surface scale (≈ 2x bump size)
+    grid.build(pts, radius);
+
+    std::vector<float> res(pts.size(), 0.0f);
+    std::vector<unsigned int> nbr, sub, trimmedNbr;
+    std::vector<float> dist, planeDist, pd;
+    Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
+    const size_t step = pts.size() / 100 + 1;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        if (i % step == 0) report(progress, 0.85f * (float)i / (float)pts.size());
+        grid.pointsWithinRadius(pts, pts[i], radius, nbr, dist);
+        if (nbr.size() < 12) continue;  // sparse fringe: no reliable reference plane
+        sub.clear();                    // cap the fit cost on dense clouds
+        size_t stride = nbr.size() / 64 + 1;
+        for (size_t t = 0; t < nbr.size(); t += stride) sub.push_back(nbr[t]);
+        if (!neighbourhoodPCA(pts, sub, c, eval, evec)) continue;
+        Eigen::Vector3f n = evec.col(0);
+        planeDist.resize(sub.size());
+        for (size_t t = 0; t < sub.size(); ++t)
+            planeDist[t] = std::abs((pts[sub[t]] - c).dot(n));
+        pd = planeDist;
+        size_t half = pd.size() / 2;
+        std::nth_element(pd.begin(), pd.begin() + half, pd.end());
+        float medPd = pd[half];
+        trimmedNbr.clear();
+        for (size_t t = 0; t < sub.size(); ++t)
+            if (planeDist[t] <= medPd) trimmedNbr.push_back(sub[t]);
+        if (neighbourhoodPCA(pts, trimmedNbr, c, eval, evec)) n = evec.col(0);
+        res[i] = std::abs((pts[i] - c).dot(n));
+    }
+
+    // LOCAL reference residual, not a global threshold: on a scan whose surface
+    // complexity varies (smooth patches next to rough detailed areas) a single
+    // global median+MAD is dominated by the rough regions -- bumps on smooth
+    // patches fall below it while ordinary rough-region points poke above it
+    // (detects the wrong places). Instead each point's residual is scored
+    // against the typical residual of its own surroundings: median residual per
+    // coarse voxel, then per point the median over the 3x3x3 voxel
+    // neighbourhood. A noise bump on a smooth patch scores res/ref >> 1; points
+    // in an evenly rough region score ~1 however big their absolute residual.
+    const float invVox = 1.0f / (radius * 3.0f);
+    std::unordered_map<VoxelKey, std::vector<float>, VoxelHash> voxRes;
+    for (size_t i = 0; i < pts.size(); ++i)
+        voxRes[voxelOf(pts[i], invVox)].push_back(res[i]);
+    std::unordered_map<VoxelKey, float, VoxelHash> voxMed;
+    for (auto& kv : voxRes) {
+        auto& v = kv.second;
+        size_t h = v.size() / 2;
+        std::nth_element(v.begin(), v.begin() + h, v.end());
+        voxMed[kv.first] = v[h];
+    }
+    const float refFloor = diag * 1e-5f;
+    std::vector<float> score(pts.size(), 0.0f);
+    std::vector<float> nbrMed;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        VoxelKey k = voxelOf(pts[i], invVox);
+        nbrMed.clear();
+        for (int z = -1; z <= 1; ++z)
+            for (int y = -1; y <= 1; ++y)
+                for (int x = -1; x <= 1; ++x) {
+                    auto it = voxMed.find({k.x + x, k.y + y, k.z + z});
+                    if (it != voxMed.end()) nbrMed.push_back(it->second);
+                }
+        size_t h = nbrMed.size() / 2;
+        std::nth_element(nbrMed.begin(), nbrMed.begin() + h, nbrMed.end());
+        float ref = std::max(nbrMed.empty() ? refFloor : nbrMed[h], refFloor);
+        score[i] = res[i] / ref;
+    }
+
+    // Hysteresis region growing: seeds score high, expand through neighbours
+    // scoring above the lower bar.
+    const float hiScore = 5.0f, loScore = 3.0f;
+    const float growRadius = diag * 0.02f;
+    std::vector<uint8_t> bump(pts.size(), 0);
+    std::queue<size_t> q;
+    for (size_t i = 0; i < pts.size(); ++i)
+        if (score[i] > hiScore) { bump[i] = 1; q.push(i); }
+    while (!q.empty()) {
+        size_t i = q.front();
+        q.pop();
+        grid.pointsWithinRadius(pts, pts[i], growRadius, nbr, dist);
+        for (unsigned int j : nbr)
+            if (!bump[j] && score[j] > loScore) { bump[j] = 1; q.push(j); }
+    }
+
+    // Only NOISE bumps, not real geometry: legitimate features (cusps, ridges)
+    // also fit a plane badly at this scale, but they flag as LARGE connected
+    // regions while noise bumps are small isolated blobs. BFS the flagged
+    // points into components and unflag any component wider than a cap.
+    const float maxBlobExtent = diag * 0.05f;
+    std::vector<uint8_t> visited(pts.size(), 0);
+    std::vector<size_t> comp;
+    for (size_t i = 0; i < pts.size(); ++i) {
+        if (!bump[i] || visited[i]) continue;
+        comp.clear();
+        std::queue<size_t> bfs;
+        bfs.push(i);
+        visited[i] = 1;
+        Eigen::Vector3f cmn = pts[i], cmx = pts[i];
+        while (!bfs.empty()) {
+            size_t a = bfs.front();
+            bfs.pop();
+            comp.push_back(a);
+            cmn = cmn.cwiseMin(pts[a]);
+            cmx = cmx.cwiseMax(pts[a]);
+            grid.pointsWithinRadius(pts, pts[a], growRadius, nbr, dist);
+            for (unsigned int j : nbr)
+                if (bump[j] && !visited[j]) { visited[j] = 1; bfs.push(j); }
+        }
+        // Too wide = real geometry; too few points = lone speckle, not a bump.
+        if ((cmx - cmn).norm() > maxBlobExtent || comp.size() < 8)
+            for (size_t a : comp) bump[a] = 0;
+    }
+    report(progress, 1.0f);
+    return bump;
+}
+
+void runBumpDetect(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+    const auto& pts = in.points;
+    if (pts.size() < 8) return;
+    Eigen::Vector3f mn, mx;
+    float diag = boundsExtent(pts, mn, mx).norm();
+    std::vector<uint8_t> bump = computeBumpMask(pts, diag, progress);
+
+    const Eigen::Vector3f red(0.95f, 0.08f, 0.08f), gray(0.75f, 0.75f, 0.75f);
+    float psize = diag * 0.004f;
+    for (size_t i = 0; i < pts.size(); ++i)
+        out.addPoint(pts[i], bump[i] ? red : gray, psize);
+}
+
+void runBumpRemove(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+    const auto& pts = in.points;
+    if (pts.size() < 8) return;
+    Eigen::Vector3f mn, mx;
+    float diag = boundsExtent(pts, mn, mx).norm();
+    std::vector<uint8_t> bump = computeBumpMask(pts, diag, progress);
+
+    float psize = diag * 0.004f;
+    const Eigen::Vector3f white(0.9f, 0.9f, 0.9f);
+    for (size_t i = 0; i < pts.size(); ++i)
+        if (!bump[i]) out.addPoint(pts[i], white, psize);
+}
+
 // --- Analyze: Kernel Density Estimation (KDE) --------------------------------
 // Ported from Helium PointCloudKDE. Gaussian-kernel local density, shown as a
 // heatmap (dense = warm).
@@ -597,6 +754,7 @@ struct ModeEntry {
     const char*  name;
     void       (*fn)(const ModeInput&, debug::DebugDraw&, const ProgressFn&);
     ModeCategory category;
+    MaskKind     mask = MaskKind::None;
 };
 const ModeEntry kModes[] = {
     {"Reconstruct",      runReconstruct,     ModeCategory::Generate},
@@ -609,6 +767,8 @@ const ModeEntry kModes[] = {
     {"Outlier: ROR",     runROR,             ModeCategory::Filter},
     {"Outlier: PFOR",    runPFOR,            ModeCategory::Filter},
     {"Morphology",       runMorphology,      ModeCategory::Filter},
+    {"Bump: Detect",     runBumpDetect,      ModeCategory::Filter, MaskKind::Recolor},
+    {"Bump: Remove",     runBumpRemove,      ModeCategory::Filter, MaskKind::Remove},
     {"Smooth (bilateral)", runSmooth,        ModeCategory::Transform},
     {"ICP Register",     runICP,             ModeCategory::Transform},
 };
@@ -641,6 +801,21 @@ const char* modeCategoryName(ModeCategory c) {
 void runMode(int index, const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
     if (index < 0 || index >= kModeCount) return;
     kModes[index].fn(in, out, progress);
+}
+
+MaskKind modeMaskKind(int index) {
+    if (index < 0 || index >= kModeCount) return MaskKind::None;
+    return kModes[index].mask;
+}
+
+void runModeMask(int index, const ModeInput& in, std::vector<uint8_t>& mask,
+                 const ProgressFn& progress) {
+    mask.assign(in.points.size(), 0);
+    if (index < 0 || index >= kModeCount || kModes[index].mask == MaskKind::None) return;
+    if (in.points.size() < 8) return;
+    Eigen::Vector3f mn, mx;
+    float diag = boundsExtent(in.points, mn, mx).norm();
+    mask = computeBumpMask(in.points, diag, progress);
 }
 
 } // namespace orange::modes

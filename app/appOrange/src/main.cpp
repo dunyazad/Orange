@@ -826,6 +826,15 @@ int main(int argc, char** argv) {
         if (!isPoints) pick.indices = mi;
         world.emplace<ecs::PickGeometry>(e, std::move(pick));
 
+        // Point clouds keep a CPU copy of their vertex buffer so mask modes
+        // (bump detect/remove) can recolor or delete points in place.
+        if (isPoints) {
+            ecs::VertexSource vsrc;
+            vsrc.vbo      = loadedVbos.back()->handle();
+            vsrc.vertices = mv;
+            world.emplace<ecs::VertexSource>(e, std::move(vsrc));
+        }
+
         // Frame the camera on the just-loaded mesh: orbit pivot -> bounds center,
         // distance -> fit the bounding sphere to the vertical FOV (+ margin). Also
         // updates the home pose so R resets to this framing, and widens the zoom

@@ -62,6 +62,17 @@ struct PickGeometry {
     std::vector<uint32_t>        indices;    // triangle list (3 per face)
 };
 
+// CPU copy of a point cloud's GPU vertex buffer. Lets systems edit the cloud in
+// place through IRenderer::updateBuffer: recolor points (e.g. bump-detect paints
+// flagged points red, restoring the original colors when the mode ends) or
+// delete points (bump-remove compacts the buffer). `vertices` always holds the
+// CURRENT original data -- a recolor uploads a modified copy without touching
+// it, so it doubles as the restore backup.
+struct VertexSource {
+    render::BufferHandle        vbo = render::kInvalidBuffer;
+    std::vector<render::Vertex> vertices;
+};
+
 // Background build of a pick BVH for a huge mesh (millions of triangles), so the
 // click that triggers it doesn't freeze the main thread. Held by shared_ptr so the
 // worker can be detached. Small meshes skip this and build inline (instant). Carries

@@ -57,4 +57,16 @@ using ProgressFn = std::function<void(float)>;
 void runMode(int index, const ModeInput& in, debug::DebugDraw& out,
              const ProgressFn& progress = {});
 
+// Some modes classify each input point instead of drawing a visualization; the
+// host applies the result to the source cloud itself -- Recolor paints flagged
+// points (restoring on mode end), Remove deletes them from the buffer. Modes
+// with MaskKind::None only draw (and mask modes fall back to their drawing
+// implementation when the host can't edit the source, e.g. a fixed ctx input).
+enum class MaskKind { None = 0, Recolor, Remove };
+MaskKind modeMaskKind(int index);
+
+// Run a mask mode: fills `mask` (one entry per input point, 1 = flagged).
+void runModeMask(int index, const ModeInput& in, std::vector<uint8_t>& mask,
+                 const ProgressFn& progress = {});
+
 } // namespace orange::modes

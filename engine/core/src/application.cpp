@@ -275,7 +275,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         ecs::cameraManipulatorSystem(world_, input_, dt);
         ecs::pickingSystem(world_, input_, window_.width(), window_.height());
         ecs::spinSystem(world_, dt);
-        ecs::processingModeSystem(world_);  // emits the active mode's debug geometry
+        ecs::processingModeSystem(world_, *plugin_->renderer());  // mode result (debug geometry / in-place cloud edit)
         ecs::renderSystem(world_, *plugin_->renderer(), window_.width(),
                           window_.height());
 

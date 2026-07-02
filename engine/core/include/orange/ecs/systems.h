@@ -93,8 +93,11 @@ bool entityVisibleOnScreen(entt::registry& world, entt::entity e,
 // Runs the active point-cloud processing mode (modes::ModeState in ctx) on the
 // selected entity's cloud, on a BACKGROUND thread so the main loop never blocks;
 // emits the last result into the debug-draw accumulator each frame. Recomputes
-// only when the active mode or selection changes. Call before renderSystem.
-void processingModeSystem(entt::registry& world);
+// only when the active mode or selection changes. Mask modes (bump detect /
+// remove) edit the source cloud's vertex buffer in place instead of drawing:
+// detect recolors the flagged points red (original colors restored when the
+// mode ends), remove deletes them -- hence the renderer. Call before renderSystem.
+void processingModeSystem(entt::registry& world, render::IRenderer& renderer);
 
 // If a processing-mode computation is running in the background, returns true and
 // fills `outProgress` (0..1) + `outName` (mode label) for a UI status line; false
