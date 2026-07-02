@@ -6,7 +6,7 @@ set ROOT=%~dp0
 if %ROOT:~-1%==\ set ROOT=%ROOT:~0,-1%
 set BUILD=%ROOT%\build
 
-cmake -S "%ROOT%" -B "%BUILD%" -G "Visual Studio 16 2019" -A x64 || goto :error
+cmake -S "%ROOT%" -B "%BUILD%" -G "Visual Studio 17 2022" -A x64 || goto :error
 cmake --build "%BUILD%" --config Release || goto :error
 
 "%BUILD%\bin\Release\appOrange.exe" %*

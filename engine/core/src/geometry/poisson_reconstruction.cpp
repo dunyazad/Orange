@@ -292,7 +292,10 @@ std::vector<Triangle> poissonReconstruct(const std::vector<Eigen::Vector3f>& poi
                     tri.v[0] = ev[e0]; tri.v[1] = ev[e1]; tri.v[2] = ev[e2];
                     tri.n[0] = en[e0]; tri.n[1] = en[e1]; tri.n[2] = en[e2];
                     // Wind so the geometric normal agrees with the (outward) gradient.
-                    Eigen::Vector3f fn = (tri.v[1] - tri.v[0]).cross(tri.v[2] - tri.v[0]);
+                    Eigen::Vector3f e10 = tri.v[1] - tri.v[0], e20 = tri.v[2] - tri.v[0];
+                    Eigen::Vector3f fn(e10.y() * e20.z() - e10.z() * e20.y(),
+                                       e10.z() * e20.x() - e10.x() * e20.z(),
+                                       e10.x() * e20.y() - e10.y() * e20.x());
                     if (fn.dot(tri.n[0] + tri.n[1] + tri.n[2]) < 0.0f) {
                         std::swap(tri.v[1], tri.v[2]);
                         std::swap(tri.n[1], tri.n[2]);
