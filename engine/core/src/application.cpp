@@ -65,7 +65,7 @@ void syncModeParamsDialog(entt::registry& world, int modeIndex) {
             d.modeIndex = modeIndex;
             for (int i = 0; i < n && i < 8; ++i) d.values[i] = modes::modeParam(modeIndex, i).defV;
         }
-        d.h       = 42 + n * 36 + 46;
+        d.h       = 42 + n * 36 + 46 + (modes::modeCanFit(modeIndex) ? 36 : 0);
         d.visible = true;
         break;
     }

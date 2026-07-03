@@ -174,6 +174,8 @@ struct ModeJob {
     std::vector<render::Vertex> verts;            // debug geometry (Draw / Recolor extras)
     std::vector<uint8_t>        mask;              // per-point delete flags (Remove)
     std::vector<Eigen::Vector3f> colors;           // per-point colors (Recolor; x<0 = keep)
+    std::vector<Eigen::Vector3f> fitted;           // new world positions (fit action)
+    bool                        isFit = false;     // this job runs the mode's Fit action
     modes::ApplyKind            applyKind = modes::ApplyKind::Draw;
     uint64_t                    gen = 0, sig = 0;
     int                         index = -1;       // which mode (for the status label)
@@ -329,7 +331,49 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
     if (cache.job && cache.job->done.load(std::memory_order_acquire)) {
         if (cache.worker.joinable()) cache.worker.join();
         if (cache.job->gen == want && cache.job->sig == selSig) {  // still relevant
-            if (cache.job->applyKind == modes::ApplyKind::Recolor && src != entt::null &&
+            if (cache.job->isFit && src != entt::null && world.all_of<VertexSource>(src) &&
+                world.all_of<Renderable>(src) && world.get<Renderable>(src).pointCloud) {
+                // Fit action: replace the cloud's positions with the mode's
+                // fitted (world-space) positions, mapped back to local space.
+                // Undoable; the mode is deactivated afterwards so the moved
+                // cloud is not immediately re-processed.
+                auto&       vs     = world.get<VertexSource>(src);
+                const auto& fitted = cache.job->fitted;
+                if (fitted.size() == vs.vertices.size()) {
+                    Eigen::Matrix4f Minv = Eigen::Matrix4f::Identity();
+                    if (world.all_of<Transform>(src))
+                        Minv = world.get<Transform>(src).matrix().inverse();
+                    auto oldVerts = std::make_shared<std::vector<render::Vertex>>(vs.vertices);
+                    auto newVerts = std::make_shared<std::vector<render::Vertex>>(vs.vertices);
+                    size_t moved = 0;
+                    for (size_t i = 0; i < fitted.size(); ++i) {
+                        Eigen::Vector4f l = Minv * Eigen::Vector4f(fitted[i].x(), fitted[i].y(),
+                                                                   fitted[i].z(), 1.0f);
+                        auto& p = (*newVerts)[i].position;
+                        if (p[0] != l.x() || p[1] != l.y() || p[2] != l.z()) ++moved;
+                        p[0] = l.x(); p[1] = l.y(); p[2] = l.z();
+                    }
+                    applyCloudVertices(world, renderer, src, *newVerts);
+                    UndoOp op;
+                    op.label = std::string(modes::modeName(state.index)) + " Fit";
+                    op.undo  = [e = src, oldVerts](entt::registry& w, render::IRenderer& r) {
+                        applyCloudVertices(w, r, e, *oldVerts);
+                    };
+                    op.redo = [e = src, newVerts](entt::registry& w, render::IRenderer& r) {
+                        applyCloudVertices(w, r, e, *newVerts);
+                    };
+                    undoStack(world).push(std::move(op));
+                    SDL_Log("processingModeSystem: %s fit done (%zu points moved)",
+                            modes::modeName(state.index), moved);
+                }
+                cache.verts.clear();
+                cache.hideSource = false;
+                if (ctx.contains<modes::ModeState>()) {
+                    auto& ms = ctx.get<modes::ModeState>();
+                    ms.index = -1;
+                    ms.generation++;
+                }
+            } else if (cache.job->applyKind == modes::ApplyKind::Recolor && src != entt::null &&
                 world.all_of<VertexSource>(src)) {
                 // Paint the mode's per-point colors IN the source buffer (a
                 // color with x < 0 keeps the original; originals stay in
@@ -412,10 +456,25 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
         return;
     }
 
-    // 3) Need a (re)compute and no worker in flight? Build the input on the main
-    //    thread (a cheap copy) and launch the heavy work on a background thread.
+    // The params dialog (if it is editing this mode): current values + a
+    // pending Fit request (kept pending while a job is in flight).
+    ModeParamsDialog* dlg = nullptr;
+    {
+        auto dv = world.view<ModeParamsDialog>();
+        for (auto de : dv) {
+            auto& d = dv.get<ModeParamsDialog>(de);
+            if (d.modeIndex == state.index) dlg = &d;
+            break;
+        }
+    }
+    const bool wantFit = dlg && dlg->requestFit && modes::modeCanFit(state.index);
+
+    // 3) Need a (re)compute (or a Fit) and no worker in flight? Build the input
+    //    on the main thread (a cheap copy) and launch the heavy work on a
+    //    background thread.
     const bool needCompute = (cache.generation != want || cache.selSig != selSig);
-    if (needCompute && !cache.job) {
+    if ((needCompute || wantFit) && !cache.job) {
+        if (wantFit) dlg->requestFit = false;  // consumed by this launch
         // The displayed result is being replaced -- if it was a recolor, put the
         // original colors back first (the new result may be another mode or
         // another entity).
@@ -433,31 +492,28 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
             if (world.all_of<Transform>(src)) M = world.get<Transform>(src).matrix();
         }
 
-        // Current parameter values from the mode-params dialog (if it is
-        // editing this mode); modes fall back to their defaults otherwise.
+        // Current parameter values (modes fall back to their defaults).
         std::vector<float> params;
-        {
-            auto dv = world.view<ModeParamsDialog>();
-            for (auto de : dv) {
-                const auto& d = dv.get<ModeParamsDialog>(de);
-                if (d.modeIndex == state.index) {
-                    int n = modes::modeParamCount(state.index);
-                    params.assign(d.values, d.values + (n < 8 ? n : 8));
-                }
-                break;
-            }
+        if (dlg) {
+            int n = modes::modeParamCount(state.index);
+            params.assign(dlg->values, dlg->values + (n < 8 ? n : 8));
         }
 
         auto job = std::make_shared<ModeJob>();
         job->gen   = want;
         job->sig   = selSig;
         job->index = state.index;
-        // Recolor/Remove modes edit the source buffer instead of drawing --
-        // only possible when the source is a real entity with a CPU vertex
-        // copy (not a fixed ctx input); otherwise fall back to drawing.
-        job->applyKind = (!hasFixed && src != entt::null && world.all_of<VertexSource>(src))
-                             ? modes::modeApplyKind(state.index)
-                             : modes::ApplyKind::Draw;
+        // Recolor/Remove/Fit edit the source buffer instead of drawing -- only
+        // possible when the source is a real entity with a CPU vertex copy
+        // (not a fixed ctx input); Remove/Fit rebuild the mesh as points, so
+        // they additionally need a point cloud. Otherwise fall back to drawing.
+        const bool canEdit = !hasFixed && src != entt::null && world.all_of<VertexSource>(src);
+        const bool isCloud = canEdit && world.get<Renderable>(src).pointCloud;
+        modes::ApplyKind k = modes::modeApplyKind(state.index);
+        job->applyKind = (k == modes::ApplyKind::Recolor && canEdit) ? k
+                       : (k == modes::ApplyKind::Remove && isCloud)  ? k
+                                                                     : modes::ApplyKind::Draw;
+        job->isFit = wantFit && isCloud;
         cache.job  = job;
         SDL_Log("processingModeSystem: %s running in background on %zu points...",
                 modes::modeName(state.index),
@@ -481,7 +537,9 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
                 auto onProgress = [job](float f) {
                     job->progress.store(f, std::memory_order_relaxed);
                 };
-                if (job->applyKind == modes::ApplyKind::Remove) {
+                if (job->isFit) {
+                    modes::runModeFit(idx, in, job->fitted, onProgress);
+                } else if (job->applyKind == modes::ApplyKind::Remove) {
                     modes::runModeMask(idx, in, job->mask, onProgress);
                 } else if (job->applyKind == modes::ApplyKind::Recolor) {
                     debug::DebugDraw extras;
@@ -1568,7 +1626,9 @@ void buildPoissonDialogGeometry(const PoissonDialog& d, render::Vertex* out) {
 constexpr int kModeDlgQuads = 256;
 constexpr int kModeDlgVerts = kModeDlgQuads * 4;
 
-struct ModeDlgRects { CRect track[8]; CRect minus[8]; CRect plus[8]; CRect apply; CRect close; };
+struct ModeDlgRects {
+    CRect track[8]; CRect minus[8]; CRect plus[8]; CRect apply; CRect fit; CRect close;
+};
 ModeDlgRects modeDlgRects(const ModeParamsDialog& d, int nParams) {
     ModeDlgRects r;
     const float pad = 16.0f, btn = 18.0f, gap = 6.0f;
@@ -1581,7 +1641,13 @@ ModeDlgRects modeDlgRects(const ModeParamsDialog& d, int nParams) {
         r.minus[i] = {d.x + pad + trackW + gap, by, btn, btn};
         r.plus[i]  = {d.x + pad + trackW + gap + btn + gap, by, btn, btn};
     }
-    r.apply = {d.x + pad, (float)(d.y + d.h) - 38.0f, d.w - 2 * pad, 28.0f};
+    if (modes::modeCanFit(d.modeIndex)) {
+        r.apply = {d.x + pad, (float)(d.y + d.h) - 74.0f, d.w - 2 * pad, 28.0f};
+        r.fit   = {d.x + pad, (float)(d.y + d.h) - 38.0f, d.w - 2 * pad, 28.0f};
+    } else {
+        r.apply = {d.x + pad, (float)(d.y + d.h) - 38.0f, d.w - 2 * pad, 28.0f};
+        r.fit   = {0, 0, 0, 0};
+    }
     r.close = {(float)(d.x + d.w) - 24.0f, (float)d.y + 7.0f, 16.0f, 16.0f};
     return r;
 }
@@ -1698,6 +1764,15 @@ void buildModeParamsDialogGeometry(const ModeParamsDialog& d, render::Vertex* ou
     float bh = (y1 - y0) * 0.62f;
     text("Apply", (x0 + x1) * 0.5f - textW("Apply", bh) * 0.5f,
          (y0 + y1) * 0.5f - bh * 0.35f, bh, 0.90f, 0.96f, 0.92f, 0.6f);
+
+    // Fit button (modes with a fit action only).
+    if (modes::modeCanFit(d.modeIndex)) {
+        toN(R.fit, x0, y0, x1, y1);
+        solid(x0, y0, x1, y1, 0.22f, 0.34f, 0.52f, 0.3f);
+        float fh = (y1 - y0) * 0.62f;
+        text("Fit", (x0 + x1) * 0.5f - textW("Fit", fh) * 0.5f,
+             (y0 + y1) * 0.5f - fh * 0.35f, fh, 0.90f, 0.94f, 0.98f, 0.6f);
+    }
 
     for (int i = q * 4; i < kModeDlgVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
@@ -3432,6 +3507,11 @@ void modeParamsDialogInputSystem(entt::registry& world, core::Input& input,
 
     if (input.leftClicked && hit(R.apply)) {
         d->requestApply = true;
+        input.captured = true;
+        return;
+    }
+    if (input.leftClicked && modes::modeCanFit(d->modeIndex) && hit(R.fit)) {
+        d->requestFit  = true;
         input.captured = true;
         return;
     }

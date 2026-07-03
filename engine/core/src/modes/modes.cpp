@@ -508,6 +508,32 @@ void pforColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
     keepToColors(keep, colors);
 }
 
+// PFOR "Fit": instead of dropping the outliers, project them onto their local
+// fitted plane -- pulls stray points back onto the surface. Inliers stay put.
+void pforFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+             const ProgressFn& progress) {
+    const auto& pts = in.points;
+    fitted = pts;
+    if (pts.size() < 8) return;
+    geometry::SparseGrid grid;
+    Eigen::Vector3f mn, mx;
+    buildGrid(pts, grid, mn, mx);
+    const int k = (int)std::lround(P(in, 0, 16.0f));
+    const float beta = P(in, 1, 0.05f);
+
+    parallelFor(pts.size(), progress, 0.0f, 1.0f, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
+        Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
+        grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
+        if (!neighbourhoodPCA(pts, nbr, c, eval, evec)) return;
+        Eigen::Vector3f n = evec.col(0);
+        float d = (pts[i] - c).dot(n);
+        float extent = std::sqrt(std::max(eval.y(), 1e-12f));
+        if (std::abs(d) > beta * extent) fitted[i] = pts[i] - n * d;  // project outlier
+    });
+}
+
 // --- Filter: Bump detection / removal (trimmed-plane residual) ----------------
 // Separate noise-like bump blobs sticking out of an otherwise smooth surface.
 // Per point: gather a bump-sized radius neighbourhood, fit a PCA plane, then
@@ -797,6 +823,7 @@ void runICP(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progre
 using DrawFn  = void (*)(const ModeInput&, debug::DebugDraw&, const ProgressFn&);
 using ColorFn = void (*)(const ModeInput&, std::vector<Eigen::Vector3f>&, debug::DebugDraw&,
                          const ProgressFn&);
+using FitFn   = void (*)(const ModeInput&, std::vector<Eigen::Vector3f>&, const ProgressFn&);
 struct ModeEntry {
     const char*  name;
     DrawFn       fn;        // Draw modes (null for Recolor/Remove)
@@ -805,6 +832,7 @@ struct ModeEntry {
     ColorFn      colorFn   = nullptr;  // Recolor modes (also the Remove fallback viz)
     int          numParams = 0;
     ModeParam    params[4] = {};
+    FitFn        fitFn     = nullptr;  // optional "Fit" action (dialog button)
 };
 const ModeParam kBumpParams[4] = {
     {"Fit Radius %", 1.0f, 8.0f, 3.0f, false},
@@ -831,7 +859,8 @@ const ModeEntry kModes[] = {
      {{"Radius %", 0.5f, 10.0f, 2.5f, false}, {"Min Nbrs", 1.0f, 32.0f, 5.0f, true}}},
     {"Outlier: PFOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, pforColors, 2,
      {{"K Neighbors", 4.0f, 256.0f, 16.0f, true},
-      {"Beta", 0.0f, 0.1f, 0.05f, false, 0.001f}}},
+      {"Beta", 0.0f, 0.1f, 0.05f, false, 0.001f}},
+     pforFit},
     {"Morphology", nullptr, ModeCategory::Filter, ApplyKind::Recolor, morphologyColors, 2,
      {{"Voxel %", 1.0f, 10.0f, 4.0f, false}, {"Erode Iters", 1.0f, 4.0f, 2.0f, true}}},
     {"Bump: Detect", nullptr, ModeCategory::Filter, ApplyKind::Recolor, bumpDetectColors, 4,
@@ -920,6 +949,18 @@ void runModeMask(int index, const ModeInput& in, std::vector<uint8_t>& mask,
     Eigen::Vector3f mn, mx;
     float diag = boundsExtent(in.points, mn, mx).norm();
     mask = computeBumpMask(in, diag, progress);
+}
+
+bool modeCanFit(int index) {
+    if (index < 0 || index >= kModeCount) return false;
+    return kModes[index].fitFn != nullptr;
+}
+
+void runModeFit(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+                const ProgressFn& progress) {
+    fitted = in.points;
+    if (index < 0 || index >= kModeCount || !kModes[index].fitFn) return;
+    kModes[index].fitFn(in, fitted, progress);
 }
 
 } // namespace orange::modes

@@ -90,4 +90,13 @@ void runModeColors(int index, const ModeInput& in, std::vector<Eigen::Vector3f>&
 void runModeMask(int index, const ModeInput& in, std::vector<uint8_t>& mask,
                  const ProgressFn& progress = {});
 
+// Some modes can FIT the points instead of just classifying them (e.g. PFOR
+// projects its outliers onto their local fitted plane). The dialog shows a
+// "Fit" button for these; the host replaces the cloud's positions (undoable).
+bool modeCanFit(int index);
+// Fills `fitted` with the new world-space positions (same order/count as
+// in.points; non-fitted points keep their input position).
+void runModeFit(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+                const ProgressFn& progress = {});
+
 } // namespace orange::modes

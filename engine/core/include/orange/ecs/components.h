@@ -378,6 +378,7 @@ struct ModeParamsDialog {
     int  modeIndex = -1;      // which mode the sliders edit
     float values[8] = {};     // current values (modes::modeParamCount entries used)
     bool requestApply = false;  // edge: "Apply" clicked -> app re-runs the mode
+    bool requestFit   = false;  // edge: "Fit" clicked -> apply the mode's fit action
 
     int  w = 280, h = 232;    // h recomputed from the param count when opened
     int  x = 0, y = 0;
