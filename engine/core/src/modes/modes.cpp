@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
 #include <execution>
 #include <functional>
 #include <numeric>
@@ -401,10 +402,11 @@ bool neighbourhoodPCA(const std::vector<Eigen::Vector3f>& pts,
 }
 
 // Keep/drop result as per-point colors: kept green, removed faded red.
+const Eigen::Vector3f kKeepGreen(0.1f, 0.9f, 0.2f);
+const Eigen::Vector3f kDropRed(0.5f, 0.12f, 0.12f);
 void keepToColors(const std::vector<uint8_t>& keep, std::vector<Eigen::Vector3f>& colors) {
-    const Eigen::Vector3f green(0.1f, 0.9f, 0.2f), red(0.5f, 0.12f, 0.12f);
     colors.resize(keep.size());
-    for (size_t i = 0; i < keep.size(); ++i) colors[i] = keep[i] ? green : red;
+    for (size_t i = 0; i < keep.size(); ++i) colors[i] = keep[i] ? kKeepGreen : kDropRed;
 }
 
 // Per-point scalar field as heatmap colors (auto-ranged over [p5, p95] so a
@@ -824,6 +826,47 @@ using DrawFn  = void (*)(const ModeInput&, debug::DebugDraw&, const ProgressFn&)
 using ColorFn = void (*)(const ModeInput&, std::vector<Eigen::Vector3f>&, debug::DebugDraw&,
                          const ProgressFn&);
 using FitFn   = void (*)(const ModeInput&, std::vector<Eigen::Vector3f>&, const ProgressFn&);
+using PointsFn = FitFn;  // same shape: points in -> points out
+
+// Points-stage wrapper for the keep/drop filters: run the colors fn, keep the
+// points it marked kKeepGreen.
+void pointsFromKeepColors(ColorFn cf, const ModeInput& in,
+                          std::vector<Eigen::Vector3f>& outPts, const ProgressFn& progress) {
+    std::vector<Eigen::Vector3f> colors;
+    debug::DebugDraw extras;
+    cf(in, colors, extras, progress);
+    outPts.clear();
+    size_t n = std::min(colors.size(), in.points.size());
+    outPts.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+        if ((colors[i] - kKeepGreen).squaredNorm() < 1e-8f) outPts.push_back(in.points[i]);
+}
+void sorPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    pointsFromKeepColors(sorColors, in, o, p);
+}
+void rorPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    pointsFromKeepColors(rorColors, in, o, p);
+}
+void pforPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    pointsFromKeepColors(pforColors, in, o, p);
+}
+void morphologyPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    pointsFromKeepColors(morphologyColors, in, o, p);
+}
+void smoothStagePoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    o = geometry::smoothPoints(in.points, (int)std::lround(P(in, 0, 5.0f)), P(in, 1, 0.5f),
+                               true, 12, p);
+}
+void bumpRemovePoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    o = in.points;
+    if (in.points.size() < 8) return;
+    Eigen::Vector3f mn, mx;
+    float diag = boundsExtent(in.points, mn, mx).norm();
+    std::vector<uint8_t> bump = computeBumpMask(in, diag, p);
+    o.clear();
+    for (size_t i = 0; i < in.points.size(); ++i)
+        if (!bump[i]) o.push_back(in.points[i]);
+}
 struct ModeEntry {
     const char*  name;
     DrawFn       fn;        // Draw modes (null for Recolor/Remove)
@@ -833,6 +876,7 @@ struct ModeEntry {
     int          numParams = 0;
     ModeParam    params[4] = {};
     FitFn        fitFn     = nullptr;  // optional "Fit" action (dialog button)
+    PointsFn     pointsFn  = nullptr;  // optional points->points pipeline stage
 };
 const ModeParam kBumpParams[4] = {
     {"Fit Radius %", 1.0f, 8.0f, 3.0f, false},
@@ -854,21 +898,26 @@ const ModeEntry kModes[] = {
     {"Density (KDE)", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, kdeColors, 1,
      {{"Bandwidth %", 0.5f, 10.0f, 3.0f, false}}},
     {"Outlier: SOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, sorColors, 2,
-     {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}, {"Alpha", 0.25f, 4.0f, 1.0f, false}}},
+     {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}, {"Alpha", 0.25f, 4.0f, 1.0f, false}},
+     nullptr, sorPoints},
     {"Outlier: ROR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, rorColors, 2,
-     {{"Radius %", 0.5f, 10.0f, 2.5f, false}, {"Min Nbrs", 1.0f, 32.0f, 5.0f, true}}},
+     {{"Radius %", 0.5f, 10.0f, 2.5f, false}, {"Min Nbrs", 1.0f, 32.0f, 5.0f, true}},
+     nullptr, rorPoints},
     {"Outlier: PFOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, pforColors, 2,
      {{"K Neighbors", 4.0f, 256.0f, 16.0f, true},
       {"Beta", 0.0f, 0.1f, 0.05f, false, 0.001f}},
-     pforFit},
+     pforFit, pforPoints},
     {"Morphology", nullptr, ModeCategory::Filter, ApplyKind::Recolor, morphologyColors, 2,
-     {{"Voxel %", 1.0f, 10.0f, 4.0f, false}, {"Erode Iters", 1.0f, 4.0f, 2.0f, true}}},
+     {{"Voxel %", 1.0f, 10.0f, 4.0f, false}, {"Erode Iters", 1.0f, 4.0f, 2.0f, true}},
+     nullptr, morphologyPoints},
     {"Bump: Detect", nullptr, ModeCategory::Filter, ApplyKind::Recolor, bumpDetectColors, 4,
      {kBumpParams[0], kBumpParams[1], kBumpParams[2], kBumpParams[3]}},
     {"Bump: Remove", nullptr, ModeCategory::Filter, ApplyKind::Remove, bumpDetectColors, 4,
-     {kBumpParams[0], kBumpParams[1], kBumpParams[2], kBumpParams[3]}},
+     {kBumpParams[0], kBumpParams[1], kBumpParams[2], kBumpParams[3]}, nullptr,
+     bumpRemovePoints},
     {"Smooth (bilateral)", runSmooth, ModeCategory::Transform, ApplyKind::Draw, nullptr, 2,
-     {{"Iterations", 1.0f, 20.0f, 5.0f, true}, {"Lambda", 0.1f, 1.0f, 0.5f, false}}},
+     {{"Iterations", 1.0f, 20.0f, 5.0f, true}, {"Lambda", 0.1f, 1.0f, 0.5f, false}},
+     nullptr, smoothStagePoints},
     {"ICP Register", runICP, ModeCategory::Transform, ApplyKind::Draw, nullptr, 1,
      {{"Iterations", 5.0f, 100.0f, 40.0f, true}}},
 };
@@ -954,6 +1003,24 @@ void runModeMask(int index, const ModeInput& in, std::vector<uint8_t>& mask,
 bool modeCanFit(int index) {
     if (index < 0 || index >= kModeCount) return false;
     return kModes[index].fitFn != nullptr;
+}
+
+bool modeCanTransformPoints(int index) {
+    if (index < 0 || index >= kModeCount) return false;
+    return kModes[index].pointsFn != nullptr;
+}
+
+void runModePoints(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& outPoints,
+                   const ProgressFn& progress) {
+    outPoints = in.points;
+    if (index < 0 || index >= kModeCount || !kModes[index].pointsFn) return;
+    kModes[index].pointsFn(in, outPoints, progress);
+}
+
+int modeIndexByName(const char* name) {
+    for (int i = 0; i < kModeCount; ++i)
+        if (std::strcmp(kModes[i].name, name) == 0) return i;
+    return -1;
 }
 
 void runModeFit(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,

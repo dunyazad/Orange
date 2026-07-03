@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cfloat>
 #include <cmath>
+#include <fstream>
+#include <sstream>
 #include <cstdio>
 #include <cstring>
 #include <execution>
@@ -1641,7 +1643,7 @@ ModeDlgRects modeDlgRects(const ModeParamsDialog& d, int nParams) {
         r.minus[i] = {d.x + pad + trackW + gap, by, btn, btn};
         r.plus[i]  = {d.x + pad + trackW + gap + btn + gap, by, btn, btn};
     }
-    if (modes::modeCanFit(d.modeIndex)) {
+    if (modes::modeCanFit(d.modeIndex) && d.pipeNodeId < 0) {
         r.apply = {d.x + pad, (float)(d.y + d.h) - 74.0f, d.w - 2 * pad, 28.0f};
         r.fit   = {d.x + pad, (float)(d.y + d.h) - 38.0f, d.w - 2 * pad, 28.0f};
     } else {
@@ -1765,8 +1767,8 @@ void buildModeParamsDialogGeometry(const ModeParamsDialog& d, render::Vertex* ou
     text("Apply", (x0 + x1) * 0.5f - textW("Apply", bh) * 0.5f,
          (y0 + y1) * 0.5f - bh * 0.35f, bh, 0.90f, 0.96f, 0.92f, 0.6f);
 
-    // Fit button (modes with a fit action only).
-    if (modes::modeCanFit(d.modeIndex)) {
+    // Fit button (modes with a fit action only; hidden in node-editing mode).
+    if (modes::modeCanFit(d.modeIndex) && d.pipeNodeId < 0) {
         toN(R.fit, x0, y0, x1, y1);
         solid(x0, y0, x1, y1, 0.22f, 0.34f, 0.52f, 0.3f);
         float fh = (y1 - y0) * 0.62f;
@@ -1775,6 +1777,339 @@ void buildModeParamsDialogGeometry(const ModeParamsDialog& d, render::Vertex* ou
     }
 
     for (int i = q * 4; i < kModeDlgVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
+}
+
+// --- Pipeline Design dialog (Blueprint-style node canvas, modeless) -----------
+constexpr int kPipeDlgQuads = 2048;
+constexpr int kPipeDlgVerts = kPipeDlgQuads * 4;
+constexpr float kPipeText    = kUiTextPx * 2.0f;              // 2x UI font in this dialog
+constexpr float kPipeTitleH  = 44.0f;                         // title bar (fits 2x text)
+constexpr float kPipeGrip    = 18.0f;  // resize-grip square (bottom-right)
+constexpr float kPipeNodeW   = 200.0f, kPipeNodeH = 68.0f;    // node box (px)
+constexpr float kPipePinR    = 9.0f;                          // pin half-size (px)
+constexpr float kPipePalette = 52.0f;                         // bottom palette bar (px)
+
+// Per-kind display label + backing mode (nullptr = host-handled Source/Output).
+struct PipeKindInfo { const char* label; const char* modeName; bool fit; };
+const PipeKindInfo kPipeKinds[(int)PipeNodeKind::Count] = {
+    {"Source",   nullptr,              false},
+    {"SOR",      "Outlier: SOR",       false},
+    {"ROR",      "Outlier: ROR",       false},
+    {"PFOR",     "Outlier: PFOR",      false},
+    {"PFOR Fit", "Outlier: PFOR",      true},
+    {"Smooth",   "Smooth (bilateral)", false},
+    {"Bump Rm",  "Bump: Remove",       false},
+    {"Output",   nullptr,              false},
+};
+
+CRect pipeCloseRect(const PipelineDialog& d) {
+    return {(float)(d.x + d.w) - 34.0f, (float)d.y + 10.0f, 24.0f, 24.0f};
+}
+CRect pipeGripRect(const PipelineDialog& d) {
+    return {(float)(d.x + d.w) - kPipeGrip, (float)(d.y + d.h) - kPipeGrip,
+            kPipeGrip, kPipeGrip};
+}
+// Node box in SCREEN pixels (canvas coords + pan + panel origin).
+CRect pipeNodeRect(const PipelineDialog& d, const PipeNode& n) {
+    return {d.x + 10.0f + d.panX + n.x, d.y + kPipeTitleH + 4.0f + d.panY + n.y,
+            kPipeNodeW, kPipeNodeH};
+}
+// Input (left) / output (right) pin centers.
+void pipePinCenters(const CRect& nr, float& inX, float& inY, float& outX, float& outY) {
+    inX  = nr.x;             inY  = nr.y + nr.h * 0.5f;
+    outX = nr.x + nr.w;      outY = nr.y + nr.h * 0.5f;
+}
+CRect pipeNodeCloseRect(const CRect& nr) {
+    return {nr.x + nr.w - 24.0f, nr.y + 3.0f, 20.0f, 20.0f};
+}
+// Palette buttons (node kinds), then Save/Load, then Run along the bottom bar.
+CRect pipePaletteRect(const PipelineDialog& d, int slot) {
+    float bw = 80.0f;
+    return {d.x + 8.0f + slot * (bw + 5.0f), (float)(d.y + d.h) - kPipePalette + 6.0f,
+            bw, kPipePalette - 12.0f};
+}
+CRect pipeRunRect(const PipelineDialog& d) {
+    return {(float)(d.x + d.w) - 90.0f - kPipeGrip, (float)(d.y + d.h) - kPipePalette + 6.0f,
+            90.0f, kPipePalette - 12.0f};
+}
+CRect pipeSaveRect(const PipelineDialog& d) {
+    CRect run = pipeRunRect(d);
+    return {run.x - 2 * (70.0f + 5.0f), run.y, 70.0f, run.h};
+}
+CRect pipeLoadRect(const PipelineDialog& d) {
+    CRect run = pipeRunRect(d);
+    return {run.x - (70.0f + 5.0f), run.y, 70.0f, run.h};
+}
+const PipeNode* pipeFindNode(const PipelineDialog& d, int id) {
+    for (const auto& n : d.nodes)
+        if (n.id == id) return &n;
+    return nullptr;
+}
+PipeNode* pipeFindNodeMut(PipelineDialog& d, int id) {
+    for (auto& n : d.nodes)
+        if (n.id == id) return &n;
+    return nullptr;
+}
+// Number of editable params of a node's backing mode (0 for Source/Output).
+int pipeNodeParamCount(PipeNodeKind kind) {
+    const char* mn = kPipeKinds[(int)kind].modeName;
+    if (!mn) return 0;
+    return modes::modeParamCount(modes::modeIndexByName(mn));
+}
+// Seed a fresh node's params from the mode's registered defaults.
+void pipeInitNodeParams(PipeNode& n) {
+    const char* mn = kPipeKinds[(int)n.kind].modeName;
+    if (!mn) return;
+    int idx = modes::modeIndexByName(mn);
+    int cnt = modes::modeParamCount(idx);
+    for (int i = 0; i < cnt && i < 4; ++i) n.params[i] = modes::modeParam(idx, i).defV;
+}
+
+// Graph persistence: a simple line format next to the exe.
+std::string pipeGraphPath() {
+    const char* base = SDL_GetBasePath();  // owned by SDL
+    return (base ? std::string(base) : std::string()) + "orange_pipeline.txt";
+}
+void pipeSaveGraph(const PipelineDialog& d) {
+    std::ofstream f(pipeGraphPath(), std::ios::trunc);
+    if (!f) { SDL_Log("Pipeline: save failed (%s)", pipeGraphPath().c_str()); return; }
+    f << "pan " << d.panX << " " << d.panY << "\n";
+    for (const auto& n : d.nodes)
+        f << "node " << n.id << " " << (int)n.kind << " " << n.x << " " << n.y << " "
+          << n.params[0] << " " << n.params[1] << " " << n.params[2] << " " << n.params[3]
+          << "\n";
+    for (const auto& l : d.links) f << "link " << l.from << " " << l.to << "\n";
+    SDL_Log("Pipeline: saved %zu node(s), %zu link(s)", d.nodes.size(), d.links.size());
+}
+void pipeLoadGraph(PipelineDialog& d) {
+    std::ifstream f(pipeGraphPath());
+    if (!f) { SDL_Log("Pipeline: nothing to load (%s)", pipeGraphPath().c_str()); return; }
+    std::vector<PipeNode> nodes;
+    std::vector<PipeLink> links;
+    float panX = 0, panY = 0;
+    int maxId = 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        std::istringstream ss(line);
+        std::string tag;
+        ss >> tag;
+        if (tag == "pan") {
+            ss >> panX >> panY;
+        } else if (tag == "node") {
+            PipeNode n;
+            int kind = 0;
+            ss >> n.id >> kind >> n.x >> n.y >> n.params[0] >> n.params[1] >> n.params[2] >>
+                n.params[3];
+            if (kind < 0 || kind >= (int)PipeNodeKind::Count) continue;
+            n.kind = (PipeNodeKind)kind;
+            maxId  = std::max(maxId, n.id);
+            nodes.push_back(n);
+        } else if (tag == "link") {
+            PipeLink l;
+            ss >> l.from >> l.to;
+            links.push_back(l);
+        }
+    }
+    if (nodes.empty()) { SDL_Log("Pipeline: load found no nodes"); return; }
+    d.nodes  = std::move(nodes);
+    d.links  = std::move(links);
+    d.panX   = panX;
+    d.panY   = panY;
+    d.nextId = maxId + 1;
+    d.linkFrom = -1;
+    d.dragNode = -1;
+    SDL_Log("Pipeline: loaded %zu node(s), %zu link(s)", d.nodes.size(), d.links.size());
+}
+
+void buildPipelineDialogGeometry(const PipelineDialog& d, render::Vertex* out) {
+    const core::Font& f = *d.font;
+    int q = 0;
+    const float wu = f.whiteU, wv = f.whiteV;
+    auto quad = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                    float u0, float v0, float u1, float v1, float z) {
+        if (q >= kPipeDlgQuads) return;
+        out[q * 4 + 0] = {{x0, y0, z}, {r, g, b}, {u0, v1}};
+        out[q * 4 + 1] = {{x1, y0, z}, {r, g, b}, {u1, v1}};
+        out[q * 4 + 2] = {{x1, y1, z}, {r, g, b}, {u1, v0}};
+        out[q * 4 + 3] = {{x0, y1, z}, {r, g, b}, {u0, v0}};
+        ++q;
+    };
+    auto solid = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                     float z) { quad(x0, y0, x1, y1, r, g, b, wu, wv, wu, wv, z); };
+    const float xs = static_cast<float>(d.h) / static_cast<float>(d.w);  // aspect fix
+    auto text = [&](const char* s, float penX, float baseY, float h, float r, float g,
+                    float b, float z) {
+        for (; *s; ++s) {
+            const core::Glyph& gl = f.glyph(*s);
+            if (gl.w > 0 && gl.h > 0) {
+                float x0 = penX + gl.xoff * h * xs, y1 = baseY - gl.yoff * h;
+                float x1 = x0 + gl.w * h * xs, y0 = y1 - gl.h * h;
+                quad(x0, y0, x1, y1, r, g, b, gl.u0, gl.v0, gl.u1, gl.v1, z);
+            }
+            penX += gl.advance * h * xs;
+        }
+    };
+    auto textW = [&](const char* s, float h) { return f.textWidth(s, h) * xs; };
+    auto toN = [&](const CRect& rr, float& x0, float& y0, float& x1, float& y1) {
+        x0 = (rr.x - d.x) / d.w;            x1 = (rr.x + rr.w - d.x) / d.w;
+        y1 = 1.0f - (rr.y - d.y) / d.h;     y0 = 1.0f - (rr.y + rr.h - d.y) / d.h;
+    };
+
+    // Arbitrary-corner quad (for wires). Corners in normalized panel space,
+    // given in the same relative order as quad() so the winding matches.
+    auto quad4 = [&](float ax, float ay, float bx, float by, float cx, float cy, float dx2,
+                     float dy2, float r, float g, float b, float z) {
+        if (q >= kPipeDlgQuads) return;
+        out[q * 4 + 0] = {{ax, ay, z}, {r, g, b}, {wu, wv}};
+        out[q * 4 + 1] = {{bx, by, z}, {r, g, b}, {wu, wv}};
+        out[q * 4 + 2] = {{cx, cy, z}, {r, g, b}, {wu, wv}};
+        out[q * 4 + 3] = {{dx2, dy2, z}, {r, g, b}, {wu, wv}};
+        ++q;
+    };
+    // Line segment between two SCREEN-pixel points, drawn as a thin quad.
+    auto segPx = [&](float ax, float ay, float bx, float by, float t, float r, float g,
+                     float b, float z) {
+        if (bx < ax || (bx == ax && by < ay)) { std::swap(ax, bx); std::swap(ay, by); }
+        float ddx = bx - ax, ddy = by - ay;
+        float len = std::sqrt(ddx * ddx + ddy * ddy);
+        if (len < 1e-3f) return;
+        float px = -ddy / len * t * 0.5f, py = ddx / len * t * 0.5f;
+        auto nx = [&](float sx) { return (sx - d.x) / d.w; };
+        auto ny = [&](float sy) { return 1.0f - (sy - d.y) / d.h; };
+        quad4(nx(ax - px), ny(ay - py), nx(bx - px), ny(by - py),
+              nx(bx + px), ny(by + py), nx(ax + px), ny(ay + py), r, g, b, z);
+    };
+    // Blueprint-style wire: cubic bezier with horizontal tangents.
+    auto wirePx = [&](float ax, float ay, float bx, float by, float r, float g, float b) {
+        float dist = std::max(30.0f, std::abs(bx - ax) * 0.5f);
+        float c1x = ax + dist, c1y = ay, c2x = bx - dist, c2y = by;
+        float lx = ax, ly = ay;
+        const int N = 14;
+        for (int s = 1; s <= N; ++s) {
+            float t = (float)s / N, u = 1.0f - t;
+            float px2 = u * u * u * ax + 3 * u * u * t * c1x + 3 * u * t * t * c2x + t * t * t * bx;
+            float py2 = u * u * u * ay + 3 * u * u * t * c1y + 3 * u * t * t * c2y + t * t * t * by;
+            segPx(lx, ly, px2, py2, 3.0f, r, g, b, 0.2f);
+            lx = px2; ly = py2;
+        }
+    };
+
+    solid(0, 0, 1, 1, 0.10f, 0.11f, 0.13f, 0.0f);                          // panel background
+    solid(0, 1.0f - kPipeTitleH / d.h, 1, 1, 0.16f, 0.18f, 0.22f, 0.05f);  // title bar
+    // Bottom palette bar.
+    solid(0, 0, 1, kPipePalette / d.h, 0.13f, 0.14f, 0.17f, 0.1f);
+
+    float x0, y0, x1, y1;
+    float th = kPipeText / d.h;
+    text("Pipeline Design", 12.0f / d.w, 1.0f - 6.0f / d.h - th, th,
+         0.88f, 0.90f, 0.94f, 0.6f);
+
+    // Close button (x).
+    toN(pipeCloseRect(d), x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.34f, 0.20f, 0.22f, 0.5f);
+    float ch = (y1 - y0) * 0.7f;
+    text("x", (x0 + x1) * 0.5f - textW("x", ch) * 0.5f, (y0 + y1) * 0.5f - ch * 0.35f, ch,
+         0.92f, 0.86f, 0.86f, 0.6f);
+
+    // Wires (under the nodes).
+    for (const auto& l : d.links) {
+        const PipeNode* a = pipeFindNode(d, l.from);
+        const PipeNode* b = pipeFindNode(d, l.to);
+        if (!a || !b) continue;
+        CRect ra = pipeNodeRect(d, *a), rb = pipeNodeRect(d, *b);
+        float ix, iy, ox, oy, ix2, iy2, ox2, oy2;
+        pipePinCenters(ra, ix, iy, ox, oy);
+        pipePinCenters(rb, ix2, iy2, ox2, oy2);
+        wirePx(ox, oy, ix2, iy2, 0.55f, 0.75f, 0.95f);
+    }
+    // Pending wire follows the cursor.
+    if (d.linkFrom >= 0) {
+        const PipeNode* a = pipeFindNode(d, d.linkFrom);
+        if (a) {
+            CRect ra = pipeNodeRect(d, *a);
+            float ix, iy, ox, oy;
+            pipePinCenters(ra, ix, iy, ox, oy);
+            wirePx(ox, oy, d.panSX, d.panSY, 0.9f, 0.8f, 0.3f);  // panSX/Y = cursor (see input)
+        }
+    }
+
+    // Nodes.
+    float lh = kPipeText / d.h;
+    char pbuf[48];
+    for (const auto& n : d.nodes) {
+        CRect nr = pipeNodeRect(d, n);
+        toN(nr, x0, y0, x1, y1);
+        bool hov = d.hoverNode == n.id;
+        // Body + header strip.
+        solid(x0, y0, x1, y1, hov ? 0.22f : 0.17f, hov ? 0.26f : 0.20f, hov ? 0.34f : 0.27f,
+              0.3f);
+        bool src = n.kind == PipeNodeKind::Source, outk = n.kind == PipeNodeKind::Output;
+        solid(x0, y1 - 28.0f / d.h, x1, y1,
+              src ? 0.18f : (outk ? 0.38f : 0.24f),
+              src ? 0.40f : (outk ? 0.24f : 0.33f),
+              src ? 0.26f : (outk ? 0.20f : 0.50f), 0.35f);
+        // Label (in the header strip).
+        const char* lbl = kPipeKinds[(int)n.kind].label;
+        float tx = x0 + 8.0f / d.w;
+        text(lbl, tx, y1 - 25.0f / d.h, lh * 0.62f, 0.92f, 0.94f, 0.98f, 0.6f);
+        // Param summary (body line, e.g. "16 / 0.050").
+        int pc = pipeNodeParamCount(n.kind);
+        if (pc > 0) {
+            int idx = modes::modeIndexByName(kPipeKinds[(int)n.kind].modeName);
+            std::string s;
+            for (int pi = 0; pi < pc && pi < 4; ++pi) {
+                modes::ModeParam mp = modes::modeParam(idx, pi);
+                if (mp.isInt) std::snprintf(pbuf, sizeof(pbuf), "%d", (int)std::lround(n.params[pi]));
+                else if (mp.step > 0.0f && mp.step < 0.01f)
+                    std::snprintf(pbuf, sizeof(pbuf), "%.3f", n.params[pi]);
+                else std::snprintf(pbuf, sizeof(pbuf), "%.2f", n.params[pi]);
+                if (!s.empty()) s += " / ";
+                s += pbuf;
+            }
+            text(s.c_str(), tx, y0 + 10.0f / d.h, lh * 0.55f, 0.70f, 0.80f, 0.92f, 0.6f);
+        }
+        // Node close (x).
+        CRect cxr = pipeNodeCloseRect(nr);
+        float cx0, cy0, cx1, cy1;
+        toN(cxr, cx0, cy0, cx1, cy1);
+        text("x", cx0 + 3.0f / d.w, cy0 + 1.0f / d.h, lh * 0.6f, 0.90f, 0.60f, 0.60f, 0.6f);
+        // Pins.
+        float ix, iy, ox, oy;
+        pipePinCenters(nr, ix, iy, ox, oy);
+        auto pin = [&](float px2, float py2, bool lit) {
+            float p0x = (px2 - kPipePinR - d.x) / d.w, p1x = (px2 + kPipePinR - d.x) / d.w;
+            float p0y = 1.0f - (py2 + kPipePinR - d.y) / d.h;
+            float p1y = 1.0f - (py2 - kPipePinR - d.y) / d.h;
+            solid(p0x, p0y, p1x, p1y, lit ? 0.95f : 0.55f, lit ? 0.85f : 0.75f,
+                  lit ? 0.30f : 0.95f, 0.5f);
+        };
+        if (!src) pin(ix, iy, false);
+        if (!outk) pin(ox, oy, d.linkFrom == n.id);
+    }
+
+    // Palette buttons + Save/Load + Run.
+    auto button = [&](const CRect& br, const char* lbl2, float r, float g, float b) {
+        toN(br, x0, y0, x1, y1);
+        solid(x0, y0, x1, y1, r, g, b, 0.4f);
+        float bh = (y1 - y0) * 0.55f;
+        text(lbl2, (x0 + x1) * 0.5f - textW(lbl2, bh) * 0.5f, (y0 + y1) * 0.5f - bh * 0.35f,
+             bh, 0.88f, 0.92f, 0.96f, 0.6f);
+    };
+    for (int s = 0; s < (int)PipeNodeKind::Count; ++s)
+        button(pipePaletteRect(d, s), kPipeKinds[s].label, 0.20f, 0.24f, 0.30f);
+    button(pipeSaveRect(d), "Save", 0.26f, 0.26f, 0.36f);
+    button(pipeLoadRect(d), "Load", 0.26f, 0.26f, 0.36f);
+    button(pipeRunRect(d), "Run", 0.20f, 0.42f, 0.30f);
+
+    // Resize grip strokes.
+    for (int s = 0; s < 3; ++s) {
+        float inset = 3.0f + s * 4.0f;
+        float gx0 = (d.w - kPipeGrip + inset) / d.w, gy0 = inset / d.h;
+        solid(gx0, gy0, gx0 + 2.0f / d.w, gy0 + (kPipeGrip - inset - 2.0f) / d.h,
+              0.45f, 0.50f, 0.58f, 0.5f);
+    }
+
+    for (int i = q * 4; i < kPipeDlgVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
 
 // --- Confirm (Yes/No) dialog -----------------------------------------------
@@ -2436,6 +2771,8 @@ std::vector<Menu> defaultAppMenus() {
         pipe.items.push_back(act("Segment 2D (Classical)", A::PipelineSegment2DClassical));
         pipe.items.push_back(act("Segment 2D (SAM/AI)",    A::PipelineSegment2DSAM));
         pipe.items.push_back(act("Segment 3D (Teeth)",     A::PipelineSegment3D));
+        pipe.items.push_back(sep());
+        pipe.items.push_back(act("Pipeline Design...",     A::PipelineDialogToggle));
         menus.push_back(std::move(pipe));
     }
     menus.push_back({"Create", {
@@ -3510,7 +3847,8 @@ void modeParamsDialogInputSystem(entt::registry& world, core::Input& input,
         input.captured = true;
         return;
     }
-    if (input.leftClicked && modes::modeCanFit(d->modeIndex) && hit(R.fit)) {
+    if (input.leftClicked && modes::modeCanFit(d->modeIndex) && d->pipeNodeId < 0 &&
+        hit(R.fit)) {
         d->requestFit  = true;
         input.captured = true;
         return;
@@ -3551,6 +3889,244 @@ void modeParamsDialogInputSystem(entt::registry& world, core::Input& input,
         input.captured = true;
     }
 
+    if (inPanel) input.captured = true;
+}
+
+void pipelineDialogInputSystem(entt::registry& world, core::Input& input,
+                               uint32_t viewportW, uint32_t viewportH) {
+    PipelineDialog* d = nullptr;
+    auto view = world.view<PipelineDialog>();
+    for (auto e : view) { d = &view.get<PipelineDialog>(e); break; }
+    if (!d || !d->visible) {
+        if (d) {
+            d->dragging = false; d->resizing = false; d->panning = false;
+            d->dragNode = -1; d->hoverNode = -1;
+        }
+        return;
+    }
+
+    // First show: dock near the right edge + seed a Source -> Output skeleton.
+    if (!d->placed) {
+        d->x = (int)viewportW - d->w - 40;
+        d->y = 80;
+        if (d->x < 0) d->x = 0;
+        d->placed = true;
+    }
+    if (d->nodes.empty()) {
+        PipeNode s{d->nextId++, PipeNodeKind::Source, 16.0f, 60.0f};
+        PipeNode o{d->nextId++, PipeNodeKind::Output, d->w - kPipeNodeW - 40.0f, 60.0f};
+        d->nodes.push_back(s);
+        d->nodes.push_back(o);
+    }
+
+    // The mode-params dialog, when bound to one of our nodes, writes its
+    // slider values back into that node every frame (and detaches if the node
+    // is gone).
+    ModeParamsDialog* pd = nullptr;
+    {
+        auto pv = world.view<ModeParamsDialog>();
+        for (auto e : pv) { pd = &pv.get<ModeParamsDialog>(e); break; }
+    }
+    if (pd && pd->pipeNodeId >= 0) {
+        PipeNode* n = pipeFindNodeMut(*d, pd->pipeNodeId);
+        if (!n) {
+            pd->pipeNodeId = -1;
+            pd->visible    = false;
+        } else {
+            int cnt = pipeNodeParamCount(n->kind);
+            for (int i = 0; i < cnt && i < 4; ++i) n->params[i] = pd->values[i];
+        }
+    }
+
+    float mx = input.mousePosX, my = input.mousePosY;
+    auto  hit = [&](const CRect& r) {
+        return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
+    };
+    bool inPanel = mx >= d->x && mx <= d->x + d->w && my >= d->y && my <= d->y + d->h;
+
+    // The pending-wire endpoint follows the cursor (drawn by the builder).
+    if (d->linkFrom >= 0 && !d->panning) { d->panSX = mx; d->panSY = my; }
+
+    if (input.leftClicked && hit(pipeCloseRect(*d))) {
+        d->visible = false; d->dragging = false; d->resizing = false; d->linkFrom = -1;
+        input.captured = true;
+        return;
+    }
+
+    // Resize grip (bottom-right).
+    if (input.leftClicked && hit(pipeGripRect(*d))) d->resizing = true;
+    if (!input.buttonLeft) d->resizing = false;
+    if (d->resizing) {
+        d->w = (int)mx - d->x;
+        d->h = (int)my - d->y;
+        if (d->w < d->minW) d->w = d->minW;
+        if (d->h < d->minH) d->h = d->minH;
+        if (d->w > (int)viewportW) d->w = (int)viewportW;
+        if (d->h > (int)viewportH) d->h = (int)viewportH;
+        input.captured = true;
+        return;
+    }
+
+    // Title-bar drag.
+    CRect titleBar = {(float)d->x, (float)d->y, (float)d->w - 38.0f, kPipeTitleH};
+    if (input.leftClicked && hit(titleBar)) {
+        d->dragging = true;
+        d->dragDX = mx - d->x;
+        d->dragDY = my - d->y;
+    }
+    if (!input.buttonLeft) d->dragging = false;
+    if (d->dragging) {
+        d->x = (int)(mx - d->dragDX);
+        d->y = (int)(my - d->dragDY);
+        int maxX = (int)viewportW - d->w, maxY = (int)viewportH - d->h;
+        d->x = d->x < 0 ? 0 : (d->x > maxX ? (maxX < 0 ? 0 : maxX) : d->x);
+        d->y = d->y < 0 ? 0 : (d->y > maxY ? (maxY < 0 ? 0 : maxY) : d->y);
+        input.captured = true;
+        return;
+    }
+
+    // Palette buttons (add node at the canvas center) + Save/Load + Run.
+    if (input.leftClicked) {
+        for (int s = 0; s < (int)PipeNodeKind::Count; ++s) {
+            if (!hit(pipePaletteRect(*d, s))) continue;
+            PipeNode n;
+            n.id   = d->nextId++;
+            n.kind = (PipeNodeKind)s;
+            n.x    = d->w * 0.5f - kPipeNodeW * 0.5f - d->panX;
+            n.y    = d->h * 0.4f - d->panY;
+            pipeInitNodeParams(n);
+            d->nodes.push_back(n);
+            input.captured = true;
+            return;
+        }
+        if (hit(pipeSaveRect(*d))) {
+            pipeSaveGraph(*d);
+            input.captured = true;
+            return;
+        }
+        if (hit(pipeLoadRect(*d))) {
+            pipeLoadGraph(*d);
+            if (pd) { pd->pipeNodeId = -1; pd->visible = false; }  // stale binding
+            input.captured = true;
+            return;
+        }
+        if (hit(pipeRunRect(*d))) {
+            d->requestRun  = true;
+            input.captured = true;
+            return;
+        }
+    }
+
+    // Nodes: close button, pins (click output pin -> click input pin wires
+    // them; clicking a wired input pin unplugs it), then body drag.
+    d->hoverNode = -1;
+    if (input.leftClicked) {
+        for (size_t i = d->nodes.size(); i-- > 0;) {  // topmost (last drawn) first
+            PipeNode& n = d->nodes[i];
+            CRect nr = pipeNodeRect(*d, n);
+            // Delete node.
+            if (hit(pipeNodeCloseRect(nr))) {
+                int id = n.id;
+                d->links.erase(std::remove_if(d->links.begin(), d->links.end(),
+                                              [id](const PipeLink& l) {
+                                                  return l.from == id || l.to == id;
+                                              }),
+                               d->links.end());
+                if (d->linkFrom == id) d->linkFrom = -1;
+                if (pd && pd->pipeNodeId == id) { pd->pipeNodeId = -1; pd->visible = false; }
+                d->nodes.erase(d->nodes.begin() + i);
+                input.captured = true;
+                return;
+            }
+            float ix, iy, ox, oy;
+            pipePinCenters(nr, ix, iy, ox, oy);
+            auto nearPin = [&](float px, float py) {
+                return std::abs(mx - px) <= kPipePinR + 3.0f &&
+                       std::abs(my - py) <= kPipePinR + 3.0f;
+            };
+            // Output pin: start a pending wire.
+            if (n.kind != PipeNodeKind::Output && nearPin(ox, oy)) {
+                d->linkFrom    = n.id;
+                input.captured = true;
+                return;
+            }
+            // Input pin: finish the pending wire, or unplug an existing one.
+            if (n.kind != PipeNodeKind::Source && nearPin(ix, iy)) {
+                if (d->linkFrom >= 0 && d->linkFrom != n.id) {
+                    int to = n.id;  // one wire per input: replace
+                    d->links.erase(std::remove_if(d->links.begin(), d->links.end(),
+                                                  [to](const PipeLink& l) { return l.to == to; }),
+                                   d->links.end());
+                    d->links.push_back({d->linkFrom, n.id});
+                    d->linkFrom = -1;
+                } else {
+                    int to = n.id;
+                    d->links.erase(std::remove_if(d->links.begin(), d->links.end(),
+                                                  [to](const PipeLink& l) { return l.to == to; }),
+                                   d->links.end());
+                }
+                input.captured = true;
+                return;
+            }
+            // Body: grab for move (also cancels a pending wire) + bind the
+            // params dialog to this node when its mode has tunables.
+            if (hit(nr)) {
+                d->linkFrom = -1;
+                d->dragNode = n.id;
+                d->nodeDX   = mx - nr.x;
+                d->nodeDY   = my - nr.y;
+                int cnt = pipeNodeParamCount(n.kind);
+                if (pd && cnt > 0) {
+                    pd->modeIndex  = modes::modeIndexByName(kPipeKinds[(int)n.kind].modeName);
+                    pd->pipeNodeId = n.id;
+                    for (int pi = 0; pi < cnt && pi < 4; ++pi) pd->values[pi] = n.params[pi];
+                    pd->h       = 42 + cnt * 36 + 46;  // no Fit row in node mode
+                    pd->visible = true;
+                } else if (pd && pd->pipeNodeId >= 0) {
+                    pd->pipeNodeId = -1;  // clicked a param-less node: unbind
+                    pd->visible    = false;
+                }
+                input.captured = true;
+                return;
+            }
+        }
+        // Empty canvas click: cancel pending wire / start panning.
+        if (inPanel && my > d->y + kPipeTitleH && my < d->y + d->h - kPipePalette) {
+            if (d->linkFrom >= 0) {
+                d->linkFrom = -1;
+            } else {
+                d->panning = true;
+                d->panSX = mx; d->panSY = my;
+                d->panOX = d->panX; d->panOY = d->panY;
+            }
+            input.captured = true;
+        }
+    }
+
+    if (!input.buttonLeft) { d->dragNode = -1; d->panning = false; }
+    if (d->dragNode >= 0) {
+        for (auto& n : d->nodes)
+            if (n.id == d->dragNode) {
+                n.x = mx - d->nodeDX - d->x - 10.0f - d->panX;
+                n.y = my - d->nodeDY - d->y - kPipeTitleH - 4.0f - d->panY;
+                break;
+            }
+        input.captured = true;
+        return;
+    }
+    if (d->panning) {
+        d->panX = d->panOX + (mx - d->panSX);
+        d->panY = d->panOY + (my - d->panSY);
+        input.captured = true;
+        return;
+    }
+
+    // Hover feedback.
+    for (size_t i = d->nodes.size(); i-- > 0;) {
+        if (hit(pipeNodeRect(*d, d->nodes[i]))) { d->hoverNode = d->nodes[i].id; break; }
+    }
+
+    // Modeless: only the panel area eats input; everything else stays live.
     if (inPanel) input.captured = true;
 }
 
@@ -4348,6 +4924,34 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         break;
     }
 
+    // --- Pipeline Design dialog overlay (modeless) --------------------
+    auto plview = world.view<PipelineDialog>();
+    for (auto entity : plview) {
+        const auto& pl = plview.get<PipelineDialog>(entity);
+        if (!pl.visible || !pl.font || pl.mesh == render::kInvalidMesh) break;
+
+        render::Vertex verts[kPipeDlgVerts];
+        buildPipelineDialogGeometry(pl, verts);
+        renderer.updateBuffer(pl.vbo, verts, sizeof(verts));
+
+        render::OverlayContext ov;
+        ov.x = pl.x; ov.y = pl.y; ov.width = pl.w; ov.height = pl.h;
+        ov.clearDepth = true;
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+        std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+        renderer.beginOverlay(ov);
+
+        render::DrawItem item;
+        item.mesh    = pl.mesh;
+        item.texture = pl.atlas;
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
+        std::memcpy(item.model, model.data(), sizeof(item.model));
+        renderer.submit(item);
+        break;
+    }
+
     // --- Confirm (Yes/No) dialog overlay ------------------------------
     auto cdview = world.view<ConfirmDialog>();
     for (auto entity : cdview) {
@@ -4485,5 +5089,213 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
 
     renderer.endFrame();
 }
+
+// --- Pipeline-graph execution (Pipeline Design dialog "Run") ------------------
+
+namespace {
+struct PipeRunJob {
+    std::atomic<bool>  done{false};
+    std::atomic<float> progress{0.0f};
+    std::vector<std::vector<Eigen::Vector3f>> results;  // one cloud per Output node
+    size_t inCount = 0;
+};
+struct PipeRunCache {
+    std::shared_ptr<PipeRunJob> job;
+    std::thread                 worker;
+    ~PipeRunCache() {
+        if (worker.joinable()) worker.detach();  // self-contained; dies with the process
+    }
+};
+} // namespace
+
+void pipelineGraphSystem(entt::registry& world, render::IRenderer& renderer) {
+    auto& ctx = world.ctx();
+    if (!ctx.contains<PipeRunCache>()) ctx.emplace<PipeRunCache>();
+    auto& cache = ctx.get<PipeRunCache>();
+
+    // Harvest: spawn each Output's result as a new, selectable point cloud
+    // (each undoable).
+    if (cache.job && cache.job->done.load(std::memory_order_acquire)) {
+        if (cache.worker.joinable()) cache.worker.join();
+        size_t spawned = 0;
+        for (const auto& pts : cache.job->results) {
+            if (pts.empty()) continue;
+            std::vector<render::Vertex> verts(pts.size());
+            for (size_t i = 0; i < pts.size(); ++i) {
+                verts[i] = {{pts[i].x(), pts[i].y(), pts[i].z()},
+                            {0.85f, 0.85f, 0.88f}};
+            }
+            render::BufferDesc bd;
+            bd.type  = render::BufferType::Vertex;
+            bd.usage = render::BufferUsage::Static;
+            bd.data  = verts.data();
+            bd.size  = verts.size() * sizeof(render::Vertex);
+            render::BufferHandle vbo = renderer.createBuffer(bd);
+            render::MeshDesc md;
+            md.vertexBuffer = vbo;
+            md.layout       = render::Vertex::layout();
+            md.vertexCount  = (uint32_t)verts.size();
+            md.topology     = render::PrimitiveTopology::Points;
+
+            auto e = world.create();
+            world.emplace<Transform>(e, Transform{});
+            Renderable r;
+            r.mesh       = renderer.createMesh(md);
+            r.pointCloud = true;
+            Eigen::Vector3f mn = Eigen::Vector3f::Constant(FLT_MAX);
+            Eigen::Vector3f mx = Eigen::Vector3f::Constant(-FLT_MAX);
+            PickGeometry pick;
+            pick.positions = pts;
+            for (const auto& p : pts) { mn = mn.cwiseMin(p); mx = mx.cwiseMax(p); }
+            r.boundsMin = mn;
+            r.boundsMax = mx;
+            world.emplace<Renderable>(e, r);
+            world.emplace<PickGeometry>(e, std::move(pick));
+            world.emplace<VertexSource>(e, VertexSource{vbo, std::move(verts)});
+            pushSpawnOp(world, e, "Pipeline Result");
+            SDL_Log("pipelineGraphSystem: output %zu: %zu -> %zu points", spawned,
+                    cache.job->inCount, pts.size());
+            ++spawned;
+        }
+        if (spawned == 0) SDL_Log("pipelineGraphSystem: produced no points");
+        cache.job.reset();
+    }
+
+    // Launch on the Run edge.
+    PipelineDialog* d = nullptr;
+    auto dv = world.view<PipelineDialog>();
+    for (auto e : dv) { d = &dv.get<PipelineDialog>(e); break; }
+    if (!d || !d->requestRun) return;
+    if (cache.job) return;  // still running; keep the edge pending
+    d->requestRun = false;
+
+    // Validate: at least one Source and one Output on the canvas.
+    bool hasSource = false, hasOutput = false;
+    for (const auto& n : d->nodes) {
+        hasSource |= n.kind == PipeNodeKind::Source;
+        hasOutput |= n.kind == PipeNodeKind::Output;
+    }
+    if (!hasSource || !hasOutput) {
+        SDL_Log("pipelineGraphSystem: graph needs a Source and an Output node");
+        return;
+    }
+
+    // Source cloud: first selected entity with points, else the only one.
+    entt::entity src = entt::null, only = entt::null;
+    size_t count = 0;
+    auto v = world.view<Renderable, PickGeometry>();
+    for (auto e : v) {
+        if (v.get<PickGeometry>(e).positions.empty()) continue;
+        ++count;
+        only = e;
+        if (v.get<Renderable>(e).selected) { src = e; break; }
+    }
+    if (src == entt::null && count == 1) src = only;
+    if (src == entt::null) {
+        SDL_Log("pipelineGraphSystem: no source cloud (select one)");
+        return;
+    }
+    std::vector<Eigen::Vector3f> raw = world.get<PickGeometry>(src).positions;
+    Eigen::Matrix4f M = Eigen::Matrix4f::Identity();
+    if (world.all_of<Transform>(src)) M = world.get<Transform>(src).matrix();
+
+    auto job = std::make_shared<PipeRunJob>();
+    job->inCount = raw.size();
+    cache.job    = job;
+    SDL_Log("pipelineGraphSystem: running graph (%zu nodes, %zu links) on %zu points...",
+            d->nodes.size(), d->links.size(), raw.size());
+    // Self-contained copies of the graph for the worker.
+    std::vector<PipeNode> nodes = d->nodes;
+    std::vector<PipeLink> links = d->links;
+    cache.worker = std::thread([job, nodes = std::move(nodes), links = std::move(links),
+                                raw = std::move(raw), M]() mutable {
+        auto source = std::make_shared<std::vector<Eigen::Vector3f>>(raw.size());
+        for (size_t i = 0; i < raw.size(); ++i) {
+            Eigen::Vector4f w = M * Eigen::Vector4f(raw[i].x(), raw[i].y(), raw[i].z(), 1.0f);
+            (*source)[i] = Eigen::Vector3f(w.x(), w.y(), w.z());
+        }
+
+        // Memoized DAG evaluation: each node computes once, so a branching
+        // output pin feeds all its consumers without re-running the stage.
+        auto findNode = [&](int id) -> const PipeNode* {
+            for (const auto& n : nodes)
+                if (n.id == id) return &n;
+            return nullptr;
+        };
+        size_t stageTotal = 0;
+        for (const auto& n : nodes)
+            if (n.kind != PipeNodeKind::Source && n.kind != PipeNodeKind::Output) ++stageTotal;
+        std::atomic<size_t> stageDone{0};
+        using Cloud = std::shared_ptr<std::vector<Eigen::Vector3f>>;
+        std::unordered_map<int, Cloud> memo;
+        std::unordered_set<int> visiting;  // cycle guard
+        std::function<Cloud(int)> eval = [&](int id) -> Cloud {
+            auto it = memo.find(id);
+            if (it != memo.end()) return it->second;
+            if (!visiting.insert(id).second) return nullptr;  // cycle
+            const PipeNode* n = findNode(id);
+            if (!n) return nullptr;
+            Cloud result;
+            if (n->kind == PipeNodeKind::Source) {
+                result = source;
+            } else {
+                const PipeLink* inL = nullptr;
+                for (const auto& l : links)
+                    if (l.to == id) { inL = &l; break; }
+                Cloud up = inL ? eval(inL->from) : nullptr;
+                if (up) {
+                    if (n->kind == PipeNodeKind::Output) {
+                        result = up;
+                    } else {
+                        const PipeKindInfo& info = kPipeKinds[(int)n->kind];
+                        int idx = info.modeName ? modes::modeIndexByName(info.modeName) : -1;
+                        if (idx >= 0) {
+                            modes::ModeInput in;
+                            in.points = *up;
+                            int pc = modes::modeParamCount(idx);
+                            in.params.assign(n->params, n->params + (pc < 4 ? pc : 4));
+                            auto next = std::make_shared<std::vector<Eigen::Vector3f>>();
+                            size_t sdone = stageDone.load(std::memory_order_relaxed);
+                            auto prog = [job, sdone, stageTotal](float f) {
+                                job->progress.store(
+                                    stageTotal ? ((float)sdone + f) / (float)stageTotal : f,
+                                    std::memory_order_relaxed);
+                            };
+                            if (info.fit)
+                                modes::runModeFit(idx, in, *next, prog);
+                            else
+                                modes::runModePoints(idx, in, *next, prog);
+                            stageDone.fetch_add(1, std::memory_order_relaxed);
+                            result = next;
+                        } else {
+                            result = up;  // unknown stage: pass through
+                        }
+                    }
+                }
+            }
+            visiting.erase(id);
+            memo[id] = result;
+            return result;
+        };
+
+        for (const auto& n : nodes) {
+            if (n.kind != PipeNodeKind::Output) continue;
+            Cloud r = eval(n.id);
+            if (r && !r->empty()) job->results.push_back(*r);
+        }
+        job->done.store(true, std::memory_order_release);
+    });
+}
+
+bool pipelineRunProgress(entt::registry& world, float& outProgress, std::string& outName) {
+    auto& ctx = world.ctx();
+    if (!ctx.contains<PipeRunCache>()) return false;
+    auto& cache = ctx.get<PipeRunCache>();
+    if (!cache.job || cache.job->done.load(std::memory_order_acquire)) return false;
+    outProgress = cache.job->progress.load(std::memory_order_relaxed);
+    outName     = "Pipeline";
+    return true;
+}
+
 
 } // namespace orange::ecs

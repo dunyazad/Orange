@@ -99,4 +99,14 @@ bool modeCanFit(int index);
 void runModeFit(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
                 const ProgressFn& progress = {});
 
+// Pipeline-graph execution (the Pipeline Design node canvas): modes that can
+// act as a points -> points stage. Filters output only their kept points,
+// Smooth outputs the moved points, Bump Remove drops its blobs. Chain stages
+// by feeding one stage's output into the next.
+bool modeCanTransformPoints(int index);
+void runModePoints(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& outPoints,
+                   const ProgressFn& progress = {});
+// Stable lookup of a mode by its registered display name (-1 if unknown).
+int modeIndexByName(const char* name);
+
 } // namespace orange::modes

@@ -61,10 +61,11 @@ void syncModeParamsDialog(entt::registry& world, int modeIndex) {
             d.visible = false;
             break;
         }
-        if (d.modeIndex != modeIndex) {
+        if (d.modeIndex != modeIndex || d.pipeNodeId >= 0) {
             d.modeIndex = modeIndex;
             for (int i = 0; i < n && i < 8; ++i) d.values[i] = modes::modeParam(modeIndex, i).defV;
         }
+        d.pipeNodeId = -1;  // regular mode editing detaches any pipeline-node binding
         d.h       = 42 + n * 36 + 46 + (modes::modeCanFit(modeIndex) ? 36 : 0);
         d.visible = true;
         break;
@@ -407,6 +408,8 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         ecs::crossSectionInputSystem(world_, input_, window_.width(), window_.height());
         ecs::poissonDialogInputSystem(world_, input_, window_.width(), window_.height());
         ecs::modeParamsDialogInputSystem(world_, input_, window_.width(), window_.height());
+        ecs::pipelineDialogInputSystem(world_, input_, window_.width(), window_.height());
+        ecs::pipelineGraphSystem(world_, *plugin_->renderer());
         {
             // "Apply" on the mode-params dialog: re-run the active mode with
             // the edited parameter values (a generation bump recomputes).
@@ -415,8 +418,10 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                 auto& md = mdv.get<ecs::ModeParamsDialog>(ent);
                 if (md.requestApply) {
                     md.requestApply = false;
+                    // Node-editing mode: values already sync into the node;
+                    // nothing to re-run until the graph's own Run.
                     auto& ctx = world_.ctx();
-                    if (ctx.contains<modes::ModeState>()) {
+                    if (md.pipeNodeId < 0 && ctx.contains<modes::ModeState>()) {
                         auto& ms = ctx.get<modes::ModeState>();
                         if (ms.index == md.modeIndex) ms.generation++;
                     }
@@ -781,6 +786,12 @@ void Application::applyMenuAction(int action) {
         case A::PoissonDialogToggle: {
             auto v = world_.view<ecs::PoissonDialog>();
             for (auto ent : v) { auto& pd = v.get<ecs::PoissonDialog>(ent); pd.visible = !pd.visible; break; }
+            break;
+        }
+
+        case A::PipelineDialogToggle: {
+            auto v = world_.view<ecs::PipelineDialog>();
+            for (auto ent : v) { auto& pl = v.get<ecs::PipelineDialog>(ent); pl.visible = !pl.visible; break; }
             break;
         }
 

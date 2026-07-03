@@ -380,12 +380,76 @@ struct ModeParamsDialog {
     bool requestApply = false;  // edge: "Apply" clicked -> app re-runs the mode
     bool requestFit   = false;  // edge: "Fit" clicked -> apply the mode's fit action
 
+    // When >= 0 the dialog edits a Pipeline Design NODE's parameters instead of
+    // the active mode: values sync back into that node every frame (see
+    // pipelineDialogInputSystem); Apply/Fit do not touch the mode system.
+    int pipeNodeId = -1;
+
     int  w = 280, h = 232;    // h recomputed from the param count when opened
     int  x = 0, y = 0;
     bool placed     = false;
     int  dragSlider = -1;
     bool dragging   = false;
     float dragDX = 0, dragDY = 0;
+
+    const core::Font*     font  = nullptr;
+    render::TextureHandle atlas = render::kInvalidTexture;
+    render::MeshHandle     mesh = render::kInvalidMesh;
+    render::BufferHandle   vbo  = render::kInvalidBuffer;
+};
+
+// Node kinds available on the Pipeline Design canvas. Source feeds the
+// selected (or only) point cloud in; the middle kinds are points->points
+// stages (modes::runModePoints / runModeFit); Output spawns the result as a
+// new point-cloud entity (undoable).
+enum class PipeNodeKind : int {
+    Source = 0, SOR, ROR, PFOR, PforFit, Smooth, BumpRemove, Output, Count
+};
+
+// One node / one edge of the pipeline graph. Node positions are in canvas
+// space (panned); each node has one input pin (left) and one output pin
+// (right) except Source (output only) and Output (input only).
+struct PipeNode {
+    int   id   = 0;
+    PipeNodeKind kind = PipeNodeKind::Source;
+    float x = 0, y = 0;      // canvas coords (px)
+    float params[4] = {};    // per-node copy of the backing mode's tunables
+};
+struct PipeLink {
+    int from = 0, to = 0;  // node ids: from's output pin -> to's input pin
+};
+
+// Modeless "Pipeline Design" dialog: a Blueprint-style node canvas for visual
+// algorithm scripting. A bottom palette adds nodes; nodes drag on the canvas;
+// click an output pin then an input pin to wire them (clicking a wired input
+// pin unplugs it); empty-canvas drag pans. "Run" walks the chain
+// Source -> ... -> Output on a background thread and spawns the result cloud
+// (pipelineGraphSystem). Title-bar draggable AND resizable via a bottom-right
+// grip; input is captured only over the panel (never blocks the rest of the
+// UI).
+struct PipelineDialog {
+    bool visible = false;
+
+    int  w = 900, h = 560;         // current size (resizable)
+    int  minW = 520, minH = 340;   // resize floor
+    int  x = 0, y = 0;
+    bool placed   = false;
+    bool dragging = false;         // title-bar move
+    bool resizing = false;         // bottom-right grip
+    float dragDX = 0, dragDY = 0;
+
+    // Graph + canvas interaction state.
+    std::vector<PipeNode> nodes;
+    std::vector<PipeLink> links;
+    int   nextId = 1;
+    float panX = 0, panY = 0;      // canvas pan offset (px)
+    int   dragNode = -1;           // node id being moved (-1 none)
+    float nodeDX = 0, nodeDY = 0;  // cursor-to-node offset at grab
+    int   linkFrom = -1;           // pending link: source node id (-1 none)
+    bool  panning = false;
+    float panSX = 0, panSY = 0, panOX = 0, panOY = 0;
+    int   hoverNode = -1;
+    bool  requestRun = false;      // edge: "Run" clicked; pipelineGraphSystem consumes
 
     const core::Font*     font  = nullptr;
     render::TextureHandle atlas = render::kInvalidTexture;
@@ -572,6 +636,7 @@ enum class MenuAction : int {
     PipelineSegment2DSAM,          // stage 3b: SAM (ONNX) 2D segmentation (requires ONNX build)
     PipelineSegment3D,             // stage 5: direct 3D per-tooth segmentation (colours the mesh)
     Undo, Redo,                    // Edit menu / Ctrl+Z / Ctrl+Y (ecs::undoStack)
+    PipelineDialogToggle,          // open/close the modeless Pipeline Design dialog
 };
 
 // One row in a dropdown. kind: Action = clickable command; Check = command that

@@ -54,6 +54,21 @@ void poissonDialogInputSystem(entt::registry& world, core::Input& input,
 void modeParamsDialogInputSystem(entt::registry& world, core::Input& input,
                                  uint32_t viewportW, uint32_t viewportH);
 
+// Modeless Pipeline Design dialog (Blueprint-style node canvas): title-bar
+// drag, bottom-right resize grip, node palette, pin wiring, canvas pan.
+// Captures input only over the panel.
+void pipelineDialogInputSystem(entt::registry& world, core::Input& input,
+                               uint32_t viewportW, uint32_t viewportH);
+
+// Executes the Pipeline Design graph when its Run button was clicked: walks
+// the Source -> ... -> Output chain on a BACKGROUND thread (each stage a
+// points->points mode) and spawns the result as a new point-cloud entity
+// (undoable). Call before renderSystem.
+void pipelineGraphSystem(entt::registry& world, render::IRenderer& renderer);
+
+// Progress of a running pipeline-graph execution (like processingModeProgress).
+bool pipelineRunProgress(entt::registry& world, float& outProgress, std::string& outName);
+
 // Centered Yes/No confirmation dialog: hit-tests the two buttons, raises the
 // `answered`/`yes` edge and hides on a click. Captures input over the panel.
 void confirmDialogInputSystem(entt::registry& world, core::Input& input,

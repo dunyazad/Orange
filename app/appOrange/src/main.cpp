@@ -681,6 +681,33 @@ int main(int argc, char** argv) {
         world.emplace<ecs::ModeParamsDialog>(e, md);
     }
 
+    // Pipeline Design dialog (modeless, resizable node canvas).
+    const int kPipeDlgQ = 2048, kPipeDlgV = kPipeDlgQ * 4;  // must match kPipeDlgQuads in systems.cpp
+    const std::vector<render::Vertex> plInit(kPipeDlgV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
+    std::vector<uint32_t> plIdx;
+    for (uint32_t q = 0; q < static_cast<uint32_t>(kPipeDlgQ); ++q) {
+        uint32_t b = q * 4;
+        plIdx.insert(plIdx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+    }
+    core::VertexBuffer<render::Vertex> plVbo(*app.renderer(), plInit,
+                                             render::BufferUsage::Dynamic);
+    core::IndexBuffer                  plIbo(*app.renderer(), plIdx);
+    render::MeshDesc plMeshDesc;
+    plMeshDesc.vertexBuffer = plVbo.handle();
+    plMeshDesc.indexBuffer  = plIbo.handle();
+    plMeshDesc.layout       = render::Vertex::layout();
+    plMeshDesc.vertexCount  = static_cast<uint32_t>(kPipeDlgV);
+    plMeshDesc.indexCount   = static_cast<uint32_t>(kPipeDlgQ * 6);
+    {
+        auto e = world.create();
+        ecs::PipelineDialog pl;
+        pl.font  = &uiFont;
+        pl.atlas = uiFont.texture;
+        pl.mesh  = app.renderer()->createMesh(plMeshDesc);
+        pl.vbo   = plVbo.handle();
+        world.emplace<ecs::PipelineDialog>(e, pl);
+    }
+
     // Confirm (Yes/No) dialog -- in-app modal used by the "load last mesh" prompt.
     const int kConfirmQ = 192, kConfirmV = kConfirmQ * 4;  // must match kConfirmQuads in systems.cpp
     const std::vector<render::Vertex> cdInit(kConfirmV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
@@ -1005,7 +1032,8 @@ int main(int argc, char** argv) {
             // spatial-structure build progress.
             float pct = 0.0f;
             std::string name;
-            if (ecs::processingModeProgress(w, pct, name) || ecs::spatialVizProgress(w, pct, name)) {
+            if (ecs::processingModeProgress(w, pct, name) || ecs::spatialVizProgress(w, pct, name) ||
+                ecs::pipelineRunProgress(w, pct, name)) {
                 if (mb) mb->statusText = name + " " + std::to_string((int)(pct * 100.0f + 0.5f)) + "%";
             } else if (mb && !mb->statusText.empty()) {
                 mb->statusText.clear();  // finished -> clear the line
