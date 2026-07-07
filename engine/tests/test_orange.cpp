@@ -281,6 +281,60 @@ static void test_qfor() {
     CHECK(inliersHeld);
 }
 
+// --- QFOR (Div Gate): divergence gate decides WHO gets judged ------------------
+// A unit sphere (supplied normals => divergence positive everywhere) with
+// radial spikes. Side=0 (+) gates the whole sphere in, so the spikes' quadric
+// residual removes them; Side=1 (-) gates nothing in, so the very same spikes
+// survive -- proving the gate, not the residual, is in charge.
+static void test_qfor_div_gate() {
+    std::printf("[qfor div gate]\n");
+    const int idx = orange::modes::modeIndexByName("Outlier: QFOR (Div Gate)");
+    CHECK(idx >= 0);
+    CHECK(orange::modes::modeCanFit(idx));
+
+    orange::modes::ModeInput in;
+    for (int a = 0; a < 24; ++a)
+        for (int b = 1; b < 12; ++b) {
+            float phi = 2.0f * 3.14159265f * a / 24.0f, th = 3.14159265f * b / 12.0f;
+            Eigen::Vector3f n(std::sin(th) * std::cos(phi), std::cos(th),
+                              std::sin(th) * std::sin(phi));
+            in.points.push_back(n);
+            in.normals.push_back(n);
+        }
+    std::vector<int> spikes = {30, 95, 160, 225};
+    for (int i : spikes) in.points[i] *= 1.3f;  // radial protrusion
+
+    const Eigen::Vector3f keepGreen(0.1f, 0.9f, 0.2f);
+    auto dropped = [&](const std::vector<Eigen::Vector3f>& c, size_t i) {
+        return (c[i] - keepGreen).squaredNorm() >= 1e-8f;
+    };
+    orange::debug::DebugDraw extras;
+
+    // Side = 0 (convex gate): the sphere's positive divergence lets QFOR judge
+    // everyone -> all spikes drop, false positives stay rare.
+    in.params = {24.0f, 3.0f, 0.3f, 0.0f};
+    std::vector<Eigen::Vector3f> colors;
+    orange::modes::runModeColors(idx, in, colors, extras);
+    CHECK(colors.size() == in.points.size());
+    int spikeDrops = 0, fp = 0;
+    std::vector<uint8_t> isSpike(in.points.size(), 0);
+    for (int i : spikes) isSpike[i] = 1;
+    for (size_t i = 0; i < colors.size(); ++i) {
+        if (isSpike[i]) spikeDrops += dropped(colors, i);
+        else fp += dropped(colors, i);
+    }
+    CHECK(spikeDrops == (int)spikes.size());
+    CHECK(fp <= (int)in.points.size() / 20);
+
+    // Side = 1 (concave gate): nothing on a convex sphere qualifies -> even the
+    // spikes survive, residual notwithstanding.
+    in.params = {24.0f, 3.0f, 0.3f, 1.0f};
+    orange::modes::runModeColors(idx, in, colors, extras);
+    int drops = 0;
+    for (size_t i = 0; i < colors.size(); ++i) drops += dropped(colors, i);
+    CHECK(drops == 0);
+}
+
 // --- mesh IO roundtrip ------------------------------------------------------
 static void test_io() {
     std::printf("[io]\n");
@@ -448,6 +502,7 @@ int main() {
     test_modes();
     test_normal_divergence();
     test_qfor();
+    test_qfor_div_gate();
     test_processing();
     test_ui_layout();
     test_io();
