@@ -178,6 +178,11 @@ struct ModeJob {
     std::vector<uint8_t>        mask;              // per-point delete flags (Remove)
     std::vector<Eigen::Vector3f> colors;           // per-point colors (Recolor; x<0 = keep)
     std::vector<Eigen::Vector3f> fitted;           // new world positions (fit action)
+    // Count-changing fit (e.g. SDF Filter resamples the cloud): the worker gets
+    // the source vertices (srcVerts) to transfer colors from, and returns the
+    // full replacement vertex set (fitVerts, world-space positions).
+    std::vector<render::Vertex> srcVerts;
+    std::vector<render::Vertex> fitVerts;
     bool                        isFit = false;     // this job runs the mode's Fit action
     modes::ApplyKind            applyKind = modes::ApplyKind::Draw;
     uint64_t                    gen = 0, sig = 0;
@@ -254,6 +259,62 @@ void applyCloudVertices(entt::registry& world, render::IRenderer& renderer, entt
     }
     r.boundsMin = mn;
     r.boundsMax = mx;
+}
+
+// Spawn a real, pickable/editable/saveable triangle-mesh entity from a
+// non-indexed triangle soup (sequential indices). Used by the Reconstruct
+// apply (dialog Fit) to turn the previewed Draw result into scene content.
+entt::entity spawnMeshFromTriangles(entt::registry& world, render::IRenderer& renderer,
+                                    const std::vector<render::Vertex>& verts,
+                                    const char* label) {
+    if (verts.size() < 3) return entt::null;
+    render::BufferDesc bd;
+    bd.type  = render::BufferType::Vertex;
+    bd.usage = render::BufferUsage::Static;
+    bd.data  = verts.data();
+    bd.size  = verts.size() * sizeof(render::Vertex);
+    render::BufferHandle vbo = renderer.createBuffer(bd);
+
+    std::vector<uint32_t> idx(verts.size());
+    for (uint32_t i = 0; i < (uint32_t)idx.size(); ++i) idx[i] = i;
+    render::BufferDesc ibd;
+    ibd.type  = render::BufferType::Index;
+    ibd.usage = render::BufferUsage::Static;
+    ibd.data  = idx.data();
+    ibd.size  = idx.size() * sizeof(uint32_t);
+
+    render::MeshDesc md;
+    md.vertexBuffer = vbo;
+    md.indexBuffer  = renderer.createBuffer(ibd);
+    md.layout       = render::Vertex::layout();
+    md.vertexCount  = (uint32_t)verts.size();
+    md.indexCount   = (uint32_t)idx.size();
+
+    auto e = world.create();
+    world.emplace<Transform>(e, Transform{});  // verts are already world-space
+    Renderable r;
+    r.mesh = renderer.createMesh(md);
+    Eigen::Vector3f mn = Eigen::Vector3f::Constant(FLT_MAX);
+    Eigen::Vector3f mx = Eigen::Vector3f::Constant(-FLT_MAX);
+    PickGeometry pick;
+    pick.positions.reserve(verts.size());
+    for (const auto& v : verts) {
+        Eigen::Vector3f p(v.position[0], v.position[1], v.position[2]);
+        pick.positions.push_back(p);
+        mn = mn.cwiseMin(p);
+        mx = mx.cwiseMax(p);
+    }
+    pick.indices = idx;
+    r.boundsMin  = mn;
+    r.boundsMax  = mx;
+    world.emplace<Renderable>(e, r);
+    world.emplace<PickGeometry>(e, std::move(pick));
+    VertexSource vs;
+    vs.vbo      = vbo;
+    vs.vertices = verts;
+    world.emplace<VertexSource>(e, std::move(vs));
+    pushSpawnOp(world, e, label);
+    return e;
 }
 } // namespace
 
@@ -368,6 +429,33 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
                     undoStack(world).push(std::move(op));
                     SDL_Log("processingModeSystem: %s fit done (%zu points moved)",
                             modes::modeName(state.index), moved);
+                } else if (!cache.job->fitVerts.empty()) {
+                    // Count-changing fit (SDF Filter resample): swap in the
+                    // worker-built replacement set, positions mapped back to
+                    // local space. Undoable like the in-place fit.
+                    Eigen::Matrix4f Minv = Eigen::Matrix4f::Identity();
+                    if (world.all_of<Transform>(src))
+                        Minv = world.get<Transform>(src).matrix().inverse();
+                    auto oldVerts = std::make_shared<std::vector<render::Vertex>>(vs.vertices);
+                    auto newVerts = std::make_shared<std::vector<render::Vertex>>(
+                        std::move(cache.job->fitVerts));
+                    for (auto& v : *newVerts) {
+                        Eigen::Vector4f l = Minv * Eigen::Vector4f(v.position[0], v.position[1],
+                                                                   v.position[2], 1.0f);
+                        v.position[0] = l.x(); v.position[1] = l.y(); v.position[2] = l.z();
+                    }
+                    applyCloudVertices(world, renderer, src, *newVerts);
+                    UndoOp op;
+                    op.label = std::string(modes::modeName(state.index)) + " Fit";
+                    op.undo  = [e = src, oldVerts](entt::registry& w, render::IRenderer& r) {
+                        applyCloudVertices(w, r, e, *oldVerts);
+                    };
+                    op.redo = [e = src, newVerts](entt::registry& w, render::IRenderer& r) {
+                        applyCloudVertices(w, r, e, *newVerts);
+                    };
+                    undoStack(world).push(std::move(op));
+                    SDL_Log("processingModeSystem: %s fit done (%zu -> %zu points)",
+                            modes::modeName(state.index), oldVerts->size(), newVerts->size());
                 }
                 cache.verts.clear();
                 cache.hideSource = false;
@@ -470,6 +558,39 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
             break;
         }
     }
+    // Apply-as-mesh (Reconstruct): the Fit button turns the CURRENT cached
+    // triangle preview into a real mesh entity, hides the source cloud (like
+    // Poisson's finalize; the tree-view eye unhides it), and deactivates the
+    // mode. Kept pending while a recompute is in flight.
+    if (dlg && dlg->requestFit && modes::modeAppliesMesh(state.index)) {
+        if (!cache.job) {
+            dlg->requestFit = false;
+            if (!cache.verts.empty() && cache.generation == want && cache.selSig == selSig) {
+                std::string  label = std::string(modes::modeName(state.index)) + " Apply";
+                entt::entity e =
+                    spawnMeshFromTriangles(world, renderer, cache.verts, label.c_str());
+                if (e != entt::null) {
+                    if (src != entt::null && world.valid(src) && world.all_of<Renderable>(src)) {
+                        syncHidden(entt::null);  // release the mode's own hide first
+                        world.get<Renderable>(src).visible = false;
+                    }
+                    SDL_Log("processingModeSystem: %s applied as mesh (%zu tris)",
+                            modes::modeName(state.index), cache.verts.size() / 3);
+                    cache.verts.clear();
+                    cache.hideSource = false;
+                    cache.generation = 0;
+                    if (ctx.contains<modes::ModeState>()) {
+                        auto& ms = ctx.get<modes::ModeState>();
+                        ms.index = -1;
+                        ms.generation++;
+                    }
+                    debug::DebugDraw::instance().addRaw(cache.verts);
+                    return;
+                }
+            }
+        }
+    }
+
     const bool wantFit = dlg && dlg->requestFit && modes::modeCanFit(state.index);
 
     // 3) Need a (re)compute (or a Fit) and no worker in flight? Build the input
@@ -520,6 +641,11 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
                        : (k == modes::ApplyKind::Remove && isCloud)  ? k
                                                                      : modes::ApplyKind::Draw;
         job->isFit = wantFit && isCloud;
+        if (wantFit && !isCloud)
+            SDL_Log("processingModeSystem: Fit skipped -- it edits point clouds only "
+                    "(the selected entity is a triangle mesh or not editable)");
+        if (job->isFit)  // color source for a count-changing fit result
+            job->srcVerts = world.get<VertexSource>(src).vertices;
         cache.job  = job;
         SDL_Log("processingModeSystem: %s running in background on %zu points...",
                 modes::modeName(state.index),
@@ -551,6 +677,29 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
                 };
                 if (job->isFit) {
                     modes::runModeFit(idx, in, job->fitted, onProgress);
+                    // Count changed (a resampling fit like SDF Filter): build
+                    // the full replacement vertex set here on the worker --
+                    // world positions + colors from the nearest source point.
+                    if (job->fitted.size() != in.points.size() && !job->fitted.empty() &&
+                        !job->srcVerts.empty() && job->srcVerts.size() == in.points.size()) {
+                        geometry::KDTree tree;
+                        tree.build(in.points);
+                        job->fitVerts.resize(job->fitted.size());
+                        for (size_t i = 0; i < job->fitted.size(); ++i) {
+                            render::Vertex v{};
+                            const auto& p = job->fitted[i];
+                            v.position[0] = p.x(); v.position[1] = p.y(); v.position[2] = p.z();
+                            int j = tree.nearest(p);
+                            if (j >= 0) {
+                                v.color[0] = job->srcVerts[j].color[0];
+                                v.color[1] = job->srcVerts[j].color[1];
+                                v.color[2] = job->srcVerts[j].color[2];
+                            } else {
+                                v.color[0] = v.color[1] = v.color[2] = 0.8f;
+                            }
+                            job->fitVerts[i] = v;
+                        }
+                    }
                 } else if (job->applyKind == modes::ApplyKind::Remove) {
                     modes::runModeMask(idx, in, job->mask, onProgress);
                 } else if (job->applyKind == modes::ApplyKind::Recolor) {
@@ -1778,7 +1927,8 @@ ModeDlgRects modeDlgRects(const ModeParamsDialog& d, int nParams) {
         r.minus[i] = {d.x + pad + trackW + gap, by, btn, btn};
         r.plus[i]  = {d.x + pad + trackW + gap + btn + gap, by, btn, btn};
     }
-    if (modes::modeCanFit(d.modeIndex) && d.pipeNodeId < 0) {
+    if ((modes::modeCanFit(d.modeIndex) || modes::modeAppliesMesh(d.modeIndex)) &&
+        d.pipeNodeId < 0) {
         r.apply = {d.x + pad, (float)(d.y + d.h) - 74.0f, d.w - 2 * pad, 28.0f};
         r.fit   = {d.x + pad, (float)(d.y + d.h) - 38.0f, d.w - 2 * pad, 28.0f};
     } else {
@@ -1903,7 +2053,8 @@ void buildModeParamsDialogGeometry(const ModeParamsDialog& d, render::Vertex* ou
          (y0 + y1) * 0.5f - bh * 0.35f, bh, 0.90f, 0.96f, 0.92f, 0.6f);
 
     // Fit button (modes with a fit action only; hidden in node-editing mode).
-    if (modes::modeCanFit(d.modeIndex) && d.pipeNodeId < 0) {
+    if ((modes::modeCanFit(d.modeIndex) || modes::modeAppliesMesh(d.modeIndex)) &&
+        d.pipeNodeId < 0) {
         toN(R.fit, x0, y0, x1, y1);
         solid(x0, y0, x1, y1, 0.22f, 0.34f, 0.52f, 0.3f);
         float fh = (y1 - y0) * 0.62f;
@@ -1934,6 +2085,7 @@ const PipeKindInfo kPipeKinds[(int)PipeNodeKind::Count] = {
     {"PFOR Fit", "Outlier: PFOR",      true},
     {"Smooth",   "Smooth (bilateral)", false},
     {"Bump Rm",  "Bump: Remove",       false},
+    {"MLS",      "Surface Dev (MLS)",  false},  // MLS projection (pointsFn = mlsFit)
     {"Output",   nullptr,              false},
 };
 
@@ -1959,7 +2111,7 @@ CRect pipeNodeCloseRect(const CRect& nr) {
 }
 // Palette buttons (node kinds), then Save/Load, then Run along the bottom bar.
 CRect pipePaletteRect(const PipelineDialog& d, int slot) {
-    float bw = 80.0f;
+    float bw = 68.0f;  // 9 kinds + Save/Load/Run must fit the default width
     return {d.x + 8.0f + slot * (bw + 5.0f), (float)(d.y + d.h) - kPipePalette + 6.0f,
             bw, kPipePalette - 12.0f};
 }
@@ -2008,6 +2160,7 @@ std::string pipeGraphPath() {
 void pipeSaveGraph(const PipelineDialog& d) {
     std::ofstream f(pipeGraphPath(), std::ios::trunc);
     if (!f) { SDL_Log("Pipeline: save failed (%s)", pipeGraphPath().c_str()); return; }
+    f << "ver 2\n";  // v2: PipeNodeKind::MLS inserted before Output
     f << "pan " << d.panX << " " << d.panY << "\n";
     for (const auto& n : d.nodes)
         f << "node " << n.id << " " << (int)n.kind << " " << n.x << " " << n.y << " "
@@ -2023,18 +2176,23 @@ void pipeLoadGraph(PipelineDialog& d) {
     std::vector<PipeLink> links;
     float panX = 0, panY = 0;
     int maxId = 0;
+    int ver   = 1;  // files without a "ver" line predate the version tag
     std::string line;
     while (std::getline(f, line)) {
         std::istringstream ss(line);
         std::string tag;
         ss >> tag;
-        if (tag == "pan") {
+        if (tag == "ver") {
+            ss >> ver;
+        } else if (tag == "pan") {
             ss >> panX >> panY;
         } else if (tag == "node") {
             PipeNode n;
             int kind = 0;
             ss >> n.id >> kind >> n.x >> n.y >> n.params[0] >> n.params[1] >> n.params[2] >>
                 n.params[3];
+            // v1 files predate PipeNodeKind::MLS: their Output was 7.
+            if (ver < 2 && kind == 7) kind = (int)PipeNodeKind::Output;
             if (kind < 0 || kind >= (int)PipeNodeKind::Count) continue;
             n.kind = (PipeNodeKind)kind;
             maxId  = std::max(maxId, n.id);
@@ -2876,14 +3034,14 @@ std::vector<Menu> defaultAppMenus() {
     // Geometry-processing operators, generated from the modes registry and grouped
     // by category (Generate / Analyze / Filter) with separators between groups.
     // Each mode i maps to MenuAction(Mode0 + i); adding a mode in modes.cpp makes
-    // it appear here automatically (up to the Mode0..Mode9 action range).
+    // it appear here automatically (up to the Mode0..Mode23 action range).
     {
         Menu geo{"Geometry", {}};
         geo.items.push_back(act("Off", A::ModeOff));  // no active operator (default)
         geo.items.push_back(sep());
         modes::ModeCategory prev = modes::modeCategory(0);
         bool first = true;
-        for (int i = 0; i < modes::modeCount() && i < 16; ++i) {
+        for (int i = 0; i < modes::modeCount() && i < 24; ++i) {
             modes::ModeCategory cat = modes::modeCategory(i);
             if (!first && cat != prev) geo.items.push_back(sep());
             first = false;
@@ -4031,8 +4189,9 @@ void modeParamsDialogInputSystem(entt::registry& world, core::Input& input,
         input.captured = true;
         return;
     }
-    if (input.leftClicked && modes::modeCanFit(d->modeIndex) && d->pipeNodeId < 0 &&
-        hit(R.fit)) {
+    if (input.leftClicked &&
+        (modes::modeCanFit(d->modeIndex) || modes::modeAppliesMesh(d->modeIndex)) &&
+        d->pipeNodeId < 0 && hit(R.fit)) {
         d->requestFit  = true;
         input.captured = true;
         return;

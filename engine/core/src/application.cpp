@@ -145,7 +145,8 @@ void syncModeParamsDialog(entt::registry& world, int modeIndex) {
                                                        : modes::modeParam(modeIndex, i).defV;
         }
         d.pipeNodeId = -1;  // regular mode editing detaches any pipeline-node binding
-        d.h       = 42 + n * 36 + 46 + (modes::modeCanFit(modeIndex) ? 36 : 0);
+        d.h       = 42 + n * 36 + 46 +
+                    ((modes::modeCanFit(modeIndex) || modes::modeAppliesMesh(modeIndex)) ? 36 : 0);
         d.visible = true;
         break;
     }
@@ -894,6 +895,8 @@ void Application::applyMenuAction(int action) {
         case A::Mode4: case A::Mode5: case A::Mode6:  case A::Mode7:
         case A::Mode8: case A::Mode9: case A::Mode10: case A::Mode11:
         case A::Mode12: case A::Mode13: case A::Mode14: case A::Mode15:
+        case A::Mode16: case A::Mode17: case A::Mode18: case A::Mode19:
+        case A::Mode20: case A::Mode21: case A::Mode22: case A::Mode23:
             setMode(action - static_cast<int>(A::Mode0));
             break;
 

@@ -94,6 +94,10 @@ void runModeMask(int index, const ModeInput& in, std::vector<uint8_t>& mask,
 // projects its outliers onto their local fitted plane). The dialog shows a
 // "Fit" button for these; the host replaces the cloud's positions (undoable).
 bool modeCanFit(int index);
+// Draw modes whose triangle output can be applied as a REAL mesh entity from
+// the dialog's Fit button (Reconstruct): the host spawns the cached triangles
+// as a pickable/editable/saveable Renderable and deactivates the mode.
+bool modeAppliesMesh(int index);
 // Fills `fitted` with the new world-space positions (same order/count as
 // in.points; non-fitted points keep their input position).
 void runModeFit(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,

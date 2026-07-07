@@ -434,8 +434,10 @@ struct ModeParamsDialog {
 // selected (or only) point cloud in; the middle kinds are points->points
 // stages (modes::runModePoints / runModeFit); Output spawns the result as a
 // new point-cloud entity (undoable).
+// NOTE: the saved-graph file stores these as ints; pipeLoadGraph remaps older
+// file versions when a kind is inserted (see the "ver" line handling).
 enum class PipeNodeKind : int {
-    Source = 0, SOR, ROR, PFOR, PforFit, Smooth, BumpRemove, Output, Count
+    Source = 0, SOR, ROR, PFOR, PforFit, Smooth, BumpRemove, MLS, Output, Count
 };
 
 // One node / one edge of the pipeline graph. Node positions are in canvas
@@ -462,7 +464,7 @@ struct PipeLink {
 struct PipelineDialog {
     bool visible = false;
 
-    int  w = 900, h = 560;         // current size (resizable)
+    int  w = 940, h = 560;         // current size (resizable)
     int  minW = 520, minH = 340;   // resize floor
     int  x = 0, y = 0;
     bool placed   = false;
@@ -660,6 +662,7 @@ enum class MenuAction : int {
     ModeOff,  // deactivate the processing operator (default state)
     Mode0, Mode1, Mode2, Mode3, Mode4, Mode5, Mode6, Mode7,
     Mode8, Mode9, Mode10, Mode11, Mode12, Mode13, Mode14, Mode15,
+    Mode16, Mode17, Mode18, Mode19, Mode20, Mode21, Mode22, Mode23,
     // Parametric primitive spawners (Create menu) -> a new Renderable entity.
     CreatePlane, CreateBox, CreateSphere, CreateCylinder, CreateCone,
     CreateTorus, CreateDisk, CreateCapsule, CreateArrow,

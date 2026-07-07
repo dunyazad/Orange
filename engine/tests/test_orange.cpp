@@ -198,6 +198,63 @@ static void test_modes() {
     CHECK(progressInRange);       // always within [0,1]
 }
 
+// --- QFOR: quadric-fit outlier filter ----------------------------------------
+// A curved (paraboloid) surface with a deterministic ripple and a few injected
+// spikes. The quadric fit must absorb the smooth curvature (curved inliers stay
+// green) while every spike lands red; Fit must pull the spikes back onto the
+// surface and leave inliers in place.
+static void test_qfor() {
+    std::printf("[qfor]\n");
+    const int idx = orange::modes::modeIndexByName("Outlier: QFOR");
+    CHECK(idx >= 0);
+    CHECK(orange::modes::modeApplyKind(idx) == orange::modes::ApplyKind::Recolor);
+    CHECK(orange::modes::modeCanFit(idx));
+    CHECK(orange::modes::modeCanTransformPoints(idx));
+
+    orange::modes::ModeInput in;
+    std::vector<int> spikes;
+    for (int gy = 0; gy < 20; ++gy)
+        for (int gx = 0; gx < 20; ++gx) {
+            float x = -1.0f + gx * (2.0f / 19.0f);
+            float y = -1.0f + gy * (2.0f / 19.0f);
+            float z = 0.3f * (x * x + y * y)                       // smooth curvature
+                    + 0.004f * std::sin(12.9898f * x + 78.233f * y);  // ripple "noise"
+            int i = (int)in.points.size();
+            if (gx % 7 == 3 && gy % 9 == 4) { z += 0.4f; spikes.push_back(i); }  // spike
+            in.points.emplace_back(x, y, z);
+        }
+    CHECK(spikes.size() >= 3);
+
+    std::vector<Eigen::Vector3f> colors;
+    orange::debug::DebugDraw extras;
+    orange::modes::runModeColors(idx, in, colors, extras);
+    CHECK(colors.size() == in.points.size());
+    const Eigen::Vector3f keepGreen(0.1f, 0.9f, 0.2f);
+    auto kept = [&](size_t i) { return (colors[i] - keepGreen).squaredNorm() < 1e-8f; };
+    int spikeFlagged = 0, falsePositives = 0;
+    std::vector<uint8_t> isSpike(in.points.size(), 0);
+    for (int i : spikes) isSpike[i] = 1;
+    for (size_t i = 0; i < in.points.size(); ++i) {
+        if (isSpike[i]) spikeFlagged += !kept(i);
+        else falsePositives += !kept(i);
+    }
+    CHECK(spikeFlagged == (int)spikes.size());               // every spike caught
+    CHECK(falsePositives <= (int)in.points.size() / 20);     // curvature not misread (<5%)
+
+    // Fit: spikes move (back toward the surface), inliers stay put.
+    std::vector<Eigen::Vector3f> fitted;
+    orange::modes::runModeFit(idx, in, fitted);
+    CHECK(fitted.size() == in.points.size());
+    bool spikesMoved = true, inliersHeld = true;
+    for (size_t i = 0; i < in.points.size(); ++i) {
+        float moved = (fitted[i] - in.points[i]).norm();
+        if (isSpike[i]) spikesMoved = spikesMoved && moved > 0.2f;
+        else if (kept(i)) inliersHeld = inliersHeld && moved == 0.0f;
+    }
+    CHECK(spikesMoved);
+    CHECK(inliersHeld);
+}
+
 // --- mesh IO roundtrip ------------------------------------------------------
 static void test_io() {
     std::printf("[io]\n");
@@ -363,6 +420,7 @@ int main() {
     test_color();
     test_sparse_grid();
     test_modes();
+    test_qfor();
     test_processing();
     test_ui_layout();
     test_io();

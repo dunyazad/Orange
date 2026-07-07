@@ -231,8 +231,16 @@ void morphologyColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
 }
 
 // --- Mode 2: SDF denoise (UDF splat + box blur + isosurface resample) --------
-// Ported from Hydrogen AppSDFFiltering (SDFEngine).
-void runSdfFilter(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+// Ported from Hydrogen AppSDFFiltering (SDFEngine). The core resampler is
+// shared: the Draw visualization colors the samples by their gradient normal,
+// and the Fit action replaces the source cloud with them (so SDF Filter can
+// actually APPLY its result, like the other operators, not just preview it).
+void sdfResample(const ModeInput& in, std::vector<Eigen::Vector3f>& outPts,
+                 std::vector<Eigen::Vector3f>& outNrm, float& outPointSize,
+                 const ProgressFn& progress) {
+    outPts.clear();
+    outNrm.clear();
+    outPointSize = 0.0f;
     const auto& pts = in.points;
     if (pts.empty()) return;
 
@@ -324,11 +332,10 @@ void runSdfFilter(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& 
         report(progress, 0.5f + 0.2f * (float)(it + 1) / (float)smoothIter);
     }
 
-    // Resample the iso-surface as points (color by SDF gradient = normal).
-    // Parallel per z-slice into per-slice buckets, then a serial emit
-    // (DebugDraw is not thread-safe).
+    // Resample the iso-surface as points (with the SDF gradient as normal).
+    // Parallel per z-slice into per-slice buckets, then a serial collect.
     float iso = voxelSize * 1.5f;
-    float psize = voxelSize * 0.4f;
+    outPointSize = voxelSize * 0.4f;
     std::vector<std::vector<std::pair<Eigen::Vector3f, Eigen::Vector3f>>> rows(nz);
     parallelFor(nz, progress, 0.7f, 1.0f, [&](size_t zi) {
         const int z = (int)zi + 1;
@@ -340,13 +347,30 @@ void runSdfFilter(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& 
                                   data[idxOf(x, y + 1, z)] - data[idxOf(x, y - 1, z)],
                                   data[idxOf(x, y, z + 1)] - data[idxOf(x, y, z - 1)]);
                 n = n.squaredNorm() > 1e-6f ? n.normalized() : Eigen::Vector3f::UnitY();
-                row.emplace_back(gridToWorld(x, y, z),
-                                 n * 0.5f + Eigen::Vector3f::Constant(0.5f));
+                row.emplace_back(gridToWorld(x, y, z), n);
             }
     });
     for (const auto& row : rows)
-        for (const auto& pc : row) out.addPoint(pc.first, pc.second, psize);
+        for (const auto& pn : row) { outPts.push_back(pn.first); outNrm.push_back(pn.second); }
     report(progress, 1.0f);
+}
+
+void runSdfFilter(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progress) {
+    std::vector<Eigen::Vector3f> ps, ns;
+    float psize = 0.0f;
+    sdfResample(in, ps, ns, psize, progress);
+    for (size_t i = 0; i < ps.size(); ++i)
+        out.addPoint(ps[i], ns[i] * 0.5f + Eigen::Vector3f::Constant(0.5f), psize);
+}
+
+// SDF Filter "Fit": replace the cloud with the denoised resample. The count
+// changes, so the host swaps the whole vertex set (colors transferred from the
+// nearest original points) instead of moving points in place.
+void sdfFitPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+                  const ProgressFn& progress) {
+    std::vector<Eigen::Vector3f> ns;
+    float psize = 0.0f;
+    sdfResample(in, fitted, ns, psize, progress);
 }
 
 // --- Mode 3: Surface reconstruction (TSDF + dual contouring) -----------------
@@ -537,6 +561,142 @@ void pforFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
     });
 }
 
+// --- Filter: Quadric-Fitting Outlier Removal (QFOR) --------------------------
+// PFOR's plane test reads smooth curvature as off-surface distance (on a sphere
+// of radius R a valid point sits ~r^2/2R off its neighbourhood plane, so tight
+// thresholds flag curved-but-clean regions). QFOR fits a leave-one-out QUADRIC
+// w = q(u,v) in the point's local PCA frame instead: smooth curvature is
+// absorbed by the quadric coefficients, so the residual left over is pure
+// off-surface displacement. On planar data it degenerates to PFOR's answer.
+// Leave-one-out matters: the point under test is EXCLUDED from its own fit
+// (frame and quadric come from the neighbours only) so a spike cannot drag its
+// reference surface toward itself.
+//
+// Returns the SIGNED residual along the local normal per point (0 where the
+// neighbourhood is degenerate) plus that normal, for the projection in Fit.
+// Thresholding happens globally in the callers: sigma = 1.4826 * median(|res|)
+// (a robust MAD scale -- mean/stddev would be dragged by the very outliers
+// we're hunting), outlier when |res| > alpha * sigma. Params: 0 = K, 1 = Alpha.
+std::vector<float> qforResiduals(const ModeInput& in, std::vector<Eigen::Vector3f>& normals,
+                                 const ProgressFn& progress, float p0, float p1) {
+    const auto& pts = in.points;
+    std::vector<float> res(pts.size(), 0.0f);
+    normals.assign(pts.size(), Eigen::Vector3f::UnitY());
+    geometry::SparseGrid grid;
+    Eigen::Vector3f mn, mx;
+    buildGrid(pts, grid, mn, mx);
+    const int k = (int)std::lround(P(in, 0, 24.0f));
+
+    parallelFor(pts.size(), progress, p0, p1, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr, oth;
+        thread_local std::vector<float> dist;
+        Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
+        grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
+        if (nbr.size() < 10) return;  // 6 unknowns: need headroom over the minimum
+        oth.assign(nbr.begin() + 1, nbr.end());  // [0] is the query point itself
+        if (!neighbourhoodPCA(pts, oth, c, eval, evec)) return;
+        const Eigen::Vector3f n  = evec.col(0);
+        const Eigen::Vector3f t1 = evec.col(2), t2 = evec.col(1);
+        // u,v scaled by the in-plane spread so the 6x6 system stays conditioned
+        // regardless of the cloud's absolute scale.
+        const float s = 1.0f / std::max(std::sqrt(std::max(eval.y() / (float)oth.size(), 0.0f)),
+                                        1e-12f);
+        // Local frame coordinates of the neighbours (and the query point).
+        thread_local std::vector<Eigen::Vector3f> loc;
+        loc.resize(oth.size());
+        for (size_t t = 0; t < oth.size(); ++t) {
+            Eigen::Vector3f d = pts[oth[t]] - c;
+            loc[t] = {d.dot(t1) * s, d.dot(t2) * s, d.dot(n)};
+        }
+        const Eigen::Vector3f di = pts[i] - c;
+        const float ui = di.dot(t1) * s, vi = di.dot(t2) * s, wi = di.dot(n);
+
+        // Two-pass robust LS (same trick as mlsCompute): the first fit's
+        // high-residual neighbours -- other spikes sitting in this window --
+        // are down-weighted for the refit, so one outlier can't drag another
+        // outlier's reference surface toward itself.
+        thread_local std::vector<float> rob, rres;
+        rob.assign(oth.size(), 1.0f);
+        float d = wi;  // degenerate fit: fall back to the plane residual
+        for (int pass = 0; pass < 2; ++pass) {
+            Eigen::Matrix<float, 6, 6> A = Eigen::Matrix<float, 6, 6>::Zero();
+            Eigen::Matrix<float, 6, 1> b = Eigen::Matrix<float, 6, 1>::Zero();
+            for (size_t t = 0; t < oth.size(); ++t) {
+                float u = loc[t].x(), v = loc[t].y();
+                Eigen::Matrix<float, 6, 1> phi;
+                phi << u * u, u * v, v * v, u, v, 1.0f;
+                A += rob[t] * (phi * phi.transpose());
+                b += rob[t] * (phi * loc[t].z());
+            }
+            Eigen::LDLT<Eigen::Matrix<float, 6, 6>> ldlt(A);
+            if (ldlt.info() != Eigen::Success) break;
+            Eigen::Matrix<float, 6, 1> q = ldlt.solve(b);
+            d = wi - (q[0] * ui * ui + q[1] * ui * vi + q[2] * vi * vi +
+                      q[3] * ui + q[4] * vi + q[5]);
+            if (pass == 1) break;
+            rres.resize(oth.size());
+            for (size_t t = 0; t < oth.size(); ++t) {
+                float u = loc[t].x(), v = loc[t].y();
+                rres[t] = std::fabs(loc[t].z() -
+                                    (q[0] * u * u + q[1] * u * v + q[2] * v * v +
+                                     q[3] * u + q[4] * v + q[5]));
+            }
+            thread_local std::vector<float> tmp;
+            tmp = rres;
+            std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+            // Floor the scale at a fraction of the in-plane spread (1/s): on an
+            // exactly-fittable surface the MAD is ~0 and an unfloored sigma
+            // would zero every weight, feeding the refit a singular system.
+            float sig    = std::max(1.4826f * tmp[tmp.size() / 2], 1e-4f / s);
+            float inv2s2 = 1.0f / (2.0f * (3.0f * sig) * (3.0f * sig));
+            for (size_t t = 0; t < oth.size(); ++t)
+                rob[t] = std::exp(-rres[t] * rres[t] * inv2s2);
+        }
+        res[i]     = d;
+        normals[i] = n;
+    });
+    return res;
+}
+
+// Robust global outlier threshold over the residuals: alpha * (1.4826 * MAD).
+float qforThreshold(const ModeInput& in, const std::vector<float>& res) {
+    std::vector<float> mag(res.size());
+    for (size_t i = 0; i < res.size(); ++i) mag[i] = std::fabs(res[i]);
+    size_t h = mag.size() / 2;
+    std::nth_element(mag.begin(), mag.begin() + h, mag.end());
+    float sigma = 1.4826f * mag[h];
+    Eigen::Vector3f mn, mx;
+    sigma = std::max(sigma, boundsExtent(in.points, mn, mx).norm() * 1e-7f);  // exact-plane guard
+    return P(in, 1, 3.0f) * sigma;
+}
+
+void qforColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
+    const auto& pts = in.points;
+    if (pts.size() < 16) return;
+    std::vector<Eigen::Vector3f> nrm;
+    std::vector<float> res = qforResiduals(in, nrm, progress, 0.0f, 0.98f);
+    const float thresh = qforThreshold(in, res);
+    std::vector<uint8_t> keep(pts.size());
+    for (size_t i = 0; i < pts.size(); ++i) keep[i] = std::fabs(res[i]) <= thresh;
+    keepToColors(keep, colors);
+}
+
+// QFOR "Fit": project the outliers onto their local quadric (along the fitted
+// normal by the residual) instead of dropping them. Inliers stay put.
+void qforFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+             const ProgressFn& progress) {
+    const auto& pts = in.points;
+    fitted = pts;
+    if (pts.size() < 16) return;
+    std::vector<Eigen::Vector3f> nrm;
+    std::vector<float> res = qforResiduals(in, nrm, progress, 0.0f, 0.98f);
+    const float thresh = qforThreshold(in, res);
+    for (size_t i = 0; i < pts.size(); ++i)
+        if (std::fabs(res[i]) > thresh) fitted[i] = pts[i] - nrm[i] * res[i];
+}
+
 // --- Filter: Bump detection / removal (trimmed-plane residual) ----------------
 // Separate noise-like bump blobs sticking out of an otherwise smooth surface.
 // Per point: gather a bump-sized radius neighbourhood, fit a PCA plane, then
@@ -712,6 +872,284 @@ void kdeColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
     scalarToColors(density, colors);
 }
 
+// --- Analyze: Surface deviation vs the MLS "energy" surface -------------------
+// Each point's neighbourhood contributes a Gaussian-weighted (energy) vote to a
+// local plane fit -- order-1 moving least squares. The point is then colored by
+// its SIGNED distance to that estimated surface: where its energy inflow says
+// the surface runs vs where the point actually sits. Above the surface (along
+// the oriented normal) = warm, below = cool, on it = green; the diverging map
+// is symmetric around zero (95th percentile of |deviation|). Fit projects every
+// point onto its MLS plane (one MLS smoothing/projection step).
+// Order-2 robust MLS: a weighted PLANE fit alone reads any smooth convexity as
+// positive deviation (the plane cuts the dome's chord), washing real
+// protrusions out. So: fit a weighted QUADRIC in the plane's local frame --
+// smooth curvature (cusps, domes, grooves) is absorbed by the quadric -- and
+// robustly DOWN-WEIGHT high-residual neighbours over two passes so a spike
+// cannot drag the reference surface toward itself. What remains as deviation
+// is exactly the stuff sticking out of (or dented into) the smooth base.
+void mlsCompute(const ModeInput& in, std::vector<float>& dev,
+                std::vector<Eigen::Vector3f>& proj, const ProgressFn& progress, float pEnd) {
+    const auto& pts = in.points;
+    dev.assign(pts.size(), 0.0f);
+    proj = pts;
+    if (pts.size() < 8) return;
+    geometry::SparseGrid grid;
+    Eigen::Vector3f mn, mx;
+    float diag = buildGrid(pts, grid, mn, mx);
+    const float h = std::max(diag * P(in, 0, 2.0f) * 0.01f, 1e-9f);  // kernel bandwidth
+
+    const std::vector<Eigen::Vector3f> nrm =
+        in.normals.size() == pts.size()
+            ? in.normals
+            : geometry::estimateNormals(pts, 16, [&](float f) { report(progress, f * 0.4f); });
+    const float p0      = in.normals.size() == pts.size() ? 0.0f : 0.4f;
+    const float inv2h2  = 1.0f / (2.0f * h * h);
+
+    parallelFor(pts.size(), progress, p0, pEnd, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;   // squared distances
+        thread_local std::vector<float> wgt;    // spatial (energy) weight
+        thread_local std::vector<float> rob;    // robust multiplier
+        thread_local std::vector<Eigen::Vector3f> loc;  // neighbour in (u,v,w) frame
+        thread_local std::vector<float> res;    // per-neighbour quadric residual
+        grid.pointsWithinRadius(pts, pts[i], h * 2.5f, nbr, dist);
+        if (nbr.size() < 8) return;
+        // A dense scan can put thousands of points in the kernel radius, but a
+        // 6-coefficient quadric only needs a few hundred well-spread samples:
+        // uniform-stride subsample. This is the difference between ~28s and a
+        // few seconds on a 450k scan, at no visible quality cost.
+        constexpr size_t kMaxNbr = 256;
+        if (nbr.size() > kMaxNbr) {
+            size_t stride = nbr.size() / kMaxNbr + 1;
+            size_t w      = 0;
+            for (size_t t = 0; t < nbr.size(); t += stride) {
+                nbr[w]  = nbr[t];
+                dist[w] = dist[t];
+                ++w;
+            }
+            nbr.resize(w);
+            dist.resize(w);
+        }
+
+        // Local frame from the energy-weighted plane (PCA).
+        wgt.resize(nbr.size());
+        float W = 0.0f;
+        Eigen::Vector3f c = Eigen::Vector3f::Zero();
+        for (size_t t = 0; t < nbr.size(); ++t) {
+            float w = std::exp(-dist[t] * inv2h2);  // energy inflow from neighbour t
+            wgt[t]  = w;
+            W += w;
+            c += w * pts[nbr[t]];
+        }
+        if (W < 1e-12f) return;
+        c /= W;
+        Eigen::Matrix3f cov = Eigen::Matrix3f::Zero();
+        for (size_t t = 0; t < nbr.size(); ++t) {
+            Eigen::Vector3f d = pts[nbr[t]] - c;
+            cov += wgt[t] * (d * d.transpose());
+        }
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
+        if (es.info() != Eigen::Success) return;
+        Eigen::Vector3f n = es.eigenvectors().col(0);
+        if (n.dot(nrm[i]) < 0.0f) n = -n;                  // orient with the point's normal
+        const Eigen::Vector3f t1 = es.eigenvectors().col(2);
+        const Eigen::Vector3f t2 = es.eigenvectors().col(1);
+
+        loc.resize(nbr.size());
+        for (size_t t = 0; t < nbr.size(); ++t) {
+            Eigen::Vector3f d = pts[nbr[t]] - c;
+            loc[t] = {d.dot(t1) / h, d.dot(t2) / h, d.dot(n)};  // u,v scaled for conditioning
+        }
+        Eigen::Vector3f di = pts[i] - c;
+        const float ui = di.dot(t1) / h, vi = di.dot(t2) / h, wi = di.dot(n);
+
+        // Robust weighted quadric w(u,v): two fit passes, down-weighting
+        // neighbours that sit far off the surface (a spike stops voting).
+        rob.assign(nbr.size(), 1.0f);
+        res.resize(nbr.size());
+        Eigen::Matrix<float, 6, 1> coef = Eigen::Matrix<float, 6, 1>::Zero();
+        bool  solved = false;
+        float sigma  = h * 0.01f;  // local residual scale (refined below)
+        for (int pass = 0; pass < 2; ++pass) {
+            Eigen::Matrix<float, 6, 6> A = Eigen::Matrix<float, 6, 6>::Zero();
+            Eigen::Matrix<float, 6, 1> b = Eigen::Matrix<float, 6, 1>::Zero();
+            for (size_t t = 0; t < nbr.size(); ++t) {
+                float u = loc[t].x(), v = loc[t].y();
+                Eigen::Matrix<float, 6, 1> phi;
+                phi << u * u, u * v, v * v, u, v, 1.0f;
+                float w = wgt[t] * rob[t];
+                A += w * (phi * phi.transpose());
+                b += w * (phi * loc[t].z());
+            }
+            Eigen::LDLT<Eigen::Matrix<float, 6, 6>> ldlt(A);
+            if (ldlt.info() != Eigen::Success) break;
+            coef   = ldlt.solve(b);
+            solved = true;
+            if (pass == 1) break;
+            // Residual scale (MAD) -> redescending weights for the refit.
+            for (size_t t = 0; t < nbr.size(); ++t) {
+                float u = loc[t].x(), v = loc[t].y();
+                res[t] = std::fabs(loc[t].z() -
+                                   (coef[0] * u * u + coef[1] * u * v + coef[2] * v * v +
+                                    coef[3] * u + coef[4] * v + coef[5]));
+            }
+            thread_local std::vector<float> tmp;
+            tmp = res;
+            std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+            sigma        = std::max(1.4826f * tmp[tmp.size() / 2], h * 1e-4f);
+            float inv2s2 = 1.0f / (2.0f * (3.0f * sigma) * (3.0f * sigma));
+            for (size_t t = 0; t < nbr.size(); ++t)
+                rob[t] = std::exp(-res[t] * res[t] * inv2s2);
+        }
+
+        float d;
+        if (solved) {
+            float wHat = coef[0] * ui * ui + coef[1] * ui * vi + coef[2] * vi * vi +
+                         coef[3] * ui + coef[4] * vi + coef[5];
+            d = wi - wHat;  // off the smooth quadric base, signed along the normal
+        } else {
+            d = wi;         // degenerate: fall back to the plane residual
+        }
+        dev[i]  = d;               // raw signed residual; normalized globally below
+        proj[i] = pts[i] - n * d;  // projection always uses the raw distance
+    });
+
+    // Normalize to statistical SIGNIFICANCE with a GLOBAL robust scale (MAD of
+    // the raw residuals). A per-neighbourhood sigma looked right on synthetic
+    // data but real scans inflate it wherever the quadric fits poorly (steep
+    // walls, interproximal gaps) -- exactly where spikes live -- washing them
+    // out. One global scale keeps "red" meaning "sticks out far beyond the
+    // scan's typical residual".
+    {
+        std::vector<float> mag(dev.size());
+        for (size_t i = 0; i < dev.size(); ++i) mag[i] = std::fabs(dev[i]);
+        std::nth_element(mag.begin(), mag.begin() + mag.size() / 2, mag.end());
+        float gSigma = std::max(1.4826f * mag[mag.size() / 2], h * 1e-4f);
+        for (auto& d : dev) d /= 3.0f * gSigma;
+    }
+    report(progress, pEnd);
+}
+
+void mlsDeviationColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                        debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
+    std::vector<float>           dev;  // significance: residual / (3 * local sigma)
+    std::vector<Eigen::Vector3f> proj;
+    mlsCompute(in, dev, proj, progress, 0.95f);
+    if (dev.empty()) return;
+    // Fixed significance range: +-1 = 3 sigma (noise stays green), saturation
+    // at +-3 = 9 sigma (unmistakably sticking out => full red / full blue).
+    colors.resize(dev.size());
+    for (size_t i = 0; i < dev.size(); ++i)
+        colors[i] = geometry::compareBandColor(dev[i], 3.0f, /*isSigned=*/true, /*bands=*/1);
+    report(progress, 1.0f);
+}
+
+void mlsFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+            const ProgressFn& progress) {
+    std::vector<float> dev;
+    mlsCompute(in, dev, fitted, progress, 1.0f);
+}
+
+// --- Filter: Protrusion detect (MLS AND PFOR) ---------------------------------
+// "Find what sticks out": a point is a protrusion only when BOTH independent
+// tests agree -- its MLS significance (how far ABOVE the energy-weighted
+// quadric base, in global-noise units) exceeds the threshold AND PFOR's
+// plane-distance test calls it an off-surface outlier. The intersection kills
+// each test's false positives (MLS alone warms up rough-but-valid texture,
+// PFOR alone fires on smooth curvature). Flagged points paint red, everything
+// else keeps its original color; Fit projects ONLY the flagged points onto
+// their MLS base surface (the rest of the cloud is untouched).
+// Params: 0 = MLS Radius % (mlsCompute reads it), 1 = MLS significance
+// threshold, 2 = PFOR K, 3 = PFOR Beta.
+void protrusionFlags(const ModeInput& in, std::vector<uint8_t>& flag,
+                     std::vector<Eigen::Vector3f>& proj, const ProgressFn& progress) {
+    const auto& pts = in.points;
+    flag.assign(pts.size(), 0);
+    proj = pts;
+    if (pts.size() < 8) return;
+    std::vector<float> dev;
+    mlsCompute(in, dev, proj, progress, 0.7f);
+    const float sigThresh = P(in, 1, 1.0f);  // 1.0 = 3x the scan's residual MAD
+
+    geometry::SparseGrid grid;
+    Eigen::Vector3f mn, mx;
+    buildGrid(pts, grid, mn, mx);
+    const int   k    = (int)std::lround(P(in, 2, 16.0f));
+    const float beta = P(in, 3, 0.05f);
+    std::vector<uint8_t> pfor(pts.size(), 0);
+    parallelFor(pts.size(), progress, 0.7f, 1.0f, [&](size_t i) {
+        if (dev[i] <= sigThresh) return;  // MLS says smooth: PFOR test not needed
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
+        Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
+        grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
+        if (!neighbourhoodPCA(pts, nbr, c, eval, evec)) return;
+        Eigen::Vector3f n = evec.col(0);
+        float planeDist = std::abs((pts[i] - c).dot(n));
+        float extent    = std::sqrt(std::max(eval.y(), 1e-12f));
+        pfor[i] = planeDist > beta * extent;  // PFOR's OUTLIER criterion
+    });
+    for (size_t i = 0; i < pts.size(); ++i)
+        flag[i] = dev[i] > sigThresh && pfor[i];
+
+    // Grow the seeds through the MLS-flagged region so WHOLE blobs flag, not
+    // just their bases: a protruding cluster's interior defeats PFOR's plane
+    // test (its neighbours are the cluster itself), so the strict intersection
+    // only fires where cluster and base mix. Same hysteresis-growth trick as
+    // the bump detector. Growth radius scales with the local point spacing.
+    {
+        float spacing = 0.0f;
+        int   sn      = 0;
+        std::vector<unsigned int> nbr;
+        std::vector<float> dist;
+        size_t step = pts.size() > 400 ? pts.size() / 400 : 1;
+        for (size_t i = 0; i < pts.size(); i += step) {
+            grid.kNearestNeighbors(pts, pts[i], 2, nbr, dist);
+            if (dist.size() >= 2) { spacing += std::sqrt(dist[1]); ++sn; }
+        }
+        spacing = sn ? spacing / (float)sn : 0.0f;
+        if (spacing > 0.0f) {
+            float growR = spacing * 2.5f;
+            std::vector<size_t> stack;
+            for (size_t i = 0; i < pts.size(); ++i)
+                if (flag[i]) stack.push_back(i);
+            while (!stack.empty()) {
+                size_t i = stack.back();
+                stack.pop_back();
+                grid.pointsWithinRadius(pts, pts[i], growR, nbr, dist);
+                for (unsigned int j : nbr)
+                    if (!flag[j] && dev[j] > sigThresh) {
+                        flag[j] = 1;
+                        stack.push_back(j);
+                    }
+            }
+        }
+    }
+}
+
+void protrusionColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                      debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
+    std::vector<uint8_t>         flag;
+    std::vector<Eigen::Vector3f> proj;
+    protrusionFlags(in, flag, proj, progress);
+    // x < 0 keeps that point's original color; only the intersection turns red.
+    colors.assign(in.points.size(), Eigen::Vector3f(-1.0f, -1.0f, -1.0f));
+    for (size_t i = 0; i < flag.size(); ++i)
+        if (flag[i]) colors[i] = Eigen::Vector3f(1.0f, 0.08f, 0.05f);
+}
+
+void protrusionFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+                   const ProgressFn& progress) {
+    std::vector<uint8_t> flag;
+    std::vector<Eigen::Vector3f> proj;
+    protrusionFlags(in, flag, proj, progress);
+    fitted = in.points;
+    for (size_t i = 0; i < flag.size(); ++i)
+        if (flag[i]) fitted[i] = proj[i];
+}
+
 // --- Analyze: Surface curvature ----------------------------------------------
 // SIGNED surface curvature (ported from Helium PointCloudCurvatureAnalysis,
 // extended with a sign): magnitude = surface variation lambda0/(sum lambda)
@@ -763,11 +1201,14 @@ void curvatureColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
         colors[i] = geometry::compareBandColor(curv[i], range, /*isSigned=*/true, /*bands=*/1);
 }
 
-// Curvature "Fit": flatten the high-curvature points -- any point whose surface
-// variation exceeds the threshold is projected onto its local PCA plane. The
-// SIGN doesn't matter for the projection (spikes and pits both land on the
-// plane); low-curvature points stay put, so smooth regions are untouched.
-// Undoable via the host's Fit apply, like PFOR's.
+// Curvature "Fit": flatten the high-curvature points -- any point whose
+// curvature magnitude exceeds the threshold is projected onto its local PCA
+// plane (spikes and pits both; the sign doesn't matter for the projection).
+// The threshold is RELATIVE to the same 95th-percentile range the mode's
+// colors saturate at, so what looks strongly red/blue is what moves: 1.0 =
+// only fully saturated points, 0.5 (default) = anything past half range.
+// An absolute surface-variation cutoff would shift meaning with K (a large
+// neighbourhood dilutes the variation) -- relative stays intuitive at any K.
 void curvatureFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
                   const ProgressFn& progress) {
     const auto& pts = in.points;
@@ -776,21 +1217,32 @@ void curvatureFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
     geometry::SparseGrid grid;
     Eigen::Vector3f mn, mx;
     buildGrid(pts, grid, mn, mx);
-    const int   k      = (int)std::lround(P(in, 0, 16.0f));
-    const float thresh = P(in, 1, 0.08f);
+    const int   k   = (int)std::lround(P(in, 0, 16.0f));
+    const float rel = P(in, 1, 0.5f);
 
-    parallelFor(pts.size(), progress, 0.0f, 1.0f, [&](size_t i) {
+    // Pass 1: curvature magnitude + the plane projection candidate per point.
+    std::vector<float>           curv(pts.size(), 0.0f);
+    std::vector<Eigen::Vector3f> proj = pts;
+    parallelFor(pts.size(), progress, 0.0f, 0.95f, [&](size_t i) {
         thread_local std::vector<unsigned int> nbr;
         thread_local std::vector<float> dist;
         Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
         grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
         if (!neighbourhoodPCA(pts, nbr, c, eval, evec)) return;
         float s = eval.x() + eval.y() + eval.z();
-        float m = s > 1e-12f ? eval.x() / s : 0.0f;
-        if (m <= thresh) return;
+        curv[i] = s > 1e-12f ? eval.x() / s : 0.0f;
         Eigen::Vector3f n = evec.col(0);
-        fitted[i] = pts[i] - n * (pts[i] - c).dot(n);  // project onto the local plane
+        proj[i] = pts[i] - n * (pts[i] - c).dot(n);
     });
+
+    // Pass 2: threshold against the color range (95th percentile of magnitude).
+    std::vector<float> mag = curv;
+    size_t p95 = std::min(mag.size() - 1, (size_t)((double)mag.size() * 0.95));
+    std::nth_element(mag.begin(), mag.begin() + p95, mag.end());
+    const float thr = rel * std::max(mag[p95], 1e-9f);
+    for (size_t i = 0; i < pts.size(); ++i)
+        if (curv[i] > thr) fitted[i] = proj[i];
+    report(progress, 1.0f);
 }
 
 // --- Analyze: Normal deviation -----------------------------------------------
@@ -906,6 +1358,9 @@ void rorPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const Progr
 void pforPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
     pointsFromKeepColors(pforColors, in, o, p);
 }
+void qforPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    pointsFromKeepColors(qforColors, in, o, p);
+}
 void morphologyPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
     pointsFromKeepColors(morphologyColors, in, o, p);
 }
@@ -933,6 +1388,9 @@ struct ModeEntry {
     ModeParam    params[4] = {};
     FitFn        fitFn     = nullptr;  // optional "Fit" action (dialog button)
     PointsFn     pointsFn  = nullptr;  // optional points->points pipeline stage
+    // Draw mode whose triangle result can be APPLIED as a real mesh entity
+    // (dialog Fit button; the host spawns the cached triangles). Reconstruct.
+    bool         meshApply = false;
 };
 const ModeParam kBumpParams[4] = {
     {"Fit Radius %", 1.0f, 8.0f, 3.0f, false},
@@ -942,19 +1400,21 @@ const ModeParam kBumpParams[4] = {
 };
 const ModeEntry kModes[] = {
     {"Reconstruct", runReconstruct, ModeCategory::Generate, ApplyKind::Draw, nullptr, 1,
-     {{"Voxel %", 0.5f, 10.0f, 3.0f, false}}},
+     {{"Voxel %", 0.5f, 10.0f, 3.0f, false}}, nullptr, nullptr, /*meshApply=*/true},
     {"SDF Filter", runSdfFilter, ModeCategory::Generate, ApplyKind::Draw, nullptr, 1,
-     {{"Blur Iters", 0.0f, 5.0f, 2.0f, true}}},
+     {{"Blur Iters", 0.0f, 5.0f, 2.0f, true}}, sdfFitPoints, sdfFitPoints},
     {"Clustering", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, clusteringColors, 1,
      {{"Radius %", 0.5f, 10.0f, 2.0f, false}}},
     {"Curvature", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, curvatureColors, 2,
      {{"K Neighbors", 6.0f, 64.0f, 16.0f, true},
-      {"Fit Thresh", 0.01f, 0.30f, 0.08f, false, 0.005f}},
+      {"Fit Thresh", 0.05f, 2.0f, 0.5f, false, 0.05f}},
      curvatureFit},
     {"Normal Deviation", nullptr, ModeCategory::Analyze, ApplyKind::Recolor,
      normalDeviationColors, 1, {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}}},
     {"Density (KDE)", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, kdeColors, 1,
      {{"Bandwidth %", 0.5f, 10.0f, 3.0f, false}}},
+    {"Surface Dev (MLS)", nullptr, ModeCategory::Analyze, ApplyKind::Recolor,
+     mlsDeviationColors, 1, {{"Radius %", 0.5f, 10.0f, 2.0f, false}}, mlsFit, mlsFit},
     {"Outlier: SOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, sorColors, 2,
      {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}, {"Alpha", 0.25f, 4.0f, 1.0f, false}},
      nullptr, sorPoints},
@@ -965,9 +1425,20 @@ const ModeEntry kModes[] = {
      {{"K Neighbors", 4.0f, 256.0f, 16.0f, true},
       {"Beta", 0.0f, 0.1f, 0.05f, false, 0.001f}},
      pforFit, pforPoints},
+    {"Outlier: QFOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, qforColors, 2,
+     {{"K Neighbors", 10.0f, 256.0f, 24.0f, true},
+      {"Alpha", 1.0f, 10.0f, 3.0f, false, 0.25f}},
+     qforFit, qforPoints},
     {"Morphology", nullptr, ModeCategory::Filter, ApplyKind::Recolor, morphologyColors, 2,
      {{"Voxel %", 1.0f, 10.0f, 4.0f, false}, {"Erode Iters", 1.0f, 4.0f, 2.0f, true}},
      nullptr, morphologyPoints},
+    {"Protrusion (MLS+PFOR)", nullptr, ModeCategory::Filter, ApplyKind::Recolor,
+     protrusionColors, 4,
+     {{"Radius %", 0.5f, 10.0f, 2.0f, false},
+      {"Sig Thresh", 0.3f, 5.0f, 1.0f, false, 0.1f},
+      {"K Neighbors", 4.0f, 64.0f, 16.0f, true},
+      {"Beta", 0.0f, 0.1f, 0.05f, false, 0.001f}},
+     protrusionFit, protrusionFit},
     {"Bump: Detect", nullptr, ModeCategory::Filter, ApplyKind::Recolor, bumpDetectColors, 4,
      {kBumpParams[0], kBumpParams[1], kBumpParams[2], kBumpParams[3]}},
     {"Bump: Remove", nullptr, ModeCategory::Filter, ApplyKind::Remove, bumpDetectColors, 4,
@@ -1061,6 +1532,11 @@ void runModeMask(int index, const ModeInput& in, std::vector<uint8_t>& mask,
 bool modeCanFit(int index) {
     if (index < 0 || index >= kModeCount) return false;
     return kModes[index].fitFn != nullptr;
+}
+
+bool modeAppliesMesh(int index) {
+    if (index < 0 || index >= kModeCount) return false;
+    return kModes[index].meshApply;
 }
 
 bool modeCanTransformPoints(int index) {
