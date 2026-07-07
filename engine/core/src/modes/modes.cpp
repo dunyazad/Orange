@@ -592,7 +592,11 @@ std::vector<float> qforResiduals(const ModeInput& in, std::vector<Eigen::Vector3
         thread_local std::vector<float> dist;
         Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
         grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
-        if (nbr.size() < 10) return;  // 6 unknowns: need headroom over the minimum
+        // Sparse fringe: fewer than half the requested neighbours found -> the
+        // reference surface would be under-sampled, skip (point stays an
+        // inlier). Absolute floor of 9 keeps the 6-unknown fit overdetermined
+        // even at small K.
+        if ((int)nbr.size() - 1 < std::max(9, k / 2)) return;
         oth.assign(nbr.begin() + 1, nbr.end());  // [0] is the query point itself
         if (!neighbourhoodPCA(pts, oth, c, eval, evec)) return;
         const Eigen::Vector3f n  = evec.col(0);
