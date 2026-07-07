@@ -198,6 +198,32 @@ static void test_modes() {
     CHECK(progressInRange);       // always within [0,1]
 }
 
+// --- Normal Divergence: sphere normals fan out => positive (warm) everywhere --
+static void test_normal_divergence() {
+    std::printf("[normal divergence]\n");
+    const int idx = orange::modes::modeIndexByName("Normal Divergence");
+    CHECK(idx >= 0);
+
+    orange::modes::ModeInput in;
+    for (int a = 0; a < 24; ++a)
+        for (int b = 1; b < 12; ++b) {  // poles excluded (duplicate points)
+            float phi = 2.0f * 3.14159265f * a / 24.0f, th = 3.14159265f * b / 12.0f;
+            Eigen::Vector3f n(std::sin(th) * std::cos(phi), std::cos(th),
+                              std::sin(th) * std::sin(phi));
+            in.points.push_back(n);   // unit sphere: position == outward normal
+            in.normals.push_back(n);
+        }
+    std::vector<Eigen::Vector3f> colors;
+    orange::debug::DebugDraw extras;
+    orange::modes::runModeColors(idx, in, colors, extras);
+    CHECK(colors.size() == in.points.size());
+    // Diverging map: warm (R > B) = positive divergence. A sphere is convex
+    // everywhere, so the overwhelming majority must land on the warm side.
+    int warm = 0;
+    for (const auto& c : colors) warm += c.x() > c.z();
+    CHECK(warm > (int)colors.size() * 9 / 10);
+}
+
 // --- QFOR: quadric-fit outlier filter ----------------------------------------
 // A curved (paraboloid) surface with a deterministic ripple and a few injected
 // spikes. The quadric fit must absorb the smooth curvature (curved inliers stay
@@ -420,6 +446,7 @@ int main() {
     test_color();
     test_sparse_grid();
     test_modes();
+    test_normal_divergence();
     test_qfor();
     test_processing();
     test_ui_layout();

@@ -1282,6 +1282,63 @@ void normalDeviationColors(const ModeInput& in, std::vector<Eigen::Vector3f>& co
     scalarToColors(devv, colors);
 }
 
+// --- Analyze: Normal divergence ------------------------------------------------
+// SIGNED divergence of the normal vector field, estimated per point as the
+// average radial rate of change of the normal toward its neighbours:
+//   div ~ mean_j [ (n_j - n_i) . (p_j - p_i) / |p_j - p_i|^2 ]
+// Where normals fan OUT (a bump apex, spike tip, convex ridge) the divergence
+// is positive -> warm; where they fan IN (pits, grooves, concave fillets) it is
+// negative -> cool; parallel normals (flat / cylinder axis direction) ~ 0 ->
+// green. Complements Curvature (magnitude-based surface variation) with a
+// field-based view that highlights sources/sinks of the normal field. Sign
+// consistency: a neighbour whose normal points against ours (orientation flip
+// in the input) is negated before differencing.
+void normalDivergenceColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                            debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
+    const auto& pts = in.points;
+    if (pts.size() < 8) return;
+    const int k = (int)std::lround(P(in, 0, 16.0f));
+    const std::vector<Eigen::Vector3f> nrm =
+        in.normals.size() == pts.size()
+            ? in.normals
+            : geometry::estimateNormals(pts, k, [&](float f) { report(progress, f * 0.5f); });
+
+    geometry::SparseGrid grid;
+    Eigen::Vector3f mn, mx;
+    buildGrid(pts, grid, mn, mx);
+
+    std::vector<float> divg(pts.size(), 0.0f);
+    parallelFor(pts.size(), progress, in.normals.size() == pts.size() ? 0.0f : 0.5f, 1.0f,
+                [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
+        grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
+        float s = 0.0f; int n = 0;
+        for (size_t t = 1; t < nbr.size(); ++t) {  // [0] is the point itself
+            Eigen::Vector3f d = pts[nbr[t]] - pts[i];
+            float d2 = d.squaredNorm();
+            if (d2 < 1e-20f) continue;
+            Eigen::Vector3f nj = nrm[nbr[t]];
+            if (nj.dot(nrm[i]) < 0.0f) nj = -nj;  // orientation-flip guard
+            s += (nj - nrm[i]).dot(d) / d2;
+            ++n;
+        }
+        divg[i] = n ? s / (float)n : 0.0f;
+    });
+
+    // Diverging colors symmetric around 0 (95th pct of |div| as the range):
+    // blue = converging normals (pits), green = parallel, red = diverging.
+    std::vector<float> mag(divg.size());
+    for (size_t i = 0; i < divg.size(); ++i) mag[i] = std::fabs(divg[i]);
+    size_t p95 = std::min(mag.size() - 1, (size_t)((double)mag.size() * 0.95));
+    std::nth_element(mag.begin(), mag.begin() + p95, mag.end());
+    float range = std::max(mag[p95], 1e-9f);
+    colors.resize(divg.size());
+    for (size_t i = 0; i < divg.size(); ++i)
+        colors[i] = geometry::compareBandColor(divg[i], range, /*isSigned=*/true, /*bands=*/1);
+}
+
 // --- Transform: Edge-preserving smoothing ------------------------------------
 // CPU reimplementation of Helium's GPU edge-preserving smoothing (it had no CPU
 // path). Bilateral Laplacian via point_ops::smoothPoints; draws the smoothed
@@ -1415,6 +1472,8 @@ const ModeEntry kModes[] = {
      curvatureFit},
     {"Normal Deviation", nullptr, ModeCategory::Analyze, ApplyKind::Recolor,
      normalDeviationColors, 1, {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}}},
+    {"Normal Divergence", nullptr, ModeCategory::Analyze, ApplyKind::Recolor,
+     normalDivergenceColors, 1, {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}}},
     {"Density (KDE)", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, kdeColors, 1,
      {{"Bandwidth %", 0.5f, 10.0f, 3.0f, false}}},
     {"Surface Dev (MLS)", nullptr, ModeCategory::Analyze, ApplyKind::Recolor,
