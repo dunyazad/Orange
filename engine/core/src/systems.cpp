@@ -2550,7 +2550,7 @@ void cameraManipulatorSystem(entt::registry& world, const core::Input& input,
         // target+distance based.
         if (m.targetAnimating) {
             m.targetAnimTime += dt;
-            float tt = m.animDuration > 0.0f ? m.targetAnimTime / m.animDuration : 1.0f;
+            float tt = m.targetAnimDuration > 0.0f ? m.targetAnimTime / m.targetAnimDuration : 1.0f;
             if (tt >= 1.0f) { tt = 1.0f; m.targetAnimating = false; }
             float e = tt * tt * (3.0f - 2.0f * tt);  // smoothstep ease
             m.target   = m.targetFrom + (m.targetTo - m.targetFrom) * e;
@@ -2694,6 +2694,9 @@ std::vector<Menu> defaultAppMenus() {
     std::vector<Menu> menus;
     menus.push_back({"File", {
         act("Open...",    A::OpenFile, "Ctrl+O"),
+        act("Save",       A::SaveFile, "Ctrl+S"),
+        act("Save As...", A::SaveFileAs, "Ctrl+Shift+S"),
+        sep(),
         act("Screenshot", A::Screenshot, "C"),
         sep(),
         act("Quit",       A::Quit, "Esc"),
@@ -4365,6 +4368,11 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
     // grid and overlays stay filled.)
     const uint32_t kSolid = static_cast<uint32_t>(core::DrawMode::Solid);
 
+    // Master lighting switch (` / Render menu); per drawable a point cloud is
+    // always unlit (flat vertex color), a triangle mesh lit while enabled.
+    const auto* ls  = world.ctx().find<LightingState>();
+    const bool  lit = !ls || ls->enabled;
+
     auto drawables = world.view<Transform, Renderable>();
     for (auto entity : drawables) {
         const auto& t = drawables.get<Transform>(entity);
@@ -4379,11 +4387,13 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         // 1) Visible pass, in this mesh's own drawing + coloring mode.
         renderer.setDrawMode(static_cast<uint32_t>(r.drawMode));
         renderer.setColorMode(r.colorMode);
+        renderer.setLighting(lit && !r.pointCloud);
         render::DrawItem item;
         item.mesh = r.mesh;
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);
-        renderer.setColorMode(0);  // selection silhouette/box stays its own color
+        renderer.setColorMode(0);   // selection silhouette/box stays its own color
+        renderer.setLighting(false);  // ...and unshaded (flat orange outline)
 
         if (r.selected && r.pointCloud) {
             // A point cloud has no solid surface for a stencil silhouette, so mark

@@ -2,7 +2,11 @@
 
 #include <SDL3/SDL.h>
 
+#include <array>
 #include <cfloat>
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
 #include <vector>
 
 #include "orange/core/draw_mode.h"
@@ -49,10 +53,82 @@ void pushRenderableChangeOp(entt::registry& world, std::vector<ModeChange> chang
     ecs::undoStack(world).push(std::move(op));
 }
 
+// Last-edited slider values per mode (registry ctx). Switching modes used to
+// reload that mode's defaults; with this, coming back to a mode restores what
+// the user last set. Persisted across runs in a text file next to the exe.
+struct ModeParamMemory {
+    std::unordered_map<int, std::array<float, 8>> values;
+};
+
+// One line per mode: "<mode name>\tv0 v1 ... v7". Keyed by NAME, not index, so
+// reordering/adding modes in modes.cpp doesn't misapply saved values.
+std::string modeParamFilePath() {
+    const char* base = SDL_GetBasePath();  // owned by SDL, do not free
+    return (base ? std::string(base) : std::string()) + "orange_mode_params.txt";
+}
+
+void loadModeParamMemory(ModeParamMemory& mem) {
+    std::ifstream f(modeParamFilePath());
+    if (!f) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        auto tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        const std::string name = line.substr(0, tab);
+        int idx = -1;
+        for (int i = 0; i < modes::modeCount(); ++i)
+            if (name == modes::modeName(i)) { idx = i; break; }
+        if (idx < 0) continue;  // mode no longer exists
+        std::array<float, 8> vals{};
+        std::istringstream ss(line.substr(tab + 1));
+        int k = 0;
+        for (float x; k < 8 && (ss >> x); ++k) vals[k] = x;
+        if (k > 0) mem.values[idx] = vals;
+    }
+}
+
+void saveModeParamMemory(const ModeParamMemory& mem) {
+    if (mem.values.empty()) return;
+    std::ofstream f(modeParamFilePath(), std::ios::trunc);
+    if (!f) return;
+    for (const auto& [idx, vals] : mem.values) {
+        if (idx < 0 || idx >= modes::modeCount()) continue;
+        f << modes::modeName(idx) << '\t';
+        for (int i = 0; i < 8; ++i) f << vals[i] << (i + 1 < 8 ? ' ' : '\n');
+    }
+}
+
+// ctx accessor; loads the file once, the first time the memory is needed.
+ModeParamMemory& modeParamMemory(entt::registry& world) {
+    auto& ctx = world.ctx();
+    if (!ctx.contains<ModeParamMemory>()) loadModeParamMemory(ctx.emplace<ModeParamMemory>());
+    return ctx.get<ModeParamMemory>();
+}
+
+// Stash the dialog's current values under its mode. Skipped while it edits a
+// pipeline node -- those values belong to the node, not the mode.
+void captureModeParams(entt::registry& world, ModeParamMemory& mem) {
+    auto v = world.view<ecs::ModeParamsDialog>();
+    for (auto e : v) {
+        auto& d = v.get<ecs::ModeParamsDialog>(e);
+        if (d.modeIndex >= 0 && d.pipeNodeId < 0) {
+            auto& slot = mem.values[d.modeIndex];
+            for (int i = 0; i < 8; ++i) slot[i] = d.values[i];
+        }
+        break;
+    }
+}
+
 // Show/refresh the mode-parameters dialog for the newly activated mode (or hide
-// it when the mode is off / has no parameters). Switching modes reloads that
-// mode's defaults; re-activating the same mode keeps the edited values.
+// it when the mode is off / has no parameters). A mode's edited values are
+// remembered in ModeParamMemory (and on disk), so switching modes (or a
+// pipeline-node detach) restores the last-used values; defaults only apply the
+// first time a mode is ever opened.
 void syncModeParamsDialog(entt::registry& world, int modeIndex) {
+    auto& mem = modeParamMemory(world);
+    captureModeParams(world, mem);  // remember the outgoing mode's edits
+    saveModeParamMemory(mem);       // tiny file; write-through on every switch
+
     auto v = world.view<ecs::ModeParamsDialog>();
     for (auto e : v) {
         auto& d = v.get<ecs::ModeParamsDialog>(e);
@@ -63,7 +139,10 @@ void syncModeParamsDialog(entt::registry& world, int modeIndex) {
         }
         if (d.modeIndex != modeIndex || d.pipeNodeId >= 0) {
             d.modeIndex = modeIndex;
-            for (int i = 0; i < n && i < 8; ++i) d.values[i] = modes::modeParam(modeIndex, i).defV;
+            auto it = mem.values.find(modeIndex);
+            for (int i = 0; i < n && i < 8; ++i)
+                d.values[i] = (it != mem.values.end()) ? it->second[i]
+                                                       : modes::modeParam(modeIndex, i).defV;
         }
         d.pipeNodeId = -1;  // regular mode editing detaches any pipeline-node binding
         d.h       = 42 + n * 36 + 46 + (modes::modeCanFit(modeIndex) ? 36 : 0);
@@ -211,6 +290,16 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                         auto mv = world_.view<ecs::MenuBar>();
                         for (auto ent : mv) { mv.get<ecs::MenuBar>(ent).requestOpenFile = true; break; }
                     }
+                    if (e.key.scancode == SDL_SCANCODE_S && (e.key.mod & SDL_KMOD_CTRL)) {
+                        // Ctrl+S saves to the source path; Ctrl+Shift+S always asks.
+                        auto mv = world_.view<ecs::MenuBar>();
+                        for (auto ent : mv) {
+                            auto& mb = mv.get<ecs::MenuBar>(ent);
+                            if (e.key.mod & SDL_KMOD_SHIFT) mb.requestSaveFileAs = true;
+                            else                            mb.requestSaveFile   = true;
+                            break;
+                        }
+                    }
                     if (e.key.scancode == SDL_SCANCODE_A && (e.key.mod & SDL_KMOD_CTRL)) {
                         // Ctrl+A: select every Renderable that is visible on screen.
                         auto v = world_.view<ecs::Renderable>();
@@ -274,9 +363,12 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                             static const char* kColorNames[4] = {"default", "height",
                                                                  "position", "grayscale"};
                             SDL_Log("Application: color mode = %s", kColorNames[next]);
-                        } else {                           // ` toggles point-sprite lighting
+                        } else {                           // ` toggles mesh lighting
                             lighting_ = !lighting_;
-                            plugin_->renderer()->setLighting(lighting_);
+                            auto& ctx = world_.ctx();
+                            if (!ctx.contains<ecs::LightingState>())
+                                ctx.emplace<ecs::LightingState>();
+                            ctx.get<ecs::LightingState>().enabled = lighting_;
                             SDL_Log("Application: lighting = %s", lighting_ ? "on" : "off");
                         }
                     }
@@ -423,7 +515,25 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                     auto& ctx = world_.ctx();
                     if (md.pipeNodeId < 0 && ctx.contains<modes::ModeState>()) {
                         auto& ms = ctx.get<modes::ModeState>();
-                        if (ms.index == md.modeIndex) ms.generation++;
+                        if (ms.index == md.modeIndex) {
+                            ms.generation++;
+                        } else if (ms.index < 0) {
+                            // A Fit/Remove result deactivated the mode (so the
+                            // edited cloud isn't instantly reprocessed) but the
+                            // dialog is still up: Apply reactivates + re-runs.
+                            ms.index = md.modeIndex;
+                            ms.generation++;
+                        }
+                    }
+                }
+                // Same deactivated-after-Fit case for the Fit button: reactivate
+                // so processingModeSystem sees + consumes the pending requestFit
+                // this frame (it ignores the flag while the mode is off).
+                if (md.requestFit && md.pipeNodeId < 0) {
+                    auto& ctx = world_.ctx();
+                    if (ctx.contains<modes::ModeState>()) {
+                        auto& ms = ctx.get<modes::ModeState>();
+                        if (ms.index < 0) ms.index = md.modeIndex;
                     }
                 }
                 break;
@@ -443,6 +553,14 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
             capture_ = false;
             saveScreenshot(*plugin_->renderer(), executableDir() + "orange_capture.png");
         }
+    }
+
+    // Persist the mode-parameter values across runs: capture any slider edits
+    // made since the last mode switch, then write the file.
+    {
+        auto& mem = modeParamMemory(world_);
+        captureModeParams(world_, mem);
+        saveModeParamMemory(mem);
     }
 }
 
@@ -636,6 +754,16 @@ void Application::applyMenuAction(int action) {
             for (auto e : mv) { mv.get<ecs::MenuBar>(e).requestOpenFile = true; break; }
             break;
         }
+        case A::SaveFile: {
+            auto mv = world_.view<ecs::MenuBar>();
+            for (auto e : mv) { mv.get<ecs::MenuBar>(e).requestSaveFile = true; break; }
+            break;
+        }
+        case A::SaveFileAs: {
+            auto mv = world_.view<ecs::MenuBar>();
+            for (auto e : mv) { mv.get<ecs::MenuBar>(e).requestSaveFileAs = true; break; }
+            break;
+        }
         case A::Screenshot: capture_ = true; break;
         case A::Quit:       running_ = false; break;
 
@@ -677,7 +805,13 @@ void Application::applyMenuAction(int action) {
             }
             break;
         }
-        case A::ToggleLighting: lighting_ = !lighting_; if (r) r->setLighting(lighting_); break;
+        case A::ToggleLighting: {
+            lighting_ = !lighting_;
+            auto& ctx = world_.ctx();
+            if (!ctx.contains<ecs::LightingState>()) ctx.emplace<ecs::LightingState>();
+            ctx.get<ecs::LightingState>().enabled = lighting_;
+            break;
+        }
         case A::ToggleVsync:    vsync_ = !vsync_;       if (r) r->setVsync(vsync_);       break;
         case A::ToggleCrossSection: {
             auto v = world_.view<ecs::CrossSection>();

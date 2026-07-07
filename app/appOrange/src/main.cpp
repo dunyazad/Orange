@@ -285,6 +285,7 @@ struct LoadJob {
     std::string                 path;            // source file (for logging/status)
     std::vector<render::Vertex> verts;           // result (valid when done && ok)
     std::vector<uint32_t>       indices;
+    std::vector<meshio::V3>     normals;         // file's own normals (may be empty)
     bool                        active = false;  // main-thread only: a job exists
 
     ~LoadJob() { if (worker.joinable()) worker.join(); }
@@ -304,6 +305,38 @@ struct PoissonJob {
     bool                        active = false;
 
     ~PoissonJob() { if (worker.joinable()) worker.join(); }
+};
+
+// App-local component: the file a mesh entity was loaded from (or last saved
+// to). File > Save overwrites this path; absent (e.g. Create-menu primitives)
+// => Save falls back to the Save As dialog.
+struct SourcePath {
+    std::string path;
+};
+
+// App-local component: the source file's per-vertex normals (PLY). They don't
+// fit in render::Vertex, but Save writes them back out -- a normal-less cloud
+// renders dark/flat in lit external viewers. Dropped (skipped at save) if the
+// vertex count changed (e.g. outlier removal) since they'd be misaligned.
+struct SourceNormals {
+    std::vector<meshio::V3> normals;
+};
+
+// Background mesh save: same shape as LoadJob. The main thread snapshots the
+// entity's CPU geometry (VertexSource + PickGeometry, transform baked in), the
+// worker writes the file, the main thread stamps SourcePath on success.
+struct SaveJob {
+    std::thread                 worker;
+    std::atomic<bool>           done{false};
+    std::atomic<bool>           ok{false};
+    std::string                 path;
+    std::vector<render::Vertex> verts;    // snapshot: worker-owned while active
+    std::vector<uint32_t>       indices;
+    std::vector<meshio::V3>     normals;  // source normals to write back (may be empty)
+    entt::entity                target = entt::null;  // gets SourcePath on success
+    bool                        active = false;
+
+    ~SaveJob() { if (worker.joinable()) worker.join(); }
 };
 
 } // namespace
@@ -826,12 +859,34 @@ int main(int argc, char** argv) {
         {"All files", "*"},
     };
 
+    // A non-flag CLI argument is a mesh/point-cloud path: queue it like a normal
+    // File > Open pick (`appOrange <file> --shot` renders it headless).
+    for (int i = 1; i < argc; ++i) {
+        if (argv[i][0] == '-') continue;
+        std::lock_guard<std::mutex> lk(fileDrop.mtx);
+        fileDrop.paths.emplace_back(argv[i]);
+        break;
+    }
+
+    // File > Save / Save As. The save dialog reports into its own queue so a
+    // picked save path is never mistaken for a load. pendingSave remembers which
+    // entity the open dialog is for (validated again when the pick arrives).
+    FileDropResult saveDrop;
+    entt::entity   pendingSave = entt::null;
+    std::string    saveDefaultLoc;  // keeps the default-location string alive for SDL
+    static const SDL_DialogFileFilter kSaveFilters[] = {
+        {"PLY (binary)", "ply"},
+        {"OBJ", "obj"},
+        {"STL (binary)", "stl"},
+        {"XYZ points", "xyz"},
+    };
+
     // Takes the CPU mesh produced by the background loader, uploads GPU buffers
     // at its original coordinates, and spawns a
     // (Transform, Renderable) entity that renderSystem picks up. Runs on the main
     // (render) thread because GPU resource creation is context-affine.
     auto finalizeMesh = [&](const std::string& path, std::vector<render::Vertex>& mv,
-                            std::vector<uint32_t>& mi) {
+                            std::vector<uint32_t>& mi, std::vector<meshio::V3>* nrm = nullptr) {
         if (mv.empty()) {
             SDL_Log("Mesh: failed to load '%s'", path.c_str());
             return;
@@ -889,6 +944,9 @@ int main(int argc, char** argv) {
             vsrc.vertices = mv;
             world.emplace<ecs::VertexSource>(e, std::move(vsrc));
         }
+        world.emplace<SourcePath>(e, SourcePath{path});  // File > Save target
+        if (nrm && nrm->size() == mv.size())             // keep file normals for re-save
+            world.emplace<SourceNormals>(e, SourceNormals{std::move(*nrm)});
         ecs::pushSpawnOp(world, e, ("Load " + path).c_str());
 
         // Frame the camera on the just-loaded mesh: orbit pivot -> bounds center,
@@ -928,13 +986,55 @@ int main(int argc, char** argv) {
 
     LoadJob    loadJob;
     PoissonJob poissonJob;
+    SaveJob    saveJob;
     float      statusHold = 0.0f;  // seconds to keep the final "Loaded/Failed" message
+
+    // Snapshot the entity's current CPU geometry (transform baked in, so spawned
+    // primitives keep their placement) and write it on a worker thread.
+    auto startSave = [&](entt::entity tgt, const std::string& path) {
+        if (saveJob.active || !world.all_of<ecs::VertexSource>(tgt)) return;
+        saveJob.verts = world.get<ecs::VertexSource>(tgt).vertices;  // copy: worker owns it
+        saveJob.indices.clear();
+        if (world.all_of<ecs::PickGeometry>(tgt))
+            saveJob.indices = world.get<ecs::PickGeometry>(tgt).indices;
+        // Source-file normals, if still aligned with the (possibly edited) verts.
+        saveJob.normals.clear();
+        if (auto* sn = world.try_get<SourceNormals>(tgt))
+            if (sn->normals.size() == saveJob.verts.size()) saveJob.normals = sn->normals;
+        Eigen::Matrix4f M = Eigen::Matrix4f::Identity();
+        if (world.all_of<ecs::Transform>(tgt)) M = world.get<ecs::Transform>(tgt).matrix();
+        if (!M.isApprox(Eigen::Matrix4f::Identity())) {
+            for (auto& v : saveJob.verts) {
+                Eigen::Vector4f p =
+                    M * Eigen::Vector4f(v.position[0], v.position[1], v.position[2], 1.0f);
+                v.position[0] = p.x(); v.position[1] = p.y(); v.position[2] = p.z();
+            }
+            // Normals transform by the inverse-transpose (handles non-uniform scale).
+            Eigen::Matrix3f N = M.block<3, 3>(0, 0).inverse().transpose();
+            for (auto& n : saveJob.normals) {
+                Eigen::Vector3f r = (N * Eigen::Vector3f(n.x, n.y, n.z)).normalized();
+                n = {r.x(), r.y(), r.z()};
+            }
+        }
+        saveJob.path   = path;
+        saveJob.target = tgt;
+        saveJob.active = true;
+        saveJob.done.store(false);
+        saveJob.ok.store(false);
+        saveJob.worker = std::thread([job = &saveJob] {
+            job->ok.store(meshio::saveMeshFile(job->path, job->verts, job->indices,
+                                               job->normals.empty() ? nullptr : &job->normals));
+            job->done.store(true);  // publish last; main thread reaps + reports
+        });
+    };
 
     auto onUpdate = [&](entt::registry& w, float dt) {
         core::watchdogHeartbeat();  // tell the watchdog the main loop is alive
 
         // Headless screenshot mode: let the scene settle, capture, then exit.
-        if (shotMode && ++shotFrames == 30) {
+        // The frame counter pauses while a load is running so a CLI-given mesh
+        // is actually in the scene when the shot is taken.
+        if (shotMode && !loadJob.active && ++shotFrames == 30) {
             core::saveScreenshot(*app.renderer(), "auto_shot.png");
             std::exit(0);
         }
@@ -954,6 +1054,38 @@ int main(int argc, char** argv) {
             if (!fileDrop.busy.exchange(true)) {
                 SDL_ShowOpenFileDialog(onFilePicked, &fileDrop, app.window().handle(),
                                        kMeshFilters, 2, nullptr, /*allow_many=*/false);
+            }
+        }
+        // Save / Save As request (menu or Ctrl+S / Ctrl+Shift+S). Target: first
+        // selected entity with CPU geometry, else the scene's only such entity.
+        // Save overwrites the SourcePath; Save As (or no source path) asks.
+        if (mb && (mb->requestSaveFile || mb->requestSaveFileAs)) {
+            const bool saveAs   = mb->requestSaveFileAs;
+            mb->requestSaveFile = mb->requestSaveFileAs = false;
+            entt::entity tgt  = entt::null;
+            int          nSrc = 0;
+            auto sv = w.view<ecs::Renderable, ecs::VertexSource>();
+            for (auto e : sv) {
+                ++nSrc;
+                if (tgt == entt::null && sv.get<ecs::Renderable>(e).selected) tgt = e;
+            }
+            if (tgt == entt::null && nSrc == 1)
+                for (auto e : sv) tgt = e;
+            if (tgt == entt::null) {
+                mb->statusText = "Save: select a mesh first";
+                statusHold     = 2.0f;
+            } else if (!saveJob.active) {
+                auto* sp = w.try_get<SourcePath>(tgt);
+                if (!saveAs && sp) {
+                    startSave(tgt, sp->path);
+                } else if (!saveDrop.busy.exchange(true)) {
+                    pendingSave    = tgt;
+                    saveDefaultLoc = sp ? sp->path : std::string();
+                    SDL_ShowSaveFileDialog(onFilePicked, &saveDrop, app.window().handle(),
+                                           kSaveFilters, 4,
+                                           saveDefaultLoc.empty() ? nullptr
+                                                                  : saveDefaultLoc.c_str());
+                }
             }
         }
         // In-app confirm dialog answered? A Yes on the "load last mesh" prompt
@@ -990,17 +1122,24 @@ int main(int argc, char** argv) {
             loadJob.ok.store(false);
             loadJob.verts.clear();
             loadJob.indices.clear();
+            loadJob.normals.clear();
             // Parse the file off the main thread, reporting progress into `percent`.
             loadJob.worker = std::thread([job = &loadJob] {
                 std::vector<render::Vertex> v;
                 std::vector<uint32_t>       i;
+                std::vector<meshio::V3>     n;
                 bool ok = meshio::loadMeshFile(
                               job->path, v, i,
                               [job](float p) {
                                   job->percent.store(static_cast<int>(p * 100.0f + 0.5f));
-                              }) &&
+                              },
+                              &n) &&
                           !v.empty();
-                if (ok) { job->verts = std::move(v); job->indices = std::move(i); }
+                if (ok) {
+                    job->verts   = std::move(v);
+                    job->indices = std::move(i);
+                    job->normals = std::move(n);
+                }
                 job->percent.store(100);
                 job->ok.store(ok);
                 job->done.store(true);  // publish last; main thread now owns the result
@@ -1015,11 +1154,12 @@ int main(int argc, char** argv) {
                 loadJob.worker.join();
                 bool ok = loadJob.ok.load();
                 if (ok) {
-                    finalizeMesh(loadJob.path, loadJob.verts, loadJob.indices);
+                    finalizeMesh(loadJob.path, loadJob.verts, loadJob.indices, &loadJob.normals);
                     std::ofstream(lastMeshFile, std::ios::trunc) << loadJob.path;  // remember for next launch
                 }
                 loadJob.verts.clear();   loadJob.verts.shrink_to_fit();
                 loadJob.indices.clear(); loadJob.indices.shrink_to_fit();
+                loadJob.normals.clear(); loadJob.normals.shrink_to_fit();
                 loadJob.active = false;
                 statusHold     = ok ? 1.0f : 3.0f;  // linger on the final message
                 if (mb) mb->statusText = ok ? "Loaded 100%" : "Load failed";
@@ -1037,6 +1177,56 @@ int main(int argc, char** argv) {
                 if (mb) mb->statusText = name + " " + std::to_string((int)(pct * 100.0f + 0.5f)) + "%";
             } else if (mb && !mb->statusText.empty()) {
                 mb->statusText.clear();  // finished -> clear the line
+            }
+        }
+
+        // Drain a picked save path (the dialog callback runs on a platform
+        // thread) and start the write. Unknown extension -> default to .ply.
+        {
+            std::string savePath;
+            {
+                std::lock_guard<std::mutex> lk(saveDrop.mtx);
+                if (!saveDrop.paths.empty()) {
+                    savePath = saveDrop.paths.front();
+                    saveDrop.paths.clear();
+                }
+            }
+            if (!savePath.empty()) {
+                auto        sepDot = savePath.find_last_of("./\\");
+                std::string ext = (sepDot != std::string::npos && savePath[sepDot] == '.')
+                                      ? savePath.substr(sepDot + 1)
+                                      : std::string();
+                for (auto& c : ext) c = static_cast<char>(std::tolower(c));
+                if (ext != "ply" && ext != "obj" && ext != "stl" && ext != "xyz")
+                    savePath += ".ply";
+                // The entity may have been deleted while the dialog was up.
+                if (w.valid(pendingSave) && !saveJob.active) startSave(pendingSave, savePath);
+                pendingSave = entt::null;
+            }
+        }
+        // Drive status text + finish a completed save on the main thread.
+        if (saveJob.active) {
+            if (!saveJob.done.load()) {
+                if (mb) mb->statusText = "Saving...";
+            } else {
+                saveJob.worker.join();
+                const bool ok = saveJob.ok.load();
+                if (ok) {
+                    // Save As stamps the new path so a later plain Save reuses it.
+                    if (w.valid(saveJob.target))
+                        w.emplace_or_replace<SourcePath>(saveJob.target,
+                                                         SourcePath{saveJob.path});
+                    SDL_Log("Mesh: saved '%s' (%zu verts, %zu tris)", saveJob.path.c_str(),
+                            saveJob.verts.size(), saveJob.indices.size() / 3);
+                } else {
+                    SDL_Log("Mesh: save failed for '%s'", saveJob.path.c_str());
+                }
+                saveJob.verts.clear();   saveJob.verts.shrink_to_fit();
+                saveJob.indices.clear(); saveJob.indices.shrink_to_fit();
+                saveJob.normals.clear(); saveJob.normals.shrink_to_fit();
+                saveJob.active = false;
+                statusHold     = ok ? 1.5f : 3.0f;
+                if (mb) mb->statusText = ok ? "Saved" : "Save failed";
             }
         }
 

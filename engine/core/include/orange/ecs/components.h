@@ -154,11 +154,13 @@ struct CameraManipulator {
     // (target + offset) glides along with it. Independent of the orientation snap
     // above; cancelled by a manual pan/zoom. `distance` is eased from distFrom to
     // distTo over the same timeline (used by the R reset; held constant by the
-    // Ctrl+click recenter). Reuses animDuration for timing.
+    // Ctrl+click recenter). Timed by targetAnimDuration (separate from the gizmo
+    // snap's animDuration).
     bool       targetAnimating = false;
     Eigen::Vector3f targetFrom = Eigen::Vector3f::Zero();
     Eigen::Vector3f targetTo   = Eigen::Vector3f::Zero();
     float      targetAnimTime  = 0.0f;
+    float      targetAnimDuration = 0.25f;
     float      distFrom = 6.0f, distTo = 6.0f;  // distance eased alongside target
 
     // Home pose restored by the R key (set when the camera is created). The reset
@@ -553,6 +555,14 @@ struct GridState {
     bool visible = true;
 };
 
+// Registry-context singleton: the master lighting switch (` / Render menu).
+// renderSystem pushes it per drawable as `enabled && !pointCloud` -- point
+// clouds always render unlit (flat vertex color), triangle meshes lit while
+// enabled. Absent context => enabled.
+struct LightingState {
+    bool enabled = true;
+};
+
 // Current point-sprite size in pixels (mirrors Application::pointSize_, set each
 // frame). renderSystem reads it so vertex-selection markers match the on-screen
 // size of the point sprites. Absent => default.
@@ -637,6 +647,9 @@ enum class MenuAction : int {
     PipelineSegment3D,             // stage 5: direct 3D per-tooth segmentation (colours the mesh)
     Undo, Redo,                    // Edit menu / Ctrl+Z / Ctrl+Y (ecs::undoStack)
     PipelineDialogToggle,          // open/close the modeless Pipeline Design dialog
+    // File > Save / Save As. Like OpenFile, these only raise MenuBar request
+    // flags; the app owns the native dialog and the actual write.
+    SaveFile, SaveFileAs,
 };
 
 // One row in a dropdown. kind: Action = clickable command; Check = command that
@@ -681,6 +694,12 @@ struct MenuBar {
     // Raised when MenuAction::OpenFile is dispatched; the app clears it once it
     // has shown the native dialog (one-shot edge flag).
     bool requestOpenFile = false;
+
+    // Raised by MenuAction::SaveFile / SaveFileAs (and Ctrl+S / Ctrl+Shift+S);
+    // the app clears them after handling (one-shot edge flags, same pattern as
+    // requestOpenFile).
+    bool requestSaveFile   = false;
+    bool requestSaveFileAs = false;
 
     // Right-aligned status text drawn in the bar (e.g. "Loading 42%"). The app
     // sets it while a background load runs and clears it when finished. Empty =

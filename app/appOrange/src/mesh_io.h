@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "orange/core/serialization.h"  // orange::io writers (PLY/OBJ/STL/XYZ)
 #include "orange/render/types.h"
 
 namespace orange::meshio {
@@ -60,8 +61,13 @@ struct Throttle {
     }
 };
 
+// `col` (optional) holds per-vertex file colors; an entry with x < 0 means "no
+// color there" and falls back to the normal-derived shading. Passing real colors
+// through matters for save/load roundtrips: a colored mesh (e.g. a Poisson
+// reconstruction) must come back with its colors, not repainted pastel.
 inline bool buildIndexed(const std::vector<V3>& pos, std::vector<uint32_t>& tris,
-                         std::vector<render::Vertex>& outV, std::vector<uint32_t>& outI) {
+                         std::vector<render::Vertex>& outV, std::vector<uint32_t>& outI,
+                         const std::vector<V3>* col = nullptr) {
     if (pos.empty() || tris.empty()) return false;
     std::vector<V3> nrm(pos.size(), V3{0, 0, 0});
     for (size_t t = 0; t + 2 < tris.size(); t += 3) {
@@ -71,7 +77,14 @@ inline bool buildIndexed(const std::vector<V3>& pos, std::vector<uint32_t>& tris
         for (uint32_t i : {a, b, c}) { nrm[i].x += fn.x; nrm[i].y += fn.y; nrm[i].z += fn.z; }
     }
     outV.resize(pos.size());
-    for (size_t i = 0; i < pos.size(); ++i) outV[i] = vert(pos[i], normOrUp(nrm[i]));
+    for (size_t i = 0; i < pos.size(); ++i) {
+        if (col && i < col->size() && (*col)[i].x >= 0.0f) {
+            const V3& c = (*col)[i];
+            outV[i] = {{pos[i].x, pos[i].y, pos[i].z}, {c.x, c.y, c.z}};
+        } else {
+            outV[i] = vert(pos[i], normOrUp(nrm[i]));
+        }
+    }
     outI = std::move(tris);
     return true;
 }
@@ -90,6 +103,7 @@ inline bool loadObj(const char* path, std::vector<render::Vertex>& outV,
     Throttle report(progress);
 
     std::vector<V3>       pos;
+    std::vector<V3>       col;  // optional per-vertex color ({-1,..} = none)
     std::vector<uint32_t> tris;
     std::string           line;
     std::streamoff        read = 0;
@@ -103,8 +117,19 @@ inline bool loadObj(const char* path, std::vector<render::Vertex>& outV,
             V3          p{};
             p.x = std::strtof(s, &e); if (e == s) continue; s = e;
             p.y = std::strtof(s, &e); if (e == s) continue; s = e;
-            p.z = std::strtof(s, &e); if (e == s) continue;
+            p.z = std::strtof(s, &e); if (e == s) continue; s = e;
             pos.push_back(p);
+            // Extended "v x y z r g b" line (our own writer + MeshLab emit it).
+            V3 c{-1, -1, -1};
+            c.x = std::strtof(s, &e);
+            if (e != s) {
+                s   = e;
+                c.y = std::strtof(s, &e); if (e == s) c = {-1, -1, -1};
+                else { s = e; c.z = std::strtof(s, &e); if (e == s) c = {-1, -1, -1}; }
+            } else {
+                c = {-1, -1, -1};
+            }
+            col.push_back(c);
         } else if (line[0] == 'f' && line[1] == ' ') {
             std::vector<int> idx;
             const char*      p = line.c_str() + 1;
@@ -123,7 +148,7 @@ inline bool loadObj(const char* path, std::vector<render::Vertex>& outV,
             }
         }
     }
-    bool ok = buildIndexed(pos, tris, outV, outI);
+    bool ok = buildIndexed(pos, tris, outV, outI, &col);  // keep file vertex colors
     if (progress) progress(1.0f);
     return ok;
 }
@@ -209,9 +234,13 @@ inline bool loadStl(const char* path, std::vector<render::Vertex>& outV,
 // --- PLY -------------------------------------------------------------------
 // Reads vertex x/y/z and face index lists (fan-triangulated); other vertex
 // properties are skipped. Supports ASCII and binary_little_endian. Normals are
-// computed (area-weighted), matching the other loaders.
+// computed (area-weighted), matching the other loaders. `outN` (optional)
+// receives the FILE's per-vertex normals when it has them (else left empty) --
+// they don't fit in render::Vertex, but saving wants them back (a normal-less
+// PLY renders dark/flat in lit external viewers).
 inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
-                    std::vector<uint32_t>& outI, const ProgressFn& progress = {}) {
+                    std::vector<uint32_t>& outI, const ProgressFn& progress = {},
+                    std::vector<V3>* outN = nullptr) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
     Throttle report(progress);
@@ -368,6 +397,9 @@ inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
         }
     }
 
+    // Hand the file's own normals back to the caller (for re-saving).
+    if (outN && inx >= 0 && iny >= 0 && inz >= 0) *outN = nrm;
+
     // No faces -> a point cloud: emit one (non-indexed) vertex per point, colored
     // by its PLY color if present, else by its normal. spawnMesh draws it as points.
     if (!haveFace || faceCount == 0) {
@@ -407,7 +439,7 @@ inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
             }
         }
     }
-    bool ok = buildIndexed(pos, tris, outV, outI);
+    bool ok = buildIndexed(pos, tris, outV, outI, &col);  // keep file vertex colors
     if (progress) progress(1.0f);
     return ok;
 }
@@ -416,8 +448,11 @@ inline bool loadPly(const char* path, std::vector<render::Vertex>& outV,
 // unknown extension or a parse failure. `progress` (optional) is called with a
 // fraction in [0,1] as the load proceeds -- safe to drive a background-thread
 // atomic that the UI samples.
+// `outNormals` (optional): filled with the file's per-vertex normals when the
+// format carries them (currently PLY); empty otherwise.
 inline bool loadMeshFile(const std::string& path, std::vector<render::Vertex>& outV,
-                         std::vector<uint32_t>& outI, const ProgressFn& progress = {}) {
+                         std::vector<uint32_t>& outI, const ProgressFn& progress = {},
+                         std::vector<V3>* outNormals = nullptr) {
     std::string ext;
     auto        dot = path.find_last_of('.');
     if (dot != std::string::npos)
@@ -425,7 +460,99 @@ inline bool loadMeshFile(const std::string& path, std::vector<render::Vertex>& o
             ext.push_back(static_cast<char>(std::tolower(path[i])));
     if (ext == "obj") return loadObj(path.c_str(), outV, outI, progress);
     if (ext == "stl") return loadStl(path.c_str(), outV, outI, progress);
-    if (ext == "ply") return loadPly(path.c_str(), outV, outI, progress);
+    if (ext == "ply") return loadPly(path.c_str(), outV, outI, progress, outNormals);
+    return false;
+}
+
+// --- Saving ------------------------------------------------------------------
+// Writes vertices (+ optional triangle indices) via the orange::io serializers,
+// dispatching on the extension: .ply (binary, with per-vertex color + normal),
+// .obj (color as extended `v` line, `vn` normals), .stl (binary triangle soup;
+// needs indices), .xyz (positions only). Point clouds (empty `indices`) work
+// for PLY/OBJ/XYZ. `normals` (optional) is written per vertex when its size
+// matches; an indexed mesh without one gets area-weighted normals computed here
+// -- normal-less files render dark/flat in lit external viewers. Returns false
+// on an unknown extension or a format/geometry mismatch. Pure CPU + file work,
+// safe to call from a background thread.
+inline bool saveMeshFile(const std::string& path, const std::vector<render::Vertex>& verts,
+                         const std::vector<uint32_t>& indices,
+                         const std::vector<V3>* normals = nullptr) {
+    if (verts.empty()) return false;
+    std::string ext;
+    auto        dot = path.find_last_of('.');
+    if (dot != std::string::npos)
+        for (size_t i = dot + 1; i < path.size(); ++i)
+            ext.push_back(static_cast<char>(std::tolower(path[i])));
+
+    const size_t triCount = indices.size() / 3;
+
+    // Per-vertex normals to write: caller-provided when complete, else computed
+    // from the triangles (area-weighted); a plain point cloud stays normal-less.
+    std::vector<V3> nrm;
+    if (normals && normals->size() == verts.size()) {
+        nrm = *normals;
+    } else if (triCount > 0) {
+        nrm.assign(verts.size(), V3{0, 0, 0});
+        for (size_t t = 0; t < triCount; ++t) {
+            uint32_t a = indices[t * 3], b = indices[t * 3 + 1], c = indices[t * 3 + 2];
+            if (a >= verts.size() || b >= verts.size() || c >= verts.size()) continue;
+            V3 pa{verts[a].position[0], verts[a].position[1], verts[a].position[2]};
+            V3 pb{verts[b].position[0], verts[b].position[1], verts[b].position[2]};
+            V3 pc{verts[c].position[0], verts[c].position[1], verts[c].position[2]};
+            V3 fn = cross(sub(pb, pa), sub(pc, pa));
+            for (uint32_t i : {a, b, c}) { nrm[i].x += fn.x; nrm[i].y += fn.y; nrm[i].z += fn.z; }
+        }
+        for (auto& n : nrm) n = normOrUp(n);
+    }
+    const bool haveNrm = nrm.size() == verts.size();
+
+    if (ext == "ply") {
+        io::PLYFormat ply;  // binary little-endian by default
+        for (size_t i = 0; i < verts.size(); ++i) {
+            const auto& v = verts[i];
+            ply.AddPoint(v.position[0], v.position[1], v.position[2]);
+            if (haveNrm) ply.AddNormal(nrm[i].x, nrm[i].y, nrm[i].z);
+            ply.AddColor(v.color[0], v.color[1], v.color[2]);
+        }
+        for (size_t t = 0; t < triCount; ++t)
+            ply.AddTriangle(static_cast<int>(indices[t * 3]), static_cast<int>(indices[t * 3 + 1]),
+                            static_cast<int>(indices[t * 3 + 2]));
+        return ply.Serialize(path);
+    }
+    if (ext == "obj") {
+        io::OBJFormat obj;
+        for (size_t i = 0; i < verts.size(); ++i) {
+            const auto& v = verts[i];
+            obj.AddPoint(v.position[0], v.position[1], v.position[2]);
+            if (haveNrm) obj.AddNormal(nrm[i].x, nrm[i].y, nrm[i].z);
+            obj.AddColor(v.color[0], v.color[1], v.color[2]);
+        }
+        // OBJ face indices are 1-based; the writer emits them verbatim.
+        for (size_t t = 0; t < triCount; ++t)
+            obj.AddTriangle(static_cast<int>(indices[t * 3] + 1), static_cast<int>(indices[t * 3 + 1] + 1),
+                            static_cast<int>(indices[t * 3 + 2] + 1));
+        return obj.Serialize(path);
+    }
+    if (ext == "stl") {
+        if (triCount == 0) return false;  // STL has no point-cloud form
+        io::STLFormat stl;
+        for (size_t t = 0; t < triCount; ++t) {
+            uint32_t a = indices[t * 3], b = indices[t * 3 + 1], c = indices[t * 3 + 2];
+            if (a >= verts.size() || b >= verts.size() || c >= verts.size()) continue;
+            Eigen::Vector3f v0(verts[a].position[0], verts[a].position[1], verts[a].position[2]);
+            Eigen::Vector3f v1(verts[b].position[0], verts[b].position[1], verts[b].position[2]);
+            Eigen::Vector3f v2(verts[c].position[0], verts[c].position[1], verts[c].position[2]);
+            Eigen::Vector3f n = (v1 - v0).cross(v2 - v0);
+            if (n.squaredNorm() > 1e-24f) n.normalize();
+            stl.AddTriangle(v0, v1, v2, n);
+        }
+        return stl.Serialize(path);
+    }
+    if (ext == "xyz") {
+        io::XYZFormat xyz;
+        for (const auto& v : verts) xyz.AddPoint(v.position[0], v.position[1], v.position[2]);
+        return xyz.Serialize(path);
+    }
     return false;
 }
 
