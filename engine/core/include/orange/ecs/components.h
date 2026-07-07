@@ -78,6 +78,15 @@ struct VertexSource {
     std::vector<render::Vertex> vertices;
 };
 
+// The source file's per-vertex ORIENTED normals (e.g. a PLY's nx/ny/nz), kept
+// alongside the VertexSource CPU copy (render::Vertex has no normal slot).
+// File > Save writes them back out, and the processing modes consume them as
+// ModeInput::normals -- a real scanner orientation beats re-estimating.
+// Skipped wherever the vertex count no longer matches (misaligned after edits).
+struct SourceNormals {
+    std::vector<Eigen::Vector3f> normals;
+};
+
 // Background build of a pick BVH for a huge mesh (millions of triangles), so the
 // click that triggers it doesn't freeze the main thread. Held by shared_ptr so the
 // worker can be detached. Small meshes skip this and build inline (instant). Carries
@@ -334,6 +343,27 @@ struct CrossSection {
     bool dragging = false;    // slider handle is being dragged
 
     const core::Font*     font  = nullptr;  // shared text font
+    render::TextureHandle atlas = render::kInvalidTexture;
+    render::MeshHandle     mesh = render::kInvalidMesh;
+    render::BufferHandle   vbo  = render::kInvalidBuffer;
+};
+
+// Deviation-color legend for 3D Compare: a vertical banded color bar with
+// numeric tick labels (+range .. -range) plus RMS, so the heatmap magnitudes
+// are readable. The app fills range/stats and sets `visible` when a compare
+// finishes; renderSystem draws it top-right under the cross-section panel;
+// compareLegendInputSystem handles the close box.
+struct CompareLegend {
+    bool  visible  = false;
+    bool  isSigned = true;
+    float range    = 1.0f;   // color range: +-range (signed) or 0..range
+    float rms      = 0.0f;
+    int   bands    = 12;     // quantization steps (matches the painted mesh)
+
+    int w = 150, h = 340;    // panel size (px)
+    int x = 0, y = 0;        // computed each frame (top-right column)
+
+    const core::Font*     font  = nullptr;
     render::TextureHandle atlas = render::kInvalidTexture;
     render::MeshHandle     mesh = render::kInvalidMesh;
     render::BufferHandle   vbo  = render::kInvalidBuffer;
@@ -650,6 +680,9 @@ enum class MenuAction : int {
     // File > Save / Save As. Like OpenFile, these only raise MenuBar request
     // flags; the app owns the native dialog and the actual write.
     SaveFile, SaveFileAs,
+    // Geometry > 3D Compare: deviation heatmap of one selected drawable against
+    // the other (Geomagic-style). Raises MenuBar::requestCompare for the app.
+    Compare3D,
 };
 
 // One row in a dropdown. kind: Action = clickable command; Check = command that
@@ -700,6 +733,10 @@ struct MenuBar {
     // requestOpenFile).
     bool requestSaveFile   = false;
     bool requestSaveFileAs = false;
+
+    // Raised by MenuAction::Compare3D; the app runs the deviation analysis on
+    // the two selected drawables (one-shot edge flag).
+    bool requestCompare = false;
 
     // Right-aligned status text drawn in the bar (e.g. "Loading 42%"). The app
     // sets it while a background load runs and clears it when finished. Empty =

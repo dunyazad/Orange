@@ -498,6 +498,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         ecs::treeViewInputSystem(world_, input_, window_.width(), window_.height());
         ecs::cameraControlsInputSystem(world_, input_, dt, window_.width(), window_.height());
         ecs::crossSectionInputSystem(world_, input_, window_.width(), window_.height());
+        ecs::compareLegendInputSystem(world_, input_, window_.width(), window_.height());
         ecs::poissonDialogInputSystem(world_, input_, window_.width(), window_.height());
         ecs::modeParamsDialogInputSystem(world_, input_, window_.width(), window_.height());
         ecs::pipelineDialogInputSystem(world_, input_, window_.width(), window_.height());
@@ -762,6 +763,11 @@ void Application::applyMenuAction(int action) {
         case A::SaveFileAs: {
             auto mv = world_.view<ecs::MenuBar>();
             for (auto e : mv) { mv.get<ecs::MenuBar>(e).requestSaveFileAs = true; break; }
+            break;
+        }
+        case A::Compare3D: {
+            auto mv = world_.view<ecs::MenuBar>();
+            for (auto e : mv) { mv.get<ecs::MenuBar>(e).requestCompare = true; break; }
             break;
         }
         case A::Screenshot: capture_ = true; break;

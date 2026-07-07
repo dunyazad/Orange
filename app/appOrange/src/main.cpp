@@ -27,6 +27,8 @@
 
 #include "mesh_io.h"
 #include "orange/core/application.h"
+#include "orange/core/color.h"
+#include "orange/core/compare.h"
 #include "orange/core/crash_handler.h"
 #include "orange/core/screenshot.h"
 #include "orange/core/ui_layout.h"
@@ -314,13 +316,34 @@ struct SourcePath {
     std::string path;
 };
 
-// App-local component: the source file's per-vertex normals (PLY). They don't
-// fit in render::Vertex, but Save writes them back out -- a normal-less cloud
-// renders dark/flat in lit external viewers. Dropped (skipped at save) if the
-// vertex count changed (e.g. outlier removal) since they'd be misaligned.
-struct SourceNormals {
-    std::vector<meshio::V3> normals;
+// Background 3D Compare (Geomagic-style deviation analysis): the worker
+// computes signed distances of the test drawable's points to the reference
+// surface; the main thread paints them as a blue-green-red heatmap (undoable).
+struct CompareJob {
+    std::thread             worker;
+    std::atomic<int>        percent{0};
+    std::atomic<bool>       done{false};
+    std::atomic<bool>       ok{false};
+    std::vector<float>      devs;              // signed deviation per test vertex
+    geometry::CompareStats  stats;
+    entt::entity            test = entt::null; // the entity that gets painted
+    bool                    active = false;
+
+    ~CompareJob() { if (worker.joinable()) worker.join(); }
 };
+
+// Recolor a drawable in place: upload `verts` into its existing vertex buffer
+// and keep the CPU copy in sync. Color-only (same vertex count/topology), works
+// for meshes and point clouds alike. Shared by the compare apply and its
+// undo/redo closures.
+void paintVertices(entt::registry& w, render::IRenderer& r, entt::entity e,
+                   const std::vector<render::Vertex>& verts) {
+    if (!w.valid(e) || !w.all_of<ecs::VertexSource>(e)) return;
+    auto& vs = w.get<ecs::VertexSource>(e);
+    if (vs.vertices.size() != verts.size()) return;
+    vs.vertices = verts;
+    r.updateBuffer(vs.vbo, verts.data(), verts.size() * sizeof(render::Vertex));
+}
 
 // Background mesh save: same shape as LoadJob. The main thread snapshots the
 // entity's CPU geometry (VertexSource + PickGeometry, transform baked in), the
@@ -660,6 +683,33 @@ int main(int argc, char** argv) {
         world.emplace<ecs::CrossSection>(e, cs);
     }
 
+    // 3D Compare legend (banded color bar + numeric ticks), under the section panel.
+    const int kLgQ = 128, kLgV = kLgQ * 4;  // must match kLegendQuads in systems.cpp
+    const std::vector<render::Vertex> lgInit(kLgV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
+    std::vector<uint32_t> lgIdx;
+    for (uint32_t q = 0; q < static_cast<uint32_t>(kLgQ); ++q) {
+        uint32_t b = q * 4;
+        lgIdx.insert(lgIdx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+    }
+    core::VertexBuffer<render::Vertex> lgVbo(*app.renderer(), lgInit,
+                                             render::BufferUsage::Dynamic);
+    core::IndexBuffer                  lgIbo(*app.renderer(), lgIdx);
+    render::MeshDesc lgMeshDesc;
+    lgMeshDesc.vertexBuffer = lgVbo.handle();
+    lgMeshDesc.indexBuffer  = lgIbo.handle();
+    lgMeshDesc.layout       = render::Vertex::layout();
+    lgMeshDesc.vertexCount  = static_cast<uint32_t>(kLgV);
+    lgMeshDesc.indexCount   = static_cast<uint32_t>(kLgQ * 6);
+    {
+        auto e = world.create();
+        ecs::CompareLegend lg;
+        lg.font  = &uiFont;
+        lg.atlas = uiFont.texture;
+        lg.mesh  = app.renderer()->createMesh(lgMeshDesc);
+        lg.vbo   = lgVbo.handle();
+        world.emplace<ecs::CompareLegend>(e, lg);
+    }
+
     // Poisson reconstruction dialog (parameter sliders + Reconstruct button).
     const int kPoissonQ = 256, kPoissonV = kPoissonQ * 4;  // must match kPoissonQuads in systems.cpp
     const std::vector<render::Vertex> pdInit(kPoissonV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
@@ -945,8 +995,12 @@ int main(int argc, char** argv) {
             world.emplace<ecs::VertexSource>(e, std::move(vsrc));
         }
         world.emplace<SourcePath>(e, SourcePath{path});  // File > Save target
-        if (nrm && nrm->size() == mv.size())             // keep file normals for re-save
-            world.emplace<SourceNormals>(e, SourceNormals{std::move(*nrm)});
+        if (nrm && nrm->size() == mv.size()) {           // keep file normals (save + modes)
+            ecs::SourceNormals sn;
+            sn.normals.reserve(nrm->size());
+            for (const auto& n : *nrm) sn.normals.emplace_back(n.x, n.y, n.z);
+            world.emplace<ecs::SourceNormals>(e, std::move(sn));
+        }
         ecs::pushSpawnOp(world, e, ("Load " + path).c_str());
 
         // Frame the camera on the just-loaded mesh: orbit pivot -> bounds center,
@@ -987,6 +1041,7 @@ int main(int argc, char** argv) {
     LoadJob    loadJob;
     PoissonJob poissonJob;
     SaveJob    saveJob;
+    CompareJob compareJob;
     float      statusHold = 0.0f;  // seconds to keep the final "Loaded/Failed" message
 
     // Snapshot the entity's current CPU geometry (transform baked in, so spawned
@@ -999,8 +1054,12 @@ int main(int argc, char** argv) {
             saveJob.indices = world.get<ecs::PickGeometry>(tgt).indices;
         // Source-file normals, if still aligned with the (possibly edited) verts.
         saveJob.normals.clear();
-        if (auto* sn = world.try_get<SourceNormals>(tgt))
-            if (sn->normals.size() == saveJob.verts.size()) saveJob.normals = sn->normals;
+        if (auto* sn = world.try_get<ecs::SourceNormals>(tgt))
+            if (sn->normals.size() == saveJob.verts.size()) {
+                saveJob.normals.reserve(sn->normals.size());
+                for (const auto& n : sn->normals)
+                    saveJob.normals.push_back({n.x(), n.y(), n.z()});
+            }
         Eigen::Matrix4f M = Eigen::Matrix4f::Identity();
         if (world.all_of<ecs::Transform>(tgt)) M = world.get<ecs::Transform>(tgt).matrix();
         if (!M.isApprox(Eigen::Matrix4f::Identity())) {
@@ -1086,6 +1145,75 @@ int main(int argc, char** argv) {
                                            saveDefaultLoc.empty() ? nullptr
                                                                   : saveDefaultLoc.c_str());
                 }
+            }
+        }
+        // 3D Compare request (Geometry menu): deviation heatmap of the test
+        // drawable against the reference, from exactly two selected drawables.
+        if (mb && mb->requestCompare) {
+            mb->requestCompare = false;
+            std::vector<entt::entity> sel;
+            auto cv = w.view<ecs::Renderable, ecs::VertexSource, ecs::PickGeometry>();
+            for (auto e : cv)
+                if (cv.get<ecs::Renderable>(e).selected) sel.push_back(e);
+            if (sel.size() != 2) {
+                mb->statusText = "Compare: select exactly 2 meshes";
+                statusHold     = 2.5f;
+            } else if (!compareJob.active) {
+                // Reference = the triangle mesh when exactly one of the pair has
+                // triangles (scan-vs-CAD); otherwise the first found. The other
+                // one is the test and gets the heatmap.
+                const bool tri0 = !w.get<ecs::PickGeometry>(sel[0]).indices.empty();
+                const bool tri1 = !w.get<ecs::PickGeometry>(sel[1]).indices.empty();
+                entt::entity ref = sel[0], test = sel[1];
+                if (tri1 && !tri0) std::swap(ref, test);
+
+                auto worldPts = [&](entt::entity e) {
+                    const auto&     pg = w.get<ecs::PickGeometry>(e);
+                    Eigen::Matrix4f M  = Eigen::Matrix4f::Identity();
+                    if (w.all_of<ecs::Transform>(e)) M = w.get<ecs::Transform>(e).matrix();
+                    std::vector<Eigen::Vector3f> out(pg.positions.size());
+                    for (size_t i = 0; i < pg.positions.size(); ++i) {
+                        const auto&     p = pg.positions[i];
+                        Eigen::Vector4f h = M * Eigen::Vector4f(p.x(), p.y(), p.z(), 1.0f);
+                        out[i]            = h.head<3>();
+                    }
+                    return out;
+                };
+                std::vector<Eigen::Vector3f> testPts = worldPts(test);
+                std::vector<Eigen::Vector3f> refPts  = worldPts(ref);
+                std::vector<uint32_t>        refIdx  = w.get<ecs::PickGeometry>(ref).indices;
+                // A point-cloud reference signs the deviation with its source
+                // normals (rotated to world space) when it has them.
+                std::vector<Eigen::Vector3f> refNrm;
+                if (refIdx.empty()) {
+                    if (auto* sn = w.try_get<ecs::SourceNormals>(ref);
+                        sn && sn->normals.size() == refPts.size()) {
+                        Eigen::Matrix3f N = Eigen::Matrix3f::Identity();
+                        if (w.all_of<ecs::Transform>(ref))
+                            N = w.get<ecs::Transform>(ref)
+                                    .matrix().block<3, 3>(0, 0).inverse().transpose();
+                        refNrm.resize(sn->normals.size());
+                        for (size_t i = 0; i < sn->normals.size(); ++i)
+                            refNrm[i] = (N * sn->normals[i]).normalized();
+                    }
+                }
+                compareJob.active = true;
+                compareJob.test   = test;
+                compareJob.percent.store(0);
+                compareJob.done.store(false);
+                compareJob.ok.store(false);
+                SDL_Log("Compare: test %zu pts vs ref %zu pts / %zu tris",
+                        testPts.size(), refPts.size(), refIdx.size() / 3);
+                compareJob.worker = std::thread(
+                    [job = &compareJob, testPts = std::move(testPts), refPts = std::move(refPts),
+                     refIdx = std::move(refIdx), refNrm = std::move(refNrm)]() mutable {
+                        job->devs = geometry::compareDeviations(
+                            testPts, refPts, refIdx, refNrm, job->stats, [job](float f) {
+                                job->percent.store(static_cast<int>(f * 100.0f));
+                            });
+                        job->ok.store(!job->devs.empty());
+                        job->done.store(true);  // publish last
+                    });
             }
         }
         // In-app confirm dialog answered? A Yes on the "load last mesh" prompt
@@ -1227,6 +1355,79 @@ int main(int argc, char** argv) {
                 saveJob.active = false;
                 statusHold     = ok ? 1.5f : 3.0f;
                 if (mb) mb->statusText = ok ? "Saved" : "Save failed";
+            }
+        }
+        // Drive status text + finish a completed 3D Compare on the main thread:
+        // paint the signed deviations as a heatmap (blue = below the reference,
+        // green = on it, red = above; unsigned refs map green->red), undoable.
+        if (compareJob.active) {
+            if (!compareJob.done.load()) {
+                if (mb)
+                    mb->statusText =
+                        "Comparing " + std::to_string(compareJob.percent.load()) + "%";
+            } else {
+                compareJob.worker.join();
+                bool ok = compareJob.ok.load();
+                if (ok && w.valid(compareJob.test) &&
+                    w.all_of<ecs::VertexSource>(compareJob.test) &&
+                    w.get<ecs::VertexSource>(compareJob.test).vertices.size() ==
+                        compareJob.devs.size()) {
+                    const auto& vs   = w.get<ecs::VertexSource>(compareJob.test);
+                    auto oldV = std::make_shared<std::vector<render::Vertex>>(vs.vertices);
+                    auto newV = std::make_shared<std::vector<render::Vertex>>(vs.vertices);
+                    const auto& s = compareJob.stats;
+                    // Quantized 5-stop jet: discrete bands read as deviation
+                    // contours (a smooth ramp hides the magnitudes).
+                    constexpr int kBands = 12;
+                    for (size_t i = 0; i < newV->size(); ++i) {
+                        Eigen::Vector3f c = geometry::compareBandColor(
+                            compareJob.devs[i], s.range, s.isSigned, kBands);
+                        (*newV)[i].color[0] = c.x();
+                        (*newV)[i].color[1] = c.y();
+                        (*newV)[i].color[2] = c.z();
+                    }
+                    // Show the legend so the band colors map to numbers on screen.
+                    {
+                        auto lgv = w.view<ecs::CompareLegend>();
+                        for (auto le : lgv) {
+                            auto& lg    = lgv.get<ecs::CompareLegend>(le);
+                            lg.range    = s.range;
+                            lg.isSigned = s.isSigned;
+                            lg.rms      = s.rms;
+                            lg.bands    = kBands;
+                            lg.visible  = true;
+                            break;
+                        }
+                    }
+                    paintVertices(w, *app.renderer(), compareJob.test, *newV);
+                    ecs::UndoOp op;
+                    op.label = "3D Compare";
+                    op.undo  = [e = compareJob.test, oldV](entt::registry& wr,
+                                                          render::IRenderer& r) {
+                        paintVertices(wr, r, e, *oldV);
+                    };
+                    op.redo = [e = compareJob.test, newV](entt::registry& wr,
+                                                          render::IRenderer& r) {
+                        paintVertices(wr, r, e, *newV);
+                    };
+                    ecs::undoStack(w).push(std::move(op));
+                    SDL_Log("Compare: %zu pts  mean %+.4f  RMS %.4f  min %+.4f  max %+.4f  "
+                            "color range +-%.4f%s",
+                            s.count, s.mean, s.rms, s.minDev, s.maxDev, s.range,
+                            s.isSigned ? "" : " (unsigned: reference has no orientation)");
+                    char buf[128];
+                    std::snprintf(buf, sizeof(buf), "Compare: RMS %.3f  max %+.3f/%+.3f  (+-%.3f)",
+                                  s.rms, s.maxDev, s.minDev, s.range);
+                    if (mb) mb->statusText = buf;
+                    statusHold = 8.0f;  // stats linger long enough to read
+                } else {
+                    ok = false;
+                    if (mb) mb->statusText = "Compare failed";
+                    statusHold = 3.0f;
+                }
+                compareJob.devs.clear();
+                compareJob.devs.shrink_to_fit();
+                compareJob.active = false;
             }
         }
 

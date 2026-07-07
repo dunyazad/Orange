@@ -20,6 +20,7 @@
 #include "orange/core/ball_tree.h"
 #include "orange/core/bsp.h"
 #include "orange/core/color.h"
+#include "orange/core/compare.h"
 #include "orange/core/debug_draw.h"
 #include "orange/core/draw_mode.h"
 #include "orange/core/geometry.h"
@@ -486,12 +487,15 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
         // matrix; the worker does the world transform AND the heavy operator.
         modes::ModeInput fixedInput;
         std::vector<Eigen::Vector3f> raw;
+        std::vector<Eigen::Vector3f> rawN;  // source-file oriented normals (may be empty)
         Eigen::Matrix4f M = Eigen::Matrix4f::Identity();
         if (hasFixed) {
             fixedInput = ctx.get<modes::ModeInput>();
         } else {
             raw = world.get<PickGeometry>(src).positions;  // vector copy
             if (world.all_of<Transform>(src)) M = world.get<Transform>(src).matrix();
+            if (auto* sn = world.try_get<SourceNormals>(src))
+                if (sn->normals.size() == raw.size()) rawN = sn->normals;
         }
 
         // Current parameter values (modes fall back to their defaults).
@@ -523,8 +527,8 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
         int  idx = state.index;
         bool useFixed = hasFixed;
         cache.worker = std::thread(
-            [job, idx, useFixed, fixed = std::move(fixedInput), raw = std::move(raw), M,
-             params = std::move(params)]() mutable {
+            [job, idx, useFixed, fixed = std::move(fixedInput), raw = std::move(raw),
+             rawN = std::move(rawN), M, params = std::move(params)]() mutable {
                 modes::ModeInput in;
                 if (useFixed) {
                     in = std::move(fixed);
@@ -533,6 +537,12 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
                     for (size_t i = 0; i < raw.size(); ++i) {
                         Eigen::Vector4f w = M * Eigen::Vector4f(raw[i].x(), raw[i].y(), raw[i].z(), 1.0f);
                         in.points[i]      = Eigen::Vector3f(w.x(), w.y(), w.z());
+                    }
+                    if (!rawN.empty()) {  // normals rotate by the inverse-transpose
+                        Eigen::Matrix3f N = M.block<3, 3>(0, 0).inverse().transpose();
+                        in.normals.resize(rawN.size());
+                        for (size_t i = 0; i < rawN.size(); ++i)
+                            in.normals[i] = (N * rawN[i]).normalized();
                     }
                 }
                 in.params = std::move(params);
@@ -1153,11 +1163,18 @@ struct TreeRow {
     bool         isGroup  = false;
     bool         expanded = false;
     bool         selected = false;
+    bool         shown    = true;          // Renderable::visible (group: any child)
+    bool         hasEye   = true;          // false = no eye icon (empty group)
     int          depth    = 0;
     int          group    = 0;             // group id (for header toggle)
     entt::entity entity   = entt::null;    // leaf entity (null for headers)
     char         label[48] = {0};
 };
+
+// Right-edge eye-icon hit zone of every row (panel px from the right edge).
+// Clicking it toggles Renderable::visible (a group header eye toggles all its
+// children) instead of selecting the row.
+constexpr float kTreeEyeZone = 34.0f;
 
 void buildTreeRows(entt::registry& world, const TreeView& tv, std::vector<TreeRow>& rows) {
     static const char* kGroupName[TreeView::kGroups] = {"Meshes", "Point Clouds"};
@@ -1168,8 +1185,16 @@ void buildTreeRows(entt::registry& world, const TreeView& tv, std::vector<TreeRo
         for (auto e : v)
             if (v.get<Renderable>(e).pointCloud == wantCloud) ++count;
 
+        bool anyShown = false;
+        for (auto e : v) {
+            const auto& r = v.get<Renderable>(e);
+            if (r.pointCloud == wantCloud && r.visible) { anyShown = true; break; }
+        }
+
         TreeRow hr;
         hr.isGroup = true; hr.expanded = tv.expanded[g]; hr.group = g; hr.depth = 0;
+        hr.shown   = anyShown;
+        hr.hasEye  = count > 0;
         std::snprintf(hr.label, sizeof(hr.label), "%s (%d)", kGroupName[g], count);
         rows.push_back(hr);
 
@@ -1179,6 +1204,7 @@ void buildTreeRows(entt::registry& world, const TreeView& tv, std::vector<TreeRo
             if (r.pointCloud != wantCloud) continue;
             TreeRow row;
             row.depth = 1; row.selected = r.selected; row.entity = e;
+            row.shown = r.visible;
             unsigned int id = (unsigned int)entt::to_integral(e);
             std::snprintf(row.label, sizeof(row.label), "%s %u", wantCloud ? "Cloud" : "Mesh", id);
             rows.push_back(row);
@@ -1246,6 +1272,24 @@ void buildTreeGeometry(const TreeView& tv, const std::vector<TreeRow>& rows, ren
         const float* col = row.isGroup ? grpCol : leafCol;
         appendText(out, q, kTreeQuads, f, row.label, nx(indent), nyTop(baseline),
                    row.isGroup ? grpH : lblH, col, 0.35f, xs);
+
+        // Visibility eye at the right edge (axis-aligned quads off the white
+        // texel -- the font bakes ASCII only, so the icon is drawn, not typed).
+        // Open eye = lens (three stacked bands) + dark pupil; hidden = dim bar.
+        if (row.hasEye) {
+            float ex = W - kTreeEyeZone + 4.0f;           // icon left (22px wide)
+            float cy = top + kTreeRowH * 0.5f;            // row center
+            if (row.shown) {
+                const float er = 0.78f, eg = 0.84f, eb = 0.90f;
+                rect(ex,     cy - 3.5f, ex + 22, cy + 3.5f, er, eg, eb, 0.35f);  // mid band
+                rect(ex + 4, cy - 7.0f, ex + 18, cy - 3.5f, er, eg, eb, 0.35f);  // upper
+                rect(ex + 4, cy + 3.5f, ex + 18, cy + 7.0f, er, eg, eb, 0.35f);  // lower
+                rect(ex + 8.5f, cy - 3.5f, ex + 13.5f, cy + 3.5f,                // pupil
+                     0.10f, 0.12f, 0.16f, 0.4f);
+            } else {
+                rect(ex + 2, cy - 2.0f, ex + 20, cy + 2.0f, 0.38f, 0.42f, 0.48f, 0.35f);
+            }
+        }
     }
 
     // Title bar on top (covers any row scrolled up under it).
@@ -1479,6 +1523,97 @@ void buildCrossSectionGeometry(const CrossSection& cs, render::Vertex* out) {
     solid(hxn - hw, hy0, hxn + hw, hy1, hc, hc, hc, 0.5f);
 
     for (int i = q * 4; i < kCsVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
+}
+
+// --- 3D Compare legend -------------------------------------------------------
+constexpr int kLegendQuads = 128;
+constexpr int kLegendVerts = kLegendQuads * 4;
+
+// Close-box rect (screen px). Shared by the builder and the input system.
+CRect legendCloseRect(const CompareLegend& lg) {
+    return {lg.x + lg.w - 26.0f, lg.y + 6.0f, 20.0f, 20.0f};
+}
+
+// Vertical banded color bar (top = +range / red, bottom = -range / blue) with a
+// numeric tick beside every 2nd band boundary, plus the RMS readout. The band
+// colors come from the same compareBandColor() used to paint the mesh, so the
+// legend and the model always agree.
+void buildCompareLegendGeometry(const CompareLegend& lg, render::Vertex* out) {
+    const core::Font& f = *lg.font;
+    int q = 0;
+    const float wu = f.whiteU, wv = f.whiteV;
+    auto quad = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                    float u0, float v0, float u1, float v1, float z) {
+        if (q >= kLegendQuads) return;
+        out[q * 4 + 0] = {{x0, y0, z}, {r, g, b}, {u0, v1}};
+        out[q * 4 + 1] = {{x1, y0, z}, {r, g, b}, {u1, v1}};
+        out[q * 4 + 2] = {{x1, y1, z}, {r, g, b}, {u1, v0}};
+        out[q * 4 + 3] = {{x0, y1, z}, {r, g, b}, {u0, v0}};
+        ++q;
+    };
+    auto solid = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                     float z) { quad(x0, y0, x1, y1, r, g, b, wu, wv, wu, wv, z); };
+    const float xs = static_cast<float>(lg.h) / static_cast<float>(lg.w);
+    auto text = [&](const char* s, float penX, float baseY, float h, float r, float g,
+                    float b, float z) {
+        for (; *s; ++s) {
+            const core::Glyph& gl = f.glyph(*s);
+            if (gl.w > 0 && gl.h > 0) {
+                float x0 = penX + gl.xoff * h * xs, y1 = baseY - gl.yoff * h;
+                float x1 = x0 + gl.w * h * xs, y0 = y1 - gl.h * h;
+                quad(x0, y0, x1, y1, r, g, b, gl.u0, gl.v0, gl.u1, gl.v1, z);
+            }
+            penX += gl.advance * h * xs;
+        }
+    };
+    auto nx    = [&](float px) { return px / lg.w; };
+    auto nyTop = [&](float px) { return 1.0f - px / lg.h; };
+
+    solid(0, 0, 1, 1, 0.10f, 0.11f, 0.13f, 0.0f);  // panel background
+
+    const float th = kUiTextPx / lg.h;
+    text("Compare", nx(10), nyTop(24), th, 0.85f, 0.88f, 0.92f, 0.6f);
+
+    // Close box.
+    CRect cb = legendCloseRect(lg);
+    float cx0 = nx(cb.x - lg.x), cx1 = nx(cb.x - lg.x + cb.w);
+    float cy1 = nyTop(cb.y - lg.y), cy0 = nyTop(cb.y - lg.y + cb.h);
+    solid(cx0, cy0, cx1, cy1, 0.22f, 0.24f, 0.29f, 0.5f);
+    float xh = (cy1 - cy0) * 0.7f;
+    text("x", (cx0 + cx1) * 0.5f - f.textWidth("x", xh) * xs * 0.5f,
+         (cy0 + cy1) * 0.5f - xh * 0.32f, xh, 0.85f, 0.88f, 0.92f, 0.6f);
+
+    // Color bar: bands stacked bottom (lowest deviation) -> top (highest).
+    const float barL = 12.0f, barR = 40.0f, barT = 44.0f, barB = lg.h - 40.0f;
+    const int   n    = lg.bands > 1 ? lg.bands : 1;
+    for (int b = 0; b < n; ++b) {
+        float t0 = (float)b / n, t1 = (float)(b + 1) / n;   // 0 = bottom
+        // Band-center deviation -> exact painted color.
+        float tc  = (t0 + t1) * 0.5f;
+        float dev = lg.isSigned ? -lg.range + tc * 2.0f * lg.range : tc * lg.range;
+        Eigen::Vector3f c = geometry::compareBandColor(dev, lg.range, lg.isSigned, lg.bands);
+        float py0 = barB - (barB - barT) * t0;  // band bottom (px from panel top)
+        float py1 = barB - (barB - barT) * t1;  // band top
+        solid(nx(barL), nyTop(py0), nx(barR), nyTop(py1), c.x(), c.y(), c.z(), 0.3f);
+    }
+
+    // Tick labels at 0, 1/4, 1/2, 3/4, 1 of the bar (bottom -> top).
+    const float lh = 15.0f / lg.h;
+    char buf[24];
+    for (int k = 0; k <= 4; ++k) {
+        float t   = (float)k / 4.0f;
+        float dev = lg.isSigned ? -lg.range + t * 2.0f * lg.range : t * lg.range;
+        std::snprintf(buf, sizeof(buf), lg.isSigned ? "%+.3g" : "%.3g", dev);
+        float py = barB - (barB - barT) * t;  // px from top
+        solid(nx(barR), nyTop(py + 1), nx(barR + 5), nyTop(py - 1),  // tick mark
+              0.62f, 0.66f, 0.72f, 0.35f);
+        text(buf, nx(barR + 9), nyTop(py + 5), lh, 0.80f, 0.84f, 0.90f, 0.6f);
+    }
+
+    std::snprintf(buf, sizeof(buf), "RMS %.3g", lg.rms);
+    text(buf, nx(12), nyTop(lg.h - 12.0f), lh, 0.72f, 0.78f, 0.85f, 0.6f);
+
+    for (int i = q * 4; i < kLegendVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
 
 // --- Poisson reconstruction dialog -----------------------------------------
@@ -2757,6 +2892,7 @@ std::vector<Menu> defaultAppMenus() {
         }
         geo.items.push_back(sep());
         geo.items.push_back(act("Poisson Reconstruction...", A::PoissonDialogToggle));
+        geo.items.push_back(act("3D Compare (2 selected)",   A::Compare3D));
         menus.push_back(std::move(geo));
     }
     {  // Pipelines: multi-step geometry pipelines, with nested sub-steps.
@@ -3570,8 +3706,25 @@ void treeViewInputSystem(entt::registry& world, core::Input& input, uint32_t vie
             tv.dragOffX = mx - tv.x;
             tv.dragOffY = my - tv.y;
         } else if (input.leftClicked && hoveredRow >= 0) {
-            const TreeRow& row = rows[hoveredRow];
-            if (row.isGroup) {
+            const TreeRow& row   = rows[hoveredRow];
+            const bool     onEye = row.hasEye && (mx - tv.x) >= tv.w - kTreeEyeZone &&
+                               (mx - tv.x) <= tv.w - 4.0f;
+            if (onEye) {
+                // Eye click: toggle visibility, never selection. A group eye
+                // hides all its children (or shows them when all were hidden).
+                if (row.isGroup) {
+                    const bool wantCloud = (row.group == 1);
+                    const bool newVis    = !row.shown;
+                    auto rv = world.view<Renderable>();
+                    for (auto o : rv) {
+                        auto& rr = rv.get<Renderable>(o);
+                        if (rr.pointCloud == wantCloud) rr.visible = newVis;
+                    }
+                } else if (row.entity != entt::null && world.valid(row.entity)) {
+                    if (auto* rr = world.try_get<Renderable>(row.entity))
+                        rr->visible = !rr->visible;
+                }
+            } else if (row.isGroup) {
                 tv.expanded[row.group] = !tv.expanded[row.group];
             } else if (row.entity != entt::null && world.valid(row.entity)) {
                 bool additive = input.ctrl;  // Ctrl-click adds/toggles, else replace
@@ -3724,6 +3877,34 @@ void crossSectionInputSystem(entt::registry& world, core::Input& input,
         input.captured = true;
     }
     if (inPanel) input.captured = true;
+}
+
+void compareLegendInputSystem(entt::registry& world, core::Input& input,
+                              uint32_t viewportW, uint32_t viewportH) {
+    (void)viewportH;
+    auto view = world.view<CompareLegend>();
+    for (auto e : view) {
+        auto& lg = view.get<CompareLegend>(e);
+        if (!lg.visible) continue;
+
+        // Top-right column, directly under the cross-section panel.
+        int baseY = kMenuBarHeight + 14 + 150 + 10 + 76 + 10 + 96 + 10;
+        auto csv = world.view<CrossSection>();
+        for (auto ce : csv) { const auto& cs = csv.get<CrossSection>(ce); baseY = cs.y + cs.h + 10; break; }
+        lg.x = static_cast<int>(viewportW) - lg.w - 14;
+        lg.y = baseY;
+        if (lg.x < 0) lg.x = 0;
+
+        float mx = input.mousePosX, my = input.mousePosY;
+        bool  inPanel = mx >= lg.x && mx <= lg.x + lg.w && my >= lg.y && my <= lg.y + lg.h;
+        if (!inPanel) continue;
+        CRect cb = legendCloseRect(lg);
+        if (input.leftClicked && mx >= cb.x && mx <= cb.x + cb.w && my >= cb.y &&
+            my <= cb.y + cb.h)
+            lg.visible = false;
+        input.captured = true;
+        break;
+    }
 }
 
 void poissonDialogInputSystem(entt::registry& world, core::Input& input,
@@ -4848,6 +5029,36 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         std::memcpy(item.model, model.data(), sizeof(item.model));
         renderer.submit(item);
         break;
+    }
+
+    // --- 3D Compare legend overlay -------------------------------------
+    {
+        auto lgview = world.view<CompareLegend>();
+        for (auto entity : lgview) {
+            const auto& lg = lgview.get<CompareLegend>(entity);
+            if (!lg.visible || !lg.font || lg.mesh == render::kInvalidMesh) break;
+
+            render::Vertex verts[kLegendVerts];
+            buildCompareLegendGeometry(lg, verts);
+            renderer.updateBuffer(lg.vbo, verts, sizeof(verts));
+
+            render::OverlayContext ov;
+            ov.x = lg.x; ov.y = lg.y; ov.width = lg.w; ov.height = lg.h;
+            ov.clearDepth = true;
+            Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+            Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+            std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+            std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+            renderer.beginOverlay(ov);
+
+            render::DrawItem item;
+            item.mesh    = lg.mesh;
+            item.texture = lg.atlas;
+            Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
+            std::memcpy(item.model, model.data(), sizeof(item.model));
+            renderer.submit(item);
+            break;
+        }
     }
 
     // --- Cross-section panel overlay ----------------------------------

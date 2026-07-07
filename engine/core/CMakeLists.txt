@@ -38,6 +38,12 @@ if(EIGEN_INCLUDE_DIR)
 endif()
 target_compile_definitions(orange_core PUBLIC EIGEN_MAX_ALIGN_BYTES=0)
 
+# systems.cpp (many EnTT/Eigen template instantiations) exceeds the default
+# COFF section limit in Debug builds; /bigobj lifts it.
+if(MSVC)
+    target_compile_options(orange_core PRIVATE /bigobj)
+endif()
+
 target_link_libraries(orange_core
     PUBLIC
         orange::render_api

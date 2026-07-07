@@ -41,6 +41,11 @@ void cameraControlsInputSystem(entt::registry& world, core::Input& input, float 
 void crossSectionInputSystem(entt::registry& world, core::Input& input,
                              uint32_t viewportW, uint32_t viewportH);
 
+// 3D Compare legend: positions it under the cross-section panel and handles
+// its close box. Sets input.captured over the panel. No-op while hidden.
+void compareLegendInputSystem(entt::registry& world, core::Input& input,
+                              uint32_t viewportW, uint32_t viewportH);
+
 // Poisson reconstruction dialog: handles the parameter sliders and the
 // "Reconstruct" button (which writes geometry::PoissonParams into the ctx and
 // activates the Poisson processing mode). Sets input.captured over the panel.

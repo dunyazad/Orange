@@ -15,6 +15,7 @@
 #include <Eigen/Eigenvalues>
 
 #include "orange/core/color.h"
+#include "orange/core/compare.h"  // compareBandColor (diverging signed map)
 #include "orange/core/mesh_generation.h"
 #include "orange/core/normals.h"
 #include "orange/core/point_ops.h"
@@ -712,8 +713,14 @@ void kdeColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
 }
 
 // --- Analyze: Surface curvature ----------------------------------------------
-// Ported from Helium PointCloudCurvatureAnalysis. Surface variation
-// lambda0/(lambda0+lambda1+lambda2) from the neighbourhood PCA, as a heatmap.
+// SIGNED surface curvature (ported from Helium PointCloudCurvatureAnalysis,
+// extended with a sign): magnitude = surface variation lambda0/(sum lambda)
+// from the neighbourhood PCA; sign = the side of the local surface the
+// neighbourhood centroid falls on along the ORIENTED normal. Convex (bumps,
+// cusps, ridges) is positive -> warm colors; concave (pits, grooves, fissures)
+// is negative -> cool colors; flat = green. Uses the source file's normals
+// when present (ModeInput::normals), else estimates + orients heuristically.
+// The diverging map is symmetric around zero (95th percentile of |curvature|).
 void curvatureColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
                      debug::DebugDraw& extras, const ProgressFn& progress) {
     (void)extras;
@@ -724,7 +731,54 @@ void curvatureColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
     buildGrid(pts, grid, mn, mx);
     const int k = (int)std::lround(P(in, 0, 16.0f));
 
+    const std::vector<Eigen::Vector3f> nrm =
+        in.normals.size() == pts.size()
+            ? in.normals
+            : geometry::estimateNormals(pts, k, [&](float f) { report(progress, f * 0.4f); });
+
     std::vector<float> curv(pts.size(), 0.0f);
+    parallelFor(pts.size(), progress, in.normals.size() == pts.size() ? 0.0f : 0.4f, 1.0f,
+                [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
+        Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
+        grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
+        if (!neighbourhoodPCA(pts, nbr, c, eval, evec)) return;
+        float s = eval.x() + eval.y() + eval.z();
+        float m = s > 1e-12f ? eval.x() / s : 0.0f;
+        // Neighbour centroid BELOW the surface (against the outward normal) =>
+        // the point sits on a bump => convex, positive. Centroid above => pit.
+        curv[i] = (c - pts[i]).dot(nrm[i]) < 0.0f ? m : -m;
+    });
+
+    // Diverging colors, symmetric around 0 so the sign is legible: blue =
+    // concave, green = flat, red = convex (95th pct of |curv| as the range).
+    std::vector<float> mag(curv.size());
+    for (size_t i = 0; i < curv.size(); ++i) mag[i] = std::fabs(curv[i]);
+    size_t p95 = std::min(mag.size() - 1, (size_t)((double)mag.size() * 0.95));
+    std::nth_element(mag.begin(), mag.begin() + p95, mag.end());
+    float range = std::max(mag[p95], 1e-9f);
+    colors.resize(curv.size());
+    for (size_t i = 0; i < curv.size(); ++i)
+        colors[i] = geometry::compareBandColor(curv[i], range, /*isSigned=*/true, /*bands=*/1);
+}
+
+// Curvature "Fit": flatten the high-curvature points -- any point whose surface
+// variation exceeds the threshold is projected onto its local PCA plane. The
+// SIGN doesn't matter for the projection (spikes and pits both land on the
+// plane); low-curvature points stay put, so smooth regions are untouched.
+// Undoable via the host's Fit apply, like PFOR's.
+void curvatureFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+                  const ProgressFn& progress) {
+    const auto& pts = in.points;
+    fitted = pts;
+    if (pts.size() < 8) return;
+    geometry::SparseGrid grid;
+    Eigen::Vector3f mn, mx;
+    buildGrid(pts, grid, mn, mx);
+    const int   k      = (int)std::lround(P(in, 0, 16.0f));
+    const float thresh = P(in, 1, 0.08f);
+
     parallelFor(pts.size(), progress, 0.0f, 1.0f, [&](size_t i) {
         thread_local std::vector<unsigned int> nbr;
         thread_local std::vector<float> dist;
@@ -732,9 +786,11 @@ void curvatureColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
         grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
         if (!neighbourhoodPCA(pts, nbr, c, eval, evec)) return;
         float s = eval.x() + eval.y() + eval.z();
-        curv[i] = s > 1e-12f ? eval.x() / s : 0.0f;
+        float m = s > 1e-12f ? eval.x() / s : 0.0f;
+        if (m <= thresh) return;
+        Eigen::Vector3f n = evec.col(0);
+        fitted[i] = pts[i] - n * (pts[i] - c).dot(n);  // project onto the local plane
     });
-    scalarToColors(curv, colors);
 }
 
 // --- Analyze: Normal deviation -----------------------------------------------
@@ -891,8 +947,10 @@ const ModeEntry kModes[] = {
      {{"Blur Iters", 0.0f, 5.0f, 2.0f, true}}},
     {"Clustering", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, clusteringColors, 1,
      {{"Radius %", 0.5f, 10.0f, 2.0f, false}}},
-    {"Curvature", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, curvatureColors, 1,
-     {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}}},
+    {"Curvature", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, curvatureColors, 2,
+     {{"K Neighbors", 6.0f, 64.0f, 16.0f, true},
+      {"Fit Thresh", 0.01f, 0.30f, 0.08f, false, 0.005f}},
+     curvatureFit},
     {"Normal Deviation", nullptr, ModeCategory::Analyze, ApplyKind::Recolor,
      normalDeviationColors, 1, {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}}},
     {"Density (KDE)", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, kdeColors, 1,
