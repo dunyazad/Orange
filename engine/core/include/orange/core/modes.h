@@ -25,6 +25,11 @@ struct ModeInput {
     std::vector<Eigen::Vector3f> points;
     std::vector<Eigen::Vector3f> normals;  // optional (used by reconstruction)
     std::vector<float> params;  // per-mode tunables (see modeParam); empty => defaults
+    // Optional candidate mask (size == points.size(), 1 = eligible), fed by the
+    // Pipeline's condition pin: filters that support it (modeSupportsCandidates)
+    // still build their reference statistics from ALL points but only ever
+    // remove/project the flagged candidates. Empty = every point eligible.
+    std::vector<uint8_t> candidates;
 };
 
 // Active-mode selector, stored in the registry ctx. The host bumps `generation`
@@ -86,6 +91,22 @@ ModeParam modeParam(int index, int p);
 void runModeColors(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
                    debug::DebugDraw& extras, const ProgressFn& progress = {});
 
+// Legend metadata published by the LAST runModeColors call: the scalar scale a
+// heatmap mode's colors saturate at (valid == false when that mode has no
+// numeric legend -- e.g. the keep/drop filters). The host polls this after a
+// recolor finishes and shows/hides the on-screen color-bar legend. Thread-safe
+// (the worker publishes, the main thread polls after completion).
+struct ModeLegend {
+    bool  valid    = false;
+    bool  isSigned = true;
+    float range    = 0.0f;  // colors saturate at +-range (signed) or 0..range
+    int   bands    = 1;     // quantization steps (1 = smooth ramp)
+    // Per-point scalar the colors encode (size == input points): lets the host
+    // range-filter the display (legend thumbs) without re-running the mode.
+    std::vector<float> scalars;
+};
+ModeLegend modeLastLegend();
+
 // Run a Remove mode: fills `mask` (one entry per input point, 1 = delete).
 void runModeMask(int index, const ModeInput& in, std::vector<uint8_t>& mask,
                  const ProgressFn& progress = {});
@@ -108,6 +129,12 @@ void runModeFit(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& fi
 // Smooth outputs the moved points, Bump Remove drops its blobs. Chain stages
 // by feeding one stage's output into the next.
 bool modeCanTransformPoints(int index);
+// True when the mode's Fit action exists AND differs from its points stage
+// (e.g. PFOR: points drops outliers, Fit projects them). Such modes get a
+// second "<name> Fit" stage on the Pipeline canvas.
+bool modeFitIsDistinct(int index);
+// Filters that honor ModeInput::candidates (the Pipeline condition pin).
+bool modeSupportsCandidates(int index);
 void runModePoints(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& outPoints,
                    const ProgressFn& progress = {});
 // Stable lookup of a mode by its registered display name (-1 if unknown).

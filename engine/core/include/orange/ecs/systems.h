@@ -53,6 +53,11 @@ void compareLegendInputSystem(entt::registry& world, core::Input& input,
 void poissonDialogInputSystem(entt::registry& world, core::Input& input,
                               uint32_t viewportW, uint32_t viewportH);
 
+// Font Size dialog (View menu): a slider + numeric input box that drive
+// core::setUiFontPx, rescaling every overlay live. No-op while hidden.
+void fontSizeDialogInputSystem(entt::registry& world, core::Input& input,
+                               uint32_t viewportW, uint32_t viewportH);
+
 // Generic mode-parameters dialog: one slider per modes::modeParam of the active
 // mode plus an Apply button (raises ModeParamsDialog::requestApply). Captures
 // input over the panel. No-op while hidden.

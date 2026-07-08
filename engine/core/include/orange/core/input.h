@@ -21,6 +21,12 @@ struct Input {
     bool ctrl         = false;  // a Ctrl key is held this frame (level state)
     bool alt          = false;  // an Alt key is held this frame (level state)
 
+    // Typed text this frame (UTF-8 from SDL text-input events) + editing keys,
+    // for widgets with a text field (e.g. the Font Size dialog's number box).
+    char text[16]  = {};
+    bool backspace = false;  // edge
+    bool enter     = false;  // edge
+
     // Clear accumulators that are only meaningful for a single frame.
     void newFrame() {
         mouseDeltaX  = 0.0f;
@@ -29,6 +35,9 @@ struct Input {
         leftClicked  = false;
         leftReleased = false;
         captured     = false;
+        text[0]      = '\0';
+        backspace    = false;
+        enter        = false;
     }
 };
 

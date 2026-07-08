@@ -13,6 +13,7 @@
 #include <entt/entt.hpp>
 
 #include "orange/core/input.h"
+#include "orange/core/modes.h"
 #include "orange/ecs/components.h"
 #include "orange/ecs/systems.h"
 
@@ -216,8 +217,45 @@ static void test_visibility() {
     CHECK(!ecs::entityVisibleOnScreen(w, off, 200, 200));
 }
 
+// --- pipeline: params-dialog edits reach the bound node ----------------------
+static void test_pipeline_param_sync() {
+    std::printf("[pipeline.param sync]\n");
+    entt::registry w;
+    auto e  = w.create();
+    auto& d = w.emplace<ecs::PipelineDialog>(e);
+    d.visible = true;
+
+    core::Input idle;  // no buttons: just runs the per-frame sync/seed
+    ecs::pipelineDialogInputSystem(w, idle, 1920, 1080);
+    CHECK(d.nodes.size() == 2);  // seeded Source + Output skeleton
+
+    const int qfor = orange::modes::modeIndexByName("Outlier: QFOR");
+    CHECK(qfor >= 0);
+    ecs::PipeNode n;
+    n.id   = 99;
+    n.role = ecs::PipeNodeRole::Stage;
+    n.mode = "Outlier: QFOR";
+    n.params = {24.0f, 3.0f, 1.0f};
+    d.nodes.push_back(n);
+
+    auto pe  = w.create();
+    auto& pd = w.emplace<ecs::ModeParamsDialog>(pe);
+    pd.visible    = true;
+    pd.modeIndex  = qfor;
+    pd.pipeNodeId = 99;                 // bound to the node, as a node click does
+    pd.values     = {64.0f, 5.0f, 0.0f};  // "user edited the sliders"
+
+    ecs::pipelineDialogInputSystem(w, idle, 1920, 1080);
+    const auto& np = d.nodes.back().params;
+    CHECK(np.size() == 3);
+    CHECK(np.size() == 3 && np[0] == 64.0f && np[1] == 5.0f && np[2] == 0.0f);
+}
+
 int main() {
     std::printf("Orange GUI behavior tests\n");
+    // The hardcoded hit coordinates below mirror the legacy 20px layout; pin
+    // the runtime font size to it (the app default is larger).
+    core::setUiFontPx(20.0f);
     test_toolbar();
     test_pick_object();
     test_pick_filter();
@@ -225,6 +263,7 @@ int main() {
     test_pick_box();
     test_pick_vertex();
     test_visibility();
+    test_pipeline_param_sync();
     std::printf("\n%d checks, %d failed\n", g_total, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

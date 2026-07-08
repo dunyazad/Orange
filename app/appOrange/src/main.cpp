@@ -30,6 +30,7 @@
 #include "orange/core/color.h"
 #include "orange/core/compare.h"
 #include "orange/core/crash_handler.h"
+#include "orange/core/modes.h"
 #include "orange/core/screenshot.h"
 #include "orange/core/ui_layout.h"
 #include "orange/core/buffer.h"
@@ -376,6 +377,8 @@ int main(int argc, char** argv) {
     // crash files. Harmless otherwise.
     bool shotMode = false;
     bool hangMode = false;
+    bool pipeMode = false;
+    bool legendMode = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--crashtest") == 0) {
             volatile int* p = nullptr;
@@ -387,6 +390,12 @@ int main(int argc, char** argv) {
         // `appOrange --hangtest` deliberately freezes the main thread so you can
         // confirm the watchdog catches the hang (writes orange_hang.txt/.dmp).
         if (std::strcmp(argv[i], "--hangtest") == 0) hangMode = true;
+        // `appOrange --shot --pipeline` opens the Pipeline Design dialog before
+        // the capture -- headless verification of the node-canvas UI.
+        if (std::strcmp(argv[i], "--pipeline") == 0) pipeMode = true;
+        // `appOrange --shot --legend` shows the color-bar legend with synthetic
+        // mode-legend values (range thumbs included) for headless UI checks.
+        if (std::strcmp(argv[i], "--legend") == 0) legendMode = true;
     }
     int shotFrames = 0;
     int hangFrames = 0;
@@ -735,6 +744,33 @@ int main(int argc, char** argv) {
         pd.mesh  = app.renderer()->createMesh(pdMeshDesc);
         pd.vbo   = pdVbo.handle();
         world.emplace<ecs::PoissonDialog>(e, pd);
+    }
+
+    // Font Size dialog (View menu): slider + numeric box for the UI font size.
+    const int kFontDlgQ = 128, kFontDlgV = kFontDlgQ * 4;  // must match kFontDlgQuads in systems.cpp
+    const std::vector<render::Vertex> fdInit(kFontDlgV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
+    std::vector<uint32_t> fdIdx;
+    for (uint32_t q = 0; q < static_cast<uint32_t>(kFontDlgQ); ++q) {
+        uint32_t b = q * 4;
+        fdIdx.insert(fdIdx.end(), {b, b + 1, b + 2, b, b + 2, b + 3});
+    }
+    core::VertexBuffer<render::Vertex> fdVbo(*app.renderer(), fdInit,
+                                             render::BufferUsage::Dynamic);
+    core::IndexBuffer                  fdIbo(*app.renderer(), fdIdx);
+    render::MeshDesc fdMeshDesc;
+    fdMeshDesc.vertexBuffer = fdVbo.handle();
+    fdMeshDesc.indexBuffer  = fdIbo.handle();
+    fdMeshDesc.layout       = render::Vertex::layout();
+    fdMeshDesc.vertexCount  = static_cast<uint32_t>(kFontDlgV);
+    fdMeshDesc.indexCount   = static_cast<uint32_t>(kFontDlgQ * 6);
+    {
+        auto e = world.create();
+        ecs::FontSizeDialog fd;
+        fd.font  = &uiFont;
+        fd.atlas = uiFont.texture;
+        fd.mesh  = app.renderer()->createMesh(fdMeshDesc);
+        fd.vbo   = fdVbo.handle();
+        world.emplace<ecs::FontSizeDialog>(e, fd);
     }
 
     // Mode-parameters dialog (generic sliders for the active geometry mode).
@@ -1107,6 +1143,47 @@ int main(int argc, char** argv) {
         auto          mbv = w.view<ecs::MenuBar>();
         for (auto e : mbv) { mb = &mbv.get<ecs::MenuBar>(e); break; }
 
+        // --pipeline: pop the Pipeline Design dialog once, via the menu action.
+        static bool pipeToggled = false;
+        if (pipeMode && !pipeToggled && mb) {
+            mb->triggered = ecs::MenuAction::PipelineDialogToggle;
+            pipeToggled   = true;
+        }
+        // --legend: show the legend once with synthetic mode values.
+        static bool legendShown = false;
+        if (legendMode && !legendShown) {
+            auto lgv = w.view<ecs::CompareLegend>();
+            for (auto le : lgv) {
+                auto& lg    = lgv.get<ecs::CompareLegend>(le);
+                lg.title    = "Normal Divergence";
+                lg.range    = 0.0523f;
+                lg.isSigned = true;
+                lg.bands    = 1;
+                lg.rms      = -1.0f;
+                lg.fromMode = true;
+                lg.selMin   = 0.22f;
+                lg.selMax   = 0.81f;
+                lg.visible  = true;
+                break;
+            }
+            // Also open the Font Size dialog (headless UI check).
+            auto fdv = w.view<ecs::FontSizeDialog>();
+            for (auto fe : fdv) { fdv.get<ecs::FontSizeDialog>(fe).visible = true; break; }
+            // Also open the params dialog so its legend strip + Extract show.
+            auto pdv = w.view<ecs::ModeParamsDialog>();
+            for (auto pe : pdv) {
+                auto& pd     = pdv.get<ecs::ModeParamsDialog>(pe);
+                pd.modeIndex = orange::modes::modeIndexByName("Normal Divergence");
+                int n        = orange::modes::modeParamCount(pd.modeIndex);
+                pd.values.resize(n);
+                for (int i = 0; i < n; ++i)
+                    pd.values[i] = orange::modes::modeParam(pd.modeIndex, i).defV;
+                pd.visible = true;
+                break;
+            }
+            legendShown = true;
+        }
+
         // Menu raised a request? Open the native dialog (unless one is already up).
         if (mb && mb->requestOpenFile) {
             mb->requestOpenFile = false;
@@ -1391,10 +1468,12 @@ int main(int argc, char** argv) {
                         auto lgv = w.view<ecs::CompareLegend>();
                         for (auto le : lgv) {
                             auto& lg    = lgv.get<ecs::CompareLegend>(le);
+                            lg.title    = "Compare";
                             lg.range    = s.range;
                             lg.isSigned = s.isSigned;
                             lg.rms      = s.rms;
                             lg.bands    = kBands;
+                            lg.fromMode = false;
                             lg.visible  = true;
                             break;
                         }

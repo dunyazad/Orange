@@ -17,4 +17,10 @@ namespace orange::core {
 void saveWidgetLayout(const entt::registry& world, const std::string& path);
 void loadWidgetLayout(entt::registry& world, const std::string& path);
 
+// App-wide UI font size in pixels (default 40 -- the legend's size). All
+// engine overlays (menu, toolbar, dialogs, tree view, legend, pipeline) size
+// their text AND layout from it; the View > Font Size... dialog sets it live.
+float uiFontPx();
+void  setUiFontPx(float px);  // clamped to [12, 64]
+
 } // namespace orange::core

@@ -195,6 +195,10 @@ void installWatchdog(double timeoutSeconds, const std::string& dir) {
                     &g_mainThread, 0, FALSE, DUPLICATE_SAME_ACCESS);
     g_watchRun.store(true);
     g_watchThread = std::thread(watchLoop);
+    // std::exit() paths (e.g. the --shot capture) run static destructors; a
+    // still-joinable g_watchThread would std::terminate there. atexit handlers
+    // registered after the thread's construction run BEFORE its destructor.
+    std::atexit(stopWatchdog);
 }
 
 void watchdogHeartbeat() { g_beat.fetch_add(1, std::memory_order_relaxed); }

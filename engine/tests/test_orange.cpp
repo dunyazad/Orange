@@ -222,6 +222,13 @@ static void test_normal_divergence() {
     int warm = 0;
     for (const auto& c : colors) warm += c.x() > c.z();
     CHECK(warm > (int)colors.size() * 9 / 10);
+
+    // The mode publishes a signed legend scale; a keep/drop filter does not.
+    orange::modes::ModeLegend ml = orange::modes::modeLastLegend();
+    CHECK(ml.valid && ml.isSigned && ml.range > 0.0f);
+    orange::modes::runModeColors(orange::modes::modeIndexByName("Outlier: QFOR"), in, colors,
+                                 extras);
+    CHECK(!orange::modes::modeLastLegend().valid);
 }
 
 // --- QFOR: quadric-fit outlier filter ----------------------------------------
@@ -279,13 +286,34 @@ static void test_qfor() {
     }
     CHECK(spikesMoved);
     CHECK(inliersHeld);
+
+    // Candidate mask (the Pipeline condition pin): QFOR may only drop flagged
+    // candidates -- the other spikes stay, however large their residual.
+    CHECK(orange::modes::modeSupportsCandidates(idx));
+    in.candidates.assign(in.points.size(), 0);
+    in.candidates[spikes[0]] = 1;  // only the first spike is eligible
+    orange::modes::runModeColors(idx, in, colors, extras);
+    int droppedMasked = 0;
+    for (size_t i = 0; i < colors.size(); ++i) droppedMasked += !kept(i);
+    CHECK(!kept(spikes[0]));
+    CHECK(droppedMasked == 1);
+    in.candidates.clear();
+
+    // Divergence Select: registered, chainable, and NOT itself candidate-aware
+    // (it PRODUCES the candidate set).
+    const int selIdx = orange::modes::modeIndexByName("Divergence Select");
+    CHECK(selIdx >= 0);
+    CHECK(orange::modes::modeCanTransformPoints(selIdx));
+    CHECK(!orange::modes::modeSupportsCandidates(selIdx));
 }
 
-// --- QFOR (Div Gate): divergence gate decides WHO gets judged ------------------
-// A unit sphere (supplied normals => divergence positive everywhere) with
-// radial spikes. Side=0 (+) gates the whole sphere in, so the spikes' quadric
-// residual removes them; Side=1 (-) gates nothing in, so the very same spikes
-// survive -- proving the gate, not the residual, is in charge.
+// --- QFOR (Div Gate): divergence-anomaly gate decides WHO gets judged ---------
+// A unit sphere (supplied radial normals) with radial spikes. The sphere's
+// uniform curvature high-passes to anomaly ~ 0; a spike tip's divergence drops
+// BELOW its neighbourhood's (the stretched-out geometry dilutes the normal
+// spread), so its anomaly is strongly NEGATIVE. Side=2 (both) gates the spikes
+// in and the quadric residual removes them; Side=0 (+ only) gates them out, so
+// the very same spikes survive -- proving the gate, not the residual, decides.
 static void test_qfor_div_gate() {
     std::printf("[qfor div gate]\n");
     const int idx = orange::modes::modeIndexByName("Outlier: QFOR (Div Gate)");
@@ -304,15 +332,16 @@ static void test_qfor_div_gate() {
     std::vector<int> spikes = {30, 95, 160, 225};
     for (int i : spikes) in.points[i] *= 1.3f;  // radial protrusion
 
-    const Eigen::Vector3f keepGreen(0.1f, 0.9f, 0.2f);
+    // 3-band viz: only RED means removed (amber = gated but kept).
+    const Eigen::Vector3f dropRed(0.5f, 0.12f, 0.12f);
     auto dropped = [&](const std::vector<Eigen::Vector3f>& c, size_t i) {
-        return (c[i] - keepGreen).squaredNorm() >= 1e-8f;
+        return (c[i] - dropRed).squaredNorm() < 1e-8f;
     };
     orange::debug::DebugDraw extras;
 
-    // Side = 0 (convex gate): the sphere's positive divergence lets QFOR judge
-    // everyone -> all spikes drop, false positives stay rare.
-    in.params = {24.0f, 3.0f, 0.3f, 0.0f};
+    // Side = 2 (both directions): the spikes' anomaly clears the gate, QFOR's
+    // residual removes them; false positives stay rare.
+    in.params = {24.0f, 3.0f, 2.0f, 2.0f, 1.0f};
     std::vector<Eigen::Vector3f> colors;
     orange::modes::runModeColors(idx, in, colors, extras);
     CHECK(colors.size() == in.points.size());
@@ -326,13 +355,92 @@ static void test_qfor_div_gate() {
     CHECK(spikeDrops == (int)spikes.size());
     CHECK(fp <= (int)in.points.size() / 20);
 
-    // Side = 1 (concave gate): nothing on a convex sphere qualifies -> even the
-    // spikes survive, residual notwithstanding.
-    in.params = {24.0f, 3.0f, 0.3f, 1.0f};
+    // Side = 0 (positive-anomaly gate): the spikes' anomaly is negative ->
+    // gated OUT -> they survive, residual notwithstanding.
+    in.params = {24.0f, 3.0f, 2.0f, 0.0f, 1.0f};
     orange::modes::runModeColors(idx, in, colors, extras);
-    int drops = 0;
-    for (size_t i = 0; i < colors.size(); ++i) drops += dropped(colors, i);
-    CHECK(drops == 0);
+    int spikeKept = 0;
+    for (int i : spikes) spikeKept += !dropped(colors, i);
+    CHECK(spikeKept == (int)spikes.size());
+
+    // Gate Raw = 1: the RAW divergence (the Normal Divergence heatmap's
+    // signal) is positive over the whole convex sphere, so Side = 0 now gates
+    // everything in -- the spikes drop again.
+    in.params = {24.0f, 3.0f, 2.0f, 0.0f, 1.0f, 1.0f};
+    orange::modes::runModeColors(idx, in, colors, extras);
+    int spikeDropsRaw = 0;
+    for (int i : spikes) spikeDropsRaw += dropped(colors, i);
+    CHECK(spikeDropsRaw == (int)spikes.size());
+
+    // PFOR (Div Gate): same gate, plane-distance core. Side = 2 drops the
+    // spikes; Side = 0 (their anomaly is negative) protects them.
+    const int pidx = orange::modes::modeIndexByName("Outlier: PFOR (Div Gate)");
+    CHECK(pidx >= 0);
+    CHECK(orange::modes::modeSupportsCandidates(pidx));
+    in.params = {16.0f, 0.05f, 2.0f, 2.0f, 0.0f};
+    orange::modes::runModeColors(pidx, in, colors, extras);
+    int pDrops = 0, pFp = 0;
+    for (size_t i = 0; i < colors.size(); ++i) {
+        if (isSpike[i]) pDrops += dropped(colors, i);
+        else pFp += dropped(colors, i);
+    }
+    CHECK(pDrops == (int)spikes.size());
+    // PFOR's plane is contaminated by the spike it shares a neighbourhood
+    // with (the reason QFOR exists), so points AROUND a spike may co-drop:
+    // allow a looser false-positive band than the quadric variant's 5%.
+    CHECK(pFp <= (int)in.points.size() * 3 / 20);
+    in.params = {16.0f, 0.05f, 2.0f, 0.0f, 0.0f};
+    orange::modes::runModeColors(pidx, in, colors, extras);
+    int pKept = 0;
+    for (int i : spikes) pKept += !dropped(colors, i);
+    CHECK(pKept == (int)spikes.size());
+}
+
+// --- QFOR (Dev Gate): normal-deviation angle decides WHO gets judged ----------
+// Sphere with two kinds of radial spikes: ones whose normal is TILTED 60 deg
+// (deviation >> Dev Deg -> gated -> removed) and ones whose normal stays
+// radial (deviation ~ 0 -> untouchable, residual notwithstanding).
+static void test_qfor_dev_gate() {
+    std::printf("[qfor dev gate]\n");
+    const int idx = orange::modes::modeIndexByName("Outlier: QFOR (Dev Gate)");
+    CHECK(idx >= 0);
+    CHECK(orange::modes::modeSupportsCandidates(idx));
+    CHECK(orange::modes::modeCanTransformPoints(idx));
+
+    orange::modes::ModeInput in;
+    for (int a = 0; a < 24; ++a)
+        for (int b = 1; b < 12; ++b) {
+            float phi = 2.0f * 3.14159265f * a / 24.0f, th = 3.14159265f * b / 12.0f;
+            Eigen::Vector3f n(std::sin(th) * std::cos(phi), std::cos(th),
+                              std::sin(th) * std::sin(phi));
+            in.points.push_back(n);
+            in.normals.push_back(n);
+        }
+    std::vector<int> tilted = {30, 95, 160}, clean = {225, 60};
+    for (int i : tilted) {
+        in.points[i] *= 1.3f;
+        Eigen::Vector3f n = in.normals[i];
+        Eigen::Vector3f t = n.cross(Eigen::Vector3f::UnitY());
+        if (t.squaredNorm() < 1e-6f) t = n.cross(Eigen::Vector3f::UnitX());
+        t.normalize();
+        in.normals[i] = (0.5f * n + 0.866f * t).normalized();  // ~60 deg off
+    }
+    for (int i : clean) in.points[i] *= 1.3f;  // big residual, orderly normal
+
+    const Eigen::Vector3f dropRed(0.5f, 0.12f, 0.12f);
+    std::vector<Eigen::Vector3f> colors;
+    orange::debug::DebugDraw extras;
+    in.params = {24.0f, 3.0f, 15.0f, 1.0f};
+    orange::modes::runModeColors(idx, in, colors, extras);
+    CHECK(colors.size() == in.points.size());
+    auto dropped = [&](size_t i) { return (colors[i] - dropRed).squaredNorm() < 1e-8f; };
+    int tiltedDrops = 0, cleanKept = 0, totalDrops = 0;
+    for (size_t i = 0; i < colors.size(); ++i) totalDrops += dropped(i);
+    for (int i : tilted) tiltedDrops += dropped(i);
+    for (int i : clean) cleanKept += !dropped(i);
+    CHECK(tiltedDrops == (int)tilted.size());
+    CHECK(cleanKept == (int)clean.size());
+    CHECK(totalDrops <= (int)tilted.size() + (int)in.points.size() / 20);
 }
 
 // --- mesh IO roundtrip ------------------------------------------------------
@@ -503,6 +611,7 @@ int main() {
     test_normal_divergence();
     test_qfor();
     test_qfor_div_gate();
+    test_qfor_dev_gate();
     test_processing();
     test_ui_layout();
     test_io();

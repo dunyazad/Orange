@@ -57,7 +57,7 @@ void pushRenderableChangeOp(entt::registry& world, std::vector<ModeChange> chang
 // reload that mode's defaults; with this, coming back to a mode restores what
 // the user last set. Persisted across runs in a text file next to the exe.
 struct ModeParamMemory {
-    std::unordered_map<int, std::array<float, 8>> values;
+    std::unordered_map<int, std::vector<float>> values;
 };
 
 // One line per mode: "<mode name>\tv0 v1 ... v7". Keyed by NAME, not index, so
@@ -79,11 +79,10 @@ void loadModeParamMemory(ModeParamMemory& mem) {
         for (int i = 0; i < modes::modeCount(); ++i)
             if (name == modes::modeName(i)) { idx = i; break; }
         if (idx < 0) continue;  // mode no longer exists
-        std::array<float, 8> vals{};
+        std::vector<float> vals;
         std::istringstream ss(line.substr(tab + 1));
-        int k = 0;
-        for (float x; k < 8 && (ss >> x); ++k) vals[k] = x;
-        if (k > 0) mem.values[idx] = vals;
+        for (float x; ss >> x;) vals.push_back(x);
+        if (!vals.empty()) mem.values[idx] = std::move(vals);
     }
 }
 
@@ -92,9 +91,10 @@ void saveModeParamMemory(const ModeParamMemory& mem) {
     std::ofstream f(modeParamFilePath(), std::ios::trunc);
     if (!f) return;
     for (const auto& [idx, vals] : mem.values) {
-        if (idx < 0 || idx >= modes::modeCount()) continue;
+        if (idx < 0 || idx >= modes::modeCount() || vals.empty()) continue;
         f << modes::modeName(idx) << '\t';
-        for (int i = 0; i < 8; ++i) f << vals[i] << (i + 1 < 8 ? ' ' : '\n');
+        for (size_t i = 0; i < vals.size(); ++i)
+            f << vals[i] << (i + 1 < vals.size() ? ' ' : '\n');
     }
 }
 
@@ -111,10 +111,8 @@ void captureModeParams(entt::registry& world, ModeParamMemory& mem) {
     auto v = world.view<ecs::ModeParamsDialog>();
     for (auto e : v) {
         auto& d = v.get<ecs::ModeParamsDialog>(e);
-        if (d.modeIndex >= 0 && d.pipeNodeId < 0) {
-            auto& slot = mem.values[d.modeIndex];
-            for (int i = 0; i < 8; ++i) slot[i] = d.values[i];
-        }
+        if (d.modeIndex >= 0 && d.pipeNodeId < 0 && !d.values.empty())
+            mem.values[d.modeIndex] = d.values;
         break;
     }
 }
@@ -140,9 +138,11 @@ void syncModeParamsDialog(entt::registry& world, int modeIndex) {
         if (d.modeIndex != modeIndex || d.pipeNodeId >= 0) {
             d.modeIndex = modeIndex;
             auto it = mem.values.find(modeIndex);
-            for (int i = 0; i < n && i < 8; ++i)
-                d.values[i] = (it != mem.values.end()) ? it->second[i]
-                                                       : modes::modeParam(modeIndex, i).defV;
+            d.values.resize(n);
+            for (int i = 0; i < n; ++i)  // remembered value, else the default
+                d.values[i] = (it != mem.values.end() && i < (int)it->second.size())
+                                  ? it->second[i]
+                                  : modes::modeParam(modeIndex, i).defV;
         }
         d.pipeNodeId = -1;  // regular mode editing detaches any pipeline-node binding
         d.h       = 42 + n * 36 + 46 +
@@ -217,6 +217,9 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
     plugin_->renderer()->setColorMode(colorMode_);
     vsync_ = config_.vsync;
 
+    // Typed characters flow as SDL text-input events (Font Size number box).
+    SDL_StartTextInput(window_.handle());
+
     Uint64 last = SDL_GetPerformanceCounter();
     const double freq = static_cast<double>(SDL_GetPerformanceFrequency());
 
@@ -229,7 +232,17 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
                 case SDL_EVENT_QUIT:
                     running_ = false;
                     break;
+                case SDL_EVENT_TEXT_INPUT: {  // typed characters (Font Size field etc.)
+                    size_t len = std::strlen(input_.text);
+                    size_t add = std::strlen(e.text.text);
+                    if (len + add < sizeof(input_.text))
+                        std::memcpy(input_.text + len, e.text.text, add + 1);
+                    break;
+                }
                 case SDL_EVENT_KEY_DOWN:
+                    if (e.key.key == SDLK_BACKSPACE) input_.backspace = true;
+                    if (e.key.key == SDLK_RETURN || e.key.key == SDLK_KP_ENTER)
+                        input_.enter = true;
                     // A visible confirm dialog eats Esc as "No" and Enter as
                     // "Yes"; Esc only quits when no dialog is up.
                     if (e.key.key == SDLK_ESCAPE || e.key.key == SDLK_RETURN ||
@@ -501,6 +514,7 @@ void Application::run(const std::function<void(entt::registry&, float)>& onUpdat
         ecs::crossSectionInputSystem(world_, input_, window_.width(), window_.height());
         ecs::compareLegendInputSystem(world_, input_, window_.width(), window_.height());
         ecs::poissonDialogInputSystem(world_, input_, window_.width(), window_.height());
+        ecs::fontSizeDialogInputSystem(world_, input_, window_.width(), window_.height());
         ecs::modeParamsDialogInputSystem(world_, input_, window_.width(), window_.height());
         ecs::pipelineDialogInputSystem(world_, input_, window_.width(), window_.height());
         ecs::pipelineGraphSystem(world_, *plugin_->renderer());
@@ -929,6 +943,12 @@ void Application::applyMenuAction(int action) {
         case A::PoissonDialogToggle: {
             auto v = world_.view<ecs::PoissonDialog>();
             for (auto ent : v) { auto& pd = v.get<ecs::PoissonDialog>(ent); pd.visible = !pd.visible; break; }
+            break;
+        }
+
+        case A::FontSizeDialogToggle: {
+            auto v = world_.view<ecs::FontSizeDialog>();
+            for (auto ent : v) { auto& fd = v.get<ecs::FontSizeDialog>(ent); fd.visible = !fd.visible; break; }
             break;
         }
 

@@ -10,6 +10,7 @@
 #include "orange/core/draw_mode.h"
 #include "orange/core/font.h"
 #include "orange/core/math.h"
+#include "orange/core/ui_layout.h"  // core::uiFontPx (app-wide UI font size)
 #include "orange/render/types.h"
 
 // ECS components. These are plain structs; behavior lives in systems.
@@ -357,11 +358,25 @@ struct CompareLegend {
     bool  visible  = false;
     bool  isSigned = true;
     float range    = 1.0f;   // color range: +-range (signed) or 0..range
-    float rms      = 0.0f;
-    int   bands    = 12;     // quantization steps (matches the painted mesh)
+    float rms      = 0.0f;   // < 0 hides the RMS readout line
+    int   bands    = 12;     // quantization steps (1 = smooth ramp)
+    std::string title = "Compare";
+    // Shown by a heatmap processing mode (Normal Divergence, ...) rather than
+    // 3D Compare: auto-hides when the mode ends or a legend-less mode runs.
+    bool fromMode = false;
 
-    int w = 150, h = 340;    // panel size (px)
-    int x = 0, y = 0;        // computed each frame (top-right column)
+    // Range-selection thumbs on the color bar (normalized 0 = bar bottom /
+    // lowest value, 1 = top). Mode legends only: points whose scalar falls
+    // outside [selMin, selMax] are hidden (drawn transparent) by
+    // processingModeSystem. Reset to the full range on every new legend.
+    float selMin = 0.0f, selMax = 1.0f;
+    int   dragThumb = -1;      // 0 = min thumb, 1 = max thumb (while dragging)
+
+    int w = 300, h = 680;      // panel size (px)
+    int x = 0, y = 0;          // auto top-right column until the user drags it
+    bool  userPlaced = false;  // title-strip drag detaches from auto placement
+    bool  dragging   = false;
+    float dragDX = 0, dragDY = 0;
 
     const core::Font*     font  = nullptr;
     render::TextureHandle atlas = render::kInvalidTexture;
@@ -408,9 +423,14 @@ struct PoissonDialog {
 struct ModeParamsDialog {
     bool visible   = false;
     int  modeIndex = -1;      // which mode the sliders edit
-    float values[8] = {};     // current values (modes::modeParamCount entries used)
+    // Current values, sized to modes::modeParamCount whenever the dialog is
+    // (re)bound to a mode or a pipeline node -- no fixed parameter cap.
+    std::vector<float> values;
     bool requestApply = false;  // edge: "Apply" clicked -> app re-runs the mode
     bool requestFit   = false;  // edge: "Fit" clicked -> apply the mode's fit action
+    // Edge: "Extract" clicked (legend strip) -> processingModeSystem spawns the
+    // points inside the legend's [selMin, selMax] range as a new point cloud.
+    bool requestExtract = false;
 
     // When >= 0 the dialog edits a Pipeline Design NODE's parameters instead of
     // the active mode: values sync back into that node every frame (see
@@ -430,27 +450,59 @@ struct ModeParamsDialog {
     render::BufferHandle   vbo  = render::kInvalidBuffer;
 };
 
-// Node kinds available on the Pipeline Design canvas. Source feeds the
-// selected (or only) point cloud in; the middle kinds are points->points
-// stages (modes::runModePoints / runModeFit); Output spawns the result as a
-// new point-cloud entity (undoable).
-// NOTE: the saved-graph file stores these as ints; pipeLoadGraph remaps older
-// file versions when a kind is inserted (see the "ver" line handling).
-enum class PipeNodeKind : int {
-    Source = 0, SOR, ROR, PFOR, PforFit, Smooth, BumpRemove, MLS, Output, Count
+// "Font Size" dialog (View menu): a slider plus a numeric input box that set
+// the app-wide UI font size (core::setUiFontPx) live. fontSizeDialogInputSystem
+// handles the slider drag, the box focus/typing, and the title-bar drag;
+// renderSystem draws it as an overlay when `visible`.
+struct FontSizeDialog {
+    bool visible = false;
+    int  w = 0, h = 0;         // recomputed each frame from the font size
+    int  x = 0, y = 0;
+    bool placed   = false;
+    bool dragging = false;
+    float dragDX = 0, dragDY = 0;
+    bool dragSlider = false;
+    bool editing = false;      // the number box has keyboard focus
+    std::string editBuf;       // digits typed while editing (committed on Enter)
+
+    const core::Font*     font  = nullptr;
+    render::TextureHandle atlas = render::kInvalidTexture;
+    render::MeshHandle     mesh = render::kInvalidMesh;
+    render::BufferHandle   vbo  = render::kInvalidBuffer;
 };
+
+// What a Pipeline Design node IS. Source feeds the selected (or only) point
+// cloud in; Output spawns the result as a new point-cloud entity (undoable);
+// a Stage runs its backing geometry mode's points->points action
+// (modes::runModePoints, or runModeFit when `fit`). Stages are generated from
+// the modes registry -- every mode with a points stage appears on the
+// palette automatically, plus a "<name> Fit" stage where the Fit action is
+// distinct -- so adding a mode in modes.cpp needs no change here.
+enum class PipeNodeRole : int { Source = 0, Stage, Output };
 
 // One node / one edge of the pipeline graph. Node positions are in canvas
 // space (panned); each node has one input pin (left) and one output pin
-// (right) except Source (output only) and Output (input only).
+// (right) except Source (output only) and Output (input only). Stage nodes
+// reference their backing mode BY NAME (stable across mode reordering; the
+// saved-graph file stores the name since ver 4 -- pipeLoadGraph remaps the
+// kind ints of older files).
 struct PipeNode {
-    int   id   = 0;
-    PipeNodeKind kind = PipeNodeKind::Source;
-    float x = 0, y = 0;      // canvas coords (px)
-    float params[4] = {};    // per-node copy of the backing mode's tunables
+    int          id   = 0;
+    PipeNodeRole role = PipeNodeRole::Stage;
+    std::string  mode;         // backing mode display name (Stage only)
+    bool         fit  = false; // run the mode's Fit action instead of its points stage
+    float x = 0, y = 0;        // canvas coords (px)
+    // Per-node copy of the backing mode's tunables, sized to that mode's
+    // modeParamCount by pipeInitNodeParams / pipeLoadGraph (no cap; the graph
+    // file stores the count per node since ver 3).
+    std::vector<float> params;
 };
 struct PipeLink {
     int from = 0, to = 0;  // node ids: from's output pin -> to's input pin
+    // Which input pin of `to`: 0 = main cloud, 1 = condition (candidate set --
+    // the points a candidate-aware filter is ALLOWED to remove/project; shown
+    // only on stages whose mode supports it, e.g. the outlier filters).
+    int toPin = 0;
 };
 
 // Modeless "Pipeline Design" dialog: a Blueprint-style node canvas for visual
@@ -640,7 +692,9 @@ struct SpatialVizCache {
 
 // Height (px) of the top menu bar. The axis gizmo and camera-controls panel are
 // pushed down by this so they never overlap the bar. Shared by systems.cpp.
-inline constexpr int kMenuBarHeight = 46;
+// Tracks the app-wide font size (View > Font Size...).
+inline int kMenuBarHeightPx() { return (int)(2.3f * core::uiFontPx()); }
+#define kMenuBarHeight (orange::ecs::kMenuBarHeightPx())
 
 // Action ids raised by a menu item click. menuBarInputSystem writes the chosen
 // item's `action` into MenuBar::triggered; Application::applyMenuAction consumes
@@ -669,6 +723,7 @@ enum class MenuAction : int {
     SpatialNone, SpatialBVH, SpatialOctree, SpatialKDTree,
     SpatialGrid, SpatialLoose, SpatialBSP, SpatialRTree, SpatialBall,
     PoissonDialogToggle,  // open/close the Poisson reconstruction parameter dialog
+    FontSizeDialogToggle,  // open/close the app-wide Font Size dialog (View menu)
     // Pipelines menu (tooth-segmentation). Stage 1 sub-steps.
     PipelineOcclusalEstimate,      // occlusal plane: full pipeline (cusps -> fit) in one click
     PipelineOcclusalWholePCA,      // occlusal plane: coarse whole-mesh PCA, viz plane + normal

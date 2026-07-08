@@ -7,6 +7,7 @@
 #include <cstring>
 #include <execution>
 #include <functional>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <unordered_map>
@@ -426,6 +427,31 @@ bool neighbourhoodPCA(const std::vector<Eigen::Vector3f>& pts,
     return true;
 }
 
+// Last-run legend (see modes.h). The worker thread publishes from inside a
+// colors fn; the host polls after the job completes.
+std::mutex g_legendMx;
+ModeLegend g_legend;
+void publishLegend(bool isSigned, float range, int bands, std::vector<float> scalars = {}) {
+    std::lock_guard<std::mutex> lk(g_legendMx);
+    g_legend = {true, isSigned, range, bands, std::move(scalars)};
+}
+void clearLegend() {
+    std::lock_guard<std::mutex> lk(g_legendMx);
+    g_legend = {};
+}
+
+// Candidate gate (ModeInput::candidates): points outside the mask are never
+// removed/projected, whatever the filter's own verdict.
+bool isCandidate(const ModeInput& in, size_t i) {
+    return in.candidates.size() != in.points.size() || in.candidates[i];
+}
+// Force-keep the non-candidates after a filter computed its keep mask.
+void keepNonCandidates(const ModeInput& in, std::vector<uint8_t>& keep) {
+    if (in.candidates.size() != in.points.size()) return;
+    for (size_t i = 0; i < keep.size(); ++i)
+        if (!in.candidates[i]) keep[i] = 1;
+}
+
 // Keep/drop result as per-point colors: kept green, removed faded red.
 const Eigen::Vector3f kKeepGreen(0.1f, 0.9f, 0.2f);
 const Eigen::Vector3f kDropRed(0.5f, 0.12f, 0.12f);
@@ -479,6 +505,7 @@ void sorColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
 
     std::vector<uint8_t> keep(pts.size());
     for (size_t i = 0; i < pts.size(); ++i) keep[i] = meanDist[i] <= (float)thresh;
+    keepNonCandidates(in, keep);
     keepToColors(keep, colors);
 }
 
@@ -503,6 +530,7 @@ void rorColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
         grid.pointsWithinRadius(pts, pts[i], radius, nbr, dist);
         keep[i] = (int)nbr.size() - 1 >= minN;  // exclude self
     });
+    keepNonCandidates(in, keep);
     keepToColors(keep, colors);
 }
 
@@ -532,6 +560,7 @@ void pforColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
         float extent = std::sqrt(std::max(eval.y(), 1e-12f));  // in-plane spread
         keep[i] = planeDist <= beta * extent;
     });
+    keepNonCandidates(in, keep);
     keepToColors(keep, colors);
 }
 
@@ -557,7 +586,8 @@ void pforFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
         Eigen::Vector3f n = evec.col(0);
         float d = (pts[i] - c).dot(n);
         float extent = std::sqrt(std::max(eval.y(), 1e-12f));
-        if (std::abs(d) > beta * extent) fitted[i] = pts[i] - n * d;  // project outlier
+        if (std::abs(d) > beta * extent && isCandidate(in, i))
+            fitted[i] = pts[i] - n * d;  // project outlier
     });
 }
 
@@ -602,13 +632,78 @@ std::vector<float> normalDivergenceField(const ModeInput& in, int k,
 }
 
 // 95th-percentile magnitude of a scalar field -- the normalization scale the
-// divergence colors saturate at and the gated QFOR's Div Thresh is relative to.
+// divergence colors saturate at.
 float fieldRange95(const std::vector<float>& v) {
     std::vector<float> mag(v.size());
     for (size_t i = 0; i < v.size(); ++i) mag[i] = std::fabs(v[i]);
     size_t p95 = std::min(mag.size() - 1, (size_t)((double)mag.size() * 0.95));
     std::nth_element(mag.begin(), mag.begin() + p95, mag.end());
     return std::max(mag[p95], 1e-9f);
+}
+
+// Divergence ANOMALY: the raw field minus each point's neighbourhood median.
+// On a curved model the raw divergence is dominated by the smooth curvature
+// baseline (a paraboloid is "diverging" everywhere), so thresholding it gates
+// almost the whole cloud and can even sit BELOW a spike tip's value. The
+// local-median high-pass removes that baseline; what remains is how much a
+// point's normal-field behaviour deviates from its own surroundings -- spikes
+// and dents stand out, uniform curvature reads as 0. `sigmaOut` returns the
+// anomaly's robust scale (1.4826 * MAD, floored vs the raw field so a
+// perfectly smooth cloud doesn't gate on numeric dust).
+std::vector<float> normalDivergenceAnomaly(const ModeInput& in, int k,
+                                           const ProgressFn& progress, float p0, float p1,
+                                           float& sigmaOut) {
+    const auto& pts = in.points;
+    const float pm = p0 + (p1 - p0) * 0.8f;
+    std::vector<float> divg = normalDivergenceField(in, k, progress, p0, pm);
+    std::vector<float> anom(pts.size(), 0.0f);
+    sigmaOut = 0.0f;
+    if (pts.size() < 8) return anom;
+    geometry::SparseGrid grid;
+    Eigen::Vector3f mn, mx;
+    buildGrid(pts, grid, mn, mx);
+    parallelFor(pts.size(), progress, pm, p1, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist, dv;
+        grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
+        if (nbr.size() < 4) return;
+        dv.clear();
+        for (size_t t = 1; t < nbr.size(); ++t) dv.push_back(divg[nbr[t]]);
+        std::nth_element(dv.begin(), dv.begin() + dv.size() / 2, dv.end());
+        anom[i] = divg[i] - dv[dv.size() / 2];
+    });
+    std::vector<float> mag(anom.size());
+    for (size_t i = 0; i < anom.size(); ++i) mag[i] = std::fabs(anom[i]);
+    std::nth_element(mag.begin(), mag.begin() + mag.size() / 2, mag.end());
+    sigmaOut = std::max(1.4826f * mag[mag.size() / 2],
+                        1e-3f * fieldRange95(divg));  // clean-cloud floor
+    return anom;
+}
+
+
+// Shared divergence gate for the gated outlier filters: 1 = the point's
+// divergence signal crosses the threshold and may be judged. `sigmaMul` is the
+// "Div Sigma" param; `raw` switches from the anomaly (local-median high-pass,
+// MAD-scaled -- robust on curved models) to the raw field on the Normal
+// Divergence heatmap's 95th-pct scale. Side: 0 = > +t, 1 = < -t, 2 = |.| > t.
+std::vector<uint8_t> divergenceGate(const ModeInput& in, int k, float sigmaMul, int side,
+                                    bool raw, const ProgressFn& progress, float p0, float p1) {
+    std::vector<float> sig;
+    float t;
+    if (raw) {
+        sig = normalDivergenceField(in, k, progress, p0, p1);
+        t   = sigmaMul * 0.1f * fieldRange95(sig);
+    } else {
+        float divSigma = 0.0f;
+        sig = normalDivergenceAnomaly(in, k, progress, p0, p1, divSigma);
+        t   = sigmaMul * divSigma;
+    }
+    std::vector<uint8_t> gate(sig.size(), 0);
+    for (size_t i = 0; i < sig.size(); ++i)
+        gate[i] = side == 0   ? sig[i] > t
+                  : side == 1 ? sig[i] < -t
+                              : std::fabs(sig[i]) > t;
+    return gate;
 }
 
 // --- Filter: Quadric-Fitting Outlier Removal (QFOR) --------------------------
@@ -627,8 +722,13 @@ float fieldRange95(const std::vector<float>& v) {
 // Thresholding happens globally in the callers: sigma = 1.4826 * median(|res|)
 // (a robust MAD scale -- mean/stddev would be dragged by the very outliers
 // we're hunting), outlier when |res| > alpha * sigma. Params: 0 = K, 1 = Alpha.
+// `halfKSkip` toggles the sparse-fringe rule: on = skip points with fewer than
+// K/2 found neighbours (under-sampled reference surface, judged as inliers);
+// off = judge everything the 6-unknown fit can mathematically handle (floor of
+// 9 neighbours stays -- below that the LS system is not overdetermined).
 std::vector<float> qforResiduals(const ModeInput& in, std::vector<Eigen::Vector3f>& normals,
-                                 const ProgressFn& progress, float p0, float p1) {
+                                 const ProgressFn& progress, float p0, float p1,
+                                 bool halfKSkip) {
     const auto& pts = in.points;
     std::vector<float> res(pts.size(), 0.0f);
     normals.assign(pts.size(), Eigen::Vector3f::UnitY());
@@ -645,8 +745,8 @@ std::vector<float> qforResiduals(const ModeInput& in, std::vector<Eigen::Vector3
         // Sparse fringe: fewer than half the requested neighbours found -> the
         // reference surface would be under-sampled, skip (point stays an
         // inlier). Absolute floor of 9 keeps the 6-unknown fit overdetermined
-        // even at small K.
-        if ((int)nbr.size() - 1 < std::max(9, k / 2)) return;
+        // even at small K (and is all that remains with halfKSkip off).
+        if ((int)nbr.size() - 1 < (halfKSkip ? std::max(9, k / 2) : 9)) return;
         oth.assign(nbr.begin() + 1, nbr.end());  // [0] is the query point itself
         if (!neighbourhoodPCA(pts, oth, c, eval, evec)) return;
         const Eigen::Vector3f n  = evec.col(0);
@@ -730,10 +830,12 @@ void qforColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
     const auto& pts = in.points;
     if (pts.size() < 16) return;
     std::vector<Eigen::Vector3f> nrm;
-    std::vector<float> res = qforResiduals(in, nrm, progress, 0.0f, 0.98f);
+    std::vector<float> res =
+        qforResiduals(in, nrm, progress, 0.0f, 0.98f, P(in, 2, 1.0f) != 0.0f);
     const float thresh = qforThreshold(in, res);
     std::vector<uint8_t> keep(pts.size());
     for (size_t i = 0; i < pts.size(); ++i) keep[i] = std::fabs(res[i]) <= thresh;
+    keepNonCandidates(in, keep);
     keepToColors(keep, colors);
 }
 
@@ -745,10 +847,12 @@ void qforFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
     fitted = pts;
     if (pts.size() < 16) return;
     std::vector<Eigen::Vector3f> nrm;
-    std::vector<float> res = qforResiduals(in, nrm, progress, 0.0f, 0.98f);
+    std::vector<float> res =
+        qforResiduals(in, nrm, progress, 0.0f, 0.98f, P(in, 2, 1.0f) != 0.0f);
     const float thresh = qforThreshold(in, res);
     for (size_t i = 0; i < pts.size(); ++i)
-        if (std::fabs(res[i]) > thresh) fitted[i] = pts[i] - nrm[i] * res[i];
+        if (std::fabs(res[i]) > thresh && isCandidate(in, i))
+            fitted[i] = pts[i] - nrm[i] * res[i];
 }
 
 // --- Filter: QFOR gated by normal divergence ----------------------------------
@@ -756,56 +860,153 @@ void qforFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
 // "consider a point an outlier candidate only where the normal field says
 // something is happening" (spike tips fan normals OUT, pits fan them IN).
 // Points outside the gate are always kept, however far off their quadric they
-// sit -- this protects deliberate sharp detail whose residual is high but
-// whose normal field is orderly. The divergence is normalized by its 95th
-// percentile magnitude (the same scale the Normal Divergence mode's colors
-// saturate at), so Div Thresh is unit-free. Side picks the gate direction:
-// 0 = div > +t (convex, spikes), 1 = div < -t (concave, pits), 2 = |div| > t
-// (both). The QFOR core reads params 0/1 (K, Alpha) at the same indices as the
-// plain QFOR mode. Params: 0 = K, 1 = Alpha, 2 = Div Thresh, 3 = Side.
-void qforDivFlags(const ModeInput& in, std::vector<uint8_t>& drop,
+// sit -- this protects deliberate sharp detail whose normal field is orderly.
+// The gate tests the divergence ANOMALY (raw field minus the neighbourhood
+// median -- see normalDivergenceAnomaly; raw divergence is curvature-dominated
+// and gated ~everything on curved models), against Div Sigma multiples of its
+// robust MAD scale. Side picks the direction: 0 = anomaly > +t, 1 = anomaly
+// < -t, 2 = |anomaly| > t (both). The QFOR core reads params 0/1 (K, Alpha) at
+// the same indices as the plain QFOR mode. Params: 0 = K, 1 = Alpha,
+// 2 = Div Sigma, 3 = Side, 4 = Sparse Skip.
+void qforDivFlags(const ModeInput& in, std::vector<uint8_t>& drop, std::vector<uint8_t>& gate,
                   std::vector<Eigen::Vector3f>& nrmOut, std::vector<float>& resOut,
                   const ProgressFn& progress) {
     const auto& pts = in.points;
     drop.assign(pts.size(), 0);
+    gate.assign(pts.size(), 0);
     resOut.clear();
     if (pts.size() < 16) return;
     const int k = (int)std::lround(P(in, 0, 24.0f));
-    const std::vector<float> divg = normalDivergenceField(in, k, progress, 0.0f, 0.4f);
-    const float t    = P(in, 2, 0.5f) * fieldRange95(divg);
-    const int   side = (int)std::lround(P(in, 3, 2.0f));
+    gate = divergenceGate(in, k, P(in, 2, 2.0f), (int)std::lround(P(in, 3, 2.0f)),
+                          P(in, 5, 0.0f) != 0.0f, progress, 0.0f, 0.4f);
 
-    resOut = qforResiduals(in, nrmOut, progress, 0.4f, 0.98f);
+    resOut = qforResiduals(in, nrmOut, progress, 0.4f, 0.98f, P(in, 4, 1.0f) != 0.0f);
     const float thresh = qforThreshold(in, resOut);
-    for (size_t i = 0; i < pts.size(); ++i) {
-        bool gated = side == 0   ? divg[i] > t
-                     : side == 1 ? divg[i] < -t
-                                 : std::fabs(divg[i]) > t;
-        drop[i] = gated && std::fabs(resOut[i]) > thresh;
-    }
+    for (size_t i = 0; i < pts.size(); ++i)
+        drop[i] = gate[i] && std::fabs(resOut[i]) > thresh && isCandidate(in, i);
 }
 
+// Three-band viz so the gate is VISIBLE: red = removed, amber = passed the
+// divergence gate but judged fine by the quadric residual, green = outside
+// the gate (never considered).
 void qforDivColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
                    debug::DebugDraw& extras, const ProgressFn& progress) {
     (void)extras;
-    std::vector<uint8_t> drop;
+    std::vector<uint8_t> drop, gate;
     std::vector<Eigen::Vector3f> nrm;
     std::vector<float> res;
-    qforDivFlags(in, drop, nrm, res, progress);
-    std::vector<uint8_t> keep(drop.size());
-    for (size_t i = 0; i < drop.size(); ++i) keep[i] = !drop[i];
-    keepToColors(keep, colors);
+    qforDivFlags(in, drop, gate, nrm, res, progress);
+    const Eigen::Vector3f amber(0.95f, 0.75f, 0.15f);
+    colors.assign(in.points.size(), kKeepGreen);
+    for (size_t i = 0; i < drop.size(); ++i)
+        colors[i] = drop[i] ? kDropRed : (gate[i] ? amber : kKeepGreen);
 }
 
 void qforDivFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
                 const ProgressFn& progress) {
     fitted = in.points;
-    std::vector<uint8_t> drop;
+    std::vector<uint8_t> drop, gate;
     std::vector<Eigen::Vector3f> nrm;
     std::vector<float> res;
-    qforDivFlags(in, drop, nrm, res, progress);
+    qforDivFlags(in, drop, gate, nrm, res, progress);
     for (size_t i = 0; i < drop.size(); ++i)
         if (drop[i]) fitted[i] = in.points[i] - nrm[i] * res[i];
+}
+
+// --- Filter: Divergence Select --------------------------------------------------
+// SELECT (keep) exactly the points whose normal-field divergence ANOMALY
+// (local-median high-pass; see normalDivergenceAnomaly) crosses Div Sigma
+// multiples of its MAD scale; everything else drops. The inverse framing of an
+// outlier filter: the kept subset is a selection, meant to feed the Pipeline's
+// condition pin (e.g. Source -> Div Select -> QFOR's cond input restricts
+// which points QFOR may remove). Side: 0 = anomaly > +t, 1 = anomaly < -t,
+// 2 = |anomaly| > t (both).
+void divSelectColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                     debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
+    const auto& pts = in.points;
+    if (pts.size() < 8) return;
+    const int k = (int)std::lround(P(in, 0, 16.0f));
+    std::vector<uint8_t> keep =
+        divergenceGate(in, k, P(in, 1, 2.0f), (int)std::lround(P(in, 2, 2.0f)),
+                       P(in, 3, 0.0f) != 0.0f, progress, 0.0f, 1.0f);
+    keepToColors(keep, colors);
+}
+
+// --- Filter: PFOR gated by normal divergence ------------------------------------
+// The divergence gate in front of PFOR's plane-distance test (the plane
+// variant of the div-gated QFOR): only points whose divergence signal crosses
+// the threshold may be judged, and of those only the ones farther than
+// beta * neighbourhood-extent off their local PCA plane drop. Params:
+// 0 = K, 1 = Beta, 2 = Div Sigma, 3 = Side, 4 = Gate Raw.
+void pforDivFlags(const ModeInput& in, std::vector<uint8_t>& drop, std::vector<uint8_t>& gate,
+                  std::vector<Eigen::Vector3f>& nrmOut, std::vector<float>& distOut,
+                  const ProgressFn& progress) {
+    const auto& pts = in.points;
+    drop.assign(pts.size(), 0);
+    gate.assign(pts.size(), 0);
+    nrmOut.assign(pts.size(), Eigen::Vector3f::UnitY());
+    distOut.assign(pts.size(), 0.0f);
+    if (pts.size() < 8) return;
+    const int   k    = (int)std::lround(P(in, 0, 16.0f));
+    const float beta = P(in, 1, 0.05f);
+    gate = divergenceGate(in, k, P(in, 2, 2.0f), (int)std::lround(P(in, 3, 2.0f)),
+                          P(in, 4, 0.0f) != 0.0f, progress, 0.0f, 0.5f);
+
+    geometry::SparseGrid grid;
+    Eigen::Vector3f mn, mx;
+    buildGrid(pts, grid, mn, mx);
+    std::vector<uint8_t> outlier(pts.size(), 0);
+    parallelFor(pts.size(), progress, 0.5f, 1.0f, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
+        Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
+        grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
+        if (!neighbourhoodPCA(pts, nbr, c, eval, evec)) return;
+        Eigen::Vector3f n = evec.col(0);
+        float d      = (pts[i] - c).dot(n);
+        float extent = std::sqrt(std::max(eval.y(), 1e-12f));
+        nrmOut[i]  = n;
+        distOut[i] = d;
+        outlier[i] = std::abs(d) > beta * extent;
+    });
+    for (size_t i = 0; i < pts.size(); ++i)
+        drop[i] = gate[i] && outlier[i] && isCandidate(in, i);
+}
+
+void pforDivColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                   debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
+    std::vector<uint8_t> drop, gate;
+    std::vector<Eigen::Vector3f> nrm;
+    std::vector<float> dist;
+    pforDivFlags(in, drop, gate, nrm, dist, progress);
+    const Eigen::Vector3f amber(0.95f, 0.75f, 0.15f);
+    colors.assign(in.points.size(), kKeepGreen);
+    for (size_t i = 0; i < drop.size(); ++i)
+        colors[i] = drop[i] ? kDropRed : (gate[i] ? amber : kKeepGreen);
+}
+
+void pforDivFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+                const ProgressFn& progress) {
+    fitted = in.points;
+    std::vector<uint8_t> drop, gate;
+    std::vector<Eigen::Vector3f> nrm;
+    std::vector<float> dist;
+    pforDivFlags(in, drop, gate, nrm, dist, progress);
+    for (size_t i = 0; i < drop.size(); ++i)
+        if (drop[i]) fitted[i] = in.points[i] - nrm[i] * dist[i];  // onto the plane
+}
+
+void pforDivGatePoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    std::vector<uint8_t> drop, gate;
+    std::vector<Eigen::Vector3f> nrm;
+    std::vector<float> dist;
+    pforDivFlags(in, drop, gate, nrm, dist, p);
+    o.clear();
+    o.reserve(in.points.size());
+    for (size_t i = 0; i < in.points.size(); ++i)
+        if (i >= drop.size() || !drop[i]) o.push_back(in.points[i]);
 }
 
 // --- Filter: Bump detection / removal (trimmed-plane residual) ----------------
@@ -1359,23 +1560,24 @@ void curvatureFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
 // --- Analyze: Normal deviation -----------------------------------------------
 // Ported from Helium PointCloudNormalDeviation. Per-point angle between its
 // normal and the mean normal of its neighbourhood (high = creases/noise).
-void normalDeviationColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
-                           debug::DebugDraw& extras, const ProgressFn& progress) {
-    (void)extras;
+// The field helper is shared with the deviation-gated QFOR filter.
+std::vector<float> normalDeviationField(const ModeInput& in, int k,
+                                        const ProgressFn& progress, float p0, float p1) {
     const auto& pts = in.points;
-    if (pts.size() < 8) return;
-    const int k = (int)std::lround(P(in, 0, 16.0f));
-    std::vector<Eigen::Vector3f> nrm =
-        in.normals.size() == pts.size()
-            ? in.normals
-            : geometry::estimateNormals(pts, k, [&](float f) { report(progress, f * 0.5f); });
+    std::vector<float> devv(pts.size(), 0.0f);
+    if (pts.size() < 8) return devv;
+    const bool haveN = in.normals.size() == pts.size();
+    const std::vector<Eigen::Vector3f> nrm =
+        haveN ? in.normals
+              : geometry::estimateNormals(pts, k, [&](float f) {
+                    report(progress, p0 + f * 0.5f * (p1 - p0));
+                });
+    const float pm = haveN ? p0 : p0 + 0.5f * (p1 - p0);
 
     geometry::SparseGrid grid;
     Eigen::Vector3f mn, mx;
     buildGrid(pts, grid, mn, mx);
-
-    std::vector<float> devv(pts.size(), 0.0f);
-    parallelFor(pts.size(), progress, 0.5f, 1.0f, [&](size_t i) {
+    parallelFor(pts.size(), progress, pm, p1, [&](size_t i) {
         thread_local std::vector<unsigned int> nbr;
         thread_local std::vector<float> dist;
         grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
@@ -1386,7 +1588,78 @@ void normalDeviationColors(const ModeInput& in, std::vector<Eigen::Vector3f>& co
         float c = std::max(-1.0f, std::min(1.0f, nrm[i].dot(avg)));
         devv[i] = std::acos(c);  // radians
     });
-    scalarToColors(devv, colors);
+    return devv;
+}
+
+void normalDeviationColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                           debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
+    if (in.points.size() < 8) return;
+    const int k = (int)std::lround(P(in, 0, 16.0f));
+    scalarToColors(normalDeviationField(in, k, progress, 0.0f, 1.0f), colors);
+}
+
+// --- Filter: QFOR gated by normal deviation ------------------------------------
+// Same shape as the divergence-gated QFOR, but the gate is the Normal
+// Deviation angle: only points whose normal deviates from their
+// neighbourhood's mean normal by more than Dev Deg (degrees -- an absolute,
+// scale-free unit) are QFOR candidates. Where the normal field is orderly the
+// point is untouchable, whatever its quadric residual. Params: 0 = K,
+// 1 = Alpha, 2 = Dev Deg, 3 = Sparse Skip.
+void qforDevFlags(const ModeInput& in, std::vector<uint8_t>& drop, std::vector<uint8_t>& gate,
+                  std::vector<Eigen::Vector3f>& nrmOut, std::vector<float>& resOut,
+                  const ProgressFn& progress) {
+    const auto& pts = in.points;
+    drop.assign(pts.size(), 0);
+    gate.assign(pts.size(), 0);
+    resOut.clear();
+    if (pts.size() < 16) return;
+    const int   k = (int)std::lround(P(in, 0, 24.0f));
+    const float t = P(in, 2, 15.0f) * 3.14159265f / 180.0f;  // Dev Deg -> radians
+    const std::vector<float> dev = normalDeviationField(in, k, progress, 0.0f, 0.4f);
+    for (size_t i = 0; i < pts.size(); ++i) gate[i] = dev[i] > t;
+
+    resOut = qforResiduals(in, nrmOut, progress, 0.4f, 0.98f, P(in, 3, 1.0f) != 0.0f);
+    const float thresh = qforThreshold(in, resOut);
+    for (size_t i = 0; i < pts.size(); ++i)
+        drop[i] = gate[i] && std::fabs(resOut[i]) > thresh && isCandidate(in, i);
+}
+
+// Same 3-band viz as the divergence gate: red = removed, amber = gated but
+// judged fine, green = outside the gate.
+void qforDevColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                   debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
+    std::vector<uint8_t> drop, gate;
+    std::vector<Eigen::Vector3f> nrm;
+    std::vector<float> res;
+    qforDevFlags(in, drop, gate, nrm, res, progress);
+    const Eigen::Vector3f amber(0.95f, 0.75f, 0.15f);
+    colors.assign(in.points.size(), kKeepGreen);
+    for (size_t i = 0; i < drop.size(); ++i)
+        colors[i] = drop[i] ? kDropRed : (gate[i] ? amber : kKeepGreen);
+}
+
+void qforDevFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+                const ProgressFn& progress) {
+    fitted = in.points;
+    std::vector<uint8_t> drop, gate;
+    std::vector<Eigen::Vector3f> nrm;
+    std::vector<float> res;
+    qforDevFlags(in, drop, gate, nrm, res, progress);
+    for (size_t i = 0; i < drop.size(); ++i)
+        if (drop[i]) fitted[i] = in.points[i] - nrm[i] * res[i];
+}
+
+void qforDevGatePoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    std::vector<uint8_t> drop, gate;
+    std::vector<Eigen::Vector3f> nrm;
+    std::vector<float> res;
+    qforDevFlags(in, drop, gate, nrm, res, p);
+    o.clear();
+    o.reserve(in.points.size());
+    for (size_t i = 0; i < in.points.size(); ++i)
+        if (i >= drop.size() || !drop[i]) o.push_back(in.points[i]);
 }
 
 // --- Analyze: Normal divergence ------------------------------------------------
@@ -1414,6 +1687,7 @@ void normalDivergenceColors(const ModeInput& in, std::vector<Eigen::Vector3f>& c
     colors.resize(divg.size());
     for (size_t i = 0; i < divg.size(); ++i)
         colors[i] = geometry::compareBandColor(divg[i], range, /*isSigned=*/true, /*bands=*/1);
+    publishLegend(/*isSigned=*/true, range, /*bands=*/1, divg);
 }
 
 // --- Transform: Edge-preserving smoothing ------------------------------------
@@ -1500,7 +1774,19 @@ void qforPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const Prog
     pointsFromKeepColors(qforColors, in, o, p);
 }
 void qforDivGatePoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
-    pointsFromKeepColors(qforDivColors, in, o, p);
+    // Not via pointsFromKeepColors: the 3-band viz paints gated-but-kept
+    // points amber, which the green-only filter would wrongly drop.
+    std::vector<uint8_t> drop, gate;
+    std::vector<Eigen::Vector3f> nrm;
+    std::vector<float> res;
+    qforDivFlags(in, drop, gate, nrm, res, p);
+    o.clear();
+    o.reserve(in.points.size());
+    for (size_t i = 0; i < in.points.size(); ++i)
+        if (i >= drop.size() || !drop[i]) o.push_back(in.points[i]);
+}
+void divSelectPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    pointsFromKeepColors(divSelectColors, in, o, p);
 }
 void morphologyPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
     pointsFromKeepColors(morphologyColors, in, o, p);
@@ -1525,8 +1811,7 @@ struct ModeEntry {
     ModeCategory category;
     ApplyKind    kind      = ApplyKind::Draw;
     ColorFn      colorFn   = nullptr;  // Recolor modes (also the Remove fallback viz)
-    int          numParams = 0;
-    ModeParam    params[4] = {};
+    std::vector<ModeParam> params;     // unbounded; count = params.size()
     FitFn        fitFn     = nullptr;  // optional "Fit" action (dialog button)
     PointsFn     pointsFn  = nullptr;  // optional points->points pipeline stage
     // Draw mode whose triangle result can be APPLIED as a real mesh entity
@@ -1540,64 +1825,88 @@ const ModeParam kBumpParams[4] = {
     {"Max Blob %", 1.0f, 20.0f, 5.0f, false},
 };
 const ModeEntry kModes[] = {
-    {"Reconstruct", runReconstruct, ModeCategory::Generate, ApplyKind::Draw, nullptr, 1,
+    {"Reconstruct", runReconstruct, ModeCategory::Generate, ApplyKind::Draw, nullptr,
      {{"Voxel %", 0.5f, 10.0f, 3.0f, false}}, nullptr, nullptr, /*meshApply=*/true},
-    {"SDF Filter", runSdfFilter, ModeCategory::Generate, ApplyKind::Draw, nullptr, 1,
+    {"SDF Filter", runSdfFilter, ModeCategory::Generate, ApplyKind::Draw, nullptr,
      {{"Blur Iters", 0.0f, 5.0f, 2.0f, true}}, sdfFitPoints, sdfFitPoints},
-    {"Clustering", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, clusteringColors, 1,
+    {"Clustering", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, clusteringColors,
      {{"Radius %", 0.5f, 10.0f, 2.0f, false}}},
-    {"Curvature", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, curvatureColors, 2,
+    {"Curvature", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, curvatureColors,
      {{"K Neighbors", 6.0f, 64.0f, 16.0f, true},
       {"Fit Thresh", 0.05f, 2.0f, 0.5f, false, 0.05f}},
      curvatureFit},
     {"Normal Deviation", nullptr, ModeCategory::Analyze, ApplyKind::Recolor,
-     normalDeviationColors, 1, {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}}},
+     normalDeviationColors, {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}}},
     {"Normal Divergence", nullptr, ModeCategory::Analyze, ApplyKind::Recolor,
-     normalDivergenceColors, 1, {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}}},
-    {"Density (KDE)", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, kdeColors, 1,
+     normalDivergenceColors, {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}}},
+    {"Density (KDE)", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, kdeColors,
      {{"Bandwidth %", 0.5f, 10.0f, 3.0f, false}}},
     {"Surface Dev (MLS)", nullptr, ModeCategory::Analyze, ApplyKind::Recolor,
-     mlsDeviationColors, 1, {{"Radius %", 0.5f, 10.0f, 2.0f, false}}, mlsFit, mlsFit},
-    {"Outlier: SOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, sorColors, 2,
+     mlsDeviationColors, {{"Radius %", 0.5f, 10.0f, 2.0f, false}}, mlsFit, mlsFit},
+    {"Outlier: SOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, sorColors,
      {{"K Neighbors", 6.0f, 64.0f, 16.0f, true}, {"Alpha", 0.25f, 4.0f, 1.0f, false}},
      nullptr, sorPoints},
-    {"Outlier: ROR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, rorColors, 2,
+    {"Outlier: ROR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, rorColors,
      {{"Radius %", 0.5f, 10.0f, 2.5f, false}, {"Min Nbrs", 1.0f, 32.0f, 5.0f, true}},
      nullptr, rorPoints},
-    {"Outlier: PFOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, pforColors, 2,
+    {"Outlier: PFOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, pforColors,
      {{"K Neighbors", 4.0f, 256.0f, 16.0f, true},
       {"Beta", 0.0f, 0.1f, 0.05f, false, 0.001f}},
      pforFit, pforPoints},
-    {"Outlier: QFOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, qforColors, 2,
-     {{"K Neighbors", 10.0f, 256.0f, 24.0f, true},
-      {"Alpha", 1.0f, 10.0f, 3.0f, false, 0.25f}},
-     qforFit, qforPoints},
-    {"Outlier: QFOR (Div Gate)", nullptr, ModeCategory::Filter, ApplyKind::Recolor,
-     qforDivColors, 4,
+    {"Outlier: PFOR (Div Gate)", nullptr, ModeCategory::Filter, ApplyKind::Recolor,
+     pforDivColors,
+     {{"K Neighbors", 4.0f, 256.0f, 16.0f, true},
+      {"Beta", 0.0f, 0.1f, 0.05f, false, 0.001f},
+      {"Div Sigma", 0.5f, 10.0f, 2.0f, false, 0.25f},
+      {"Side +|-|Both", 0.0f, 2.0f, 2.0f, true},
+      {"Gate Raw", 0.0f, 1.0f, 0.0f, true}},
+     pforDivFit, pforDivGatePoints},
+    {"Outlier: QFOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, qforColors,
      {{"K Neighbors", 10.0f, 256.0f, 24.0f, true},
       {"Alpha", 1.0f, 10.0f, 3.0f, false, 0.25f},
-      {"Div Thresh", 0.05f, 1.0f, 0.5f, false, 0.05f},
-      {"Side +|-|Both", 0.0f, 2.0f, 2.0f, true}},
+      {"Sparse Skip", 0.0f, 1.0f, 1.0f, true}},
+     qforFit, qforPoints},
+    {"Outlier: QFOR (Div Gate)", nullptr, ModeCategory::Filter, ApplyKind::Recolor,
+     qforDivColors,
+     {{"K Neighbors", 10.0f, 256.0f, 24.0f, true},
+      {"Alpha", 1.0f, 10.0f, 3.0f, false, 0.25f},
+      {"Div Sigma", 0.5f, 10.0f, 2.0f, false, 0.25f},
+      {"Side +|-|Both", 0.0f, 2.0f, 2.0f, true},
+      {"Sparse Skip", 0.0f, 1.0f, 1.0f, true},
+      {"Gate Raw", 0.0f, 1.0f, 0.0f, true}},
      qforDivFit, qforDivGatePoints},
-    {"Morphology", nullptr, ModeCategory::Filter, ApplyKind::Recolor, morphologyColors, 2,
+    {"Outlier: QFOR (Dev Gate)", nullptr, ModeCategory::Filter, ApplyKind::Recolor,
+     qforDevColors,
+     {{"K Neighbors", 10.0f, 256.0f, 24.0f, true},
+      {"Alpha", 1.0f, 10.0f, 3.0f, false, 0.25f},
+      {"Dev Deg", 1.0f, 90.0f, 15.0f, false, 1.0f},
+      {"Sparse Skip", 0.0f, 1.0f, 1.0f, true}},
+     qforDevFit, qforDevGatePoints},
+    {"Divergence Select", nullptr, ModeCategory::Filter, ApplyKind::Recolor, divSelectColors,
+     {{"K Neighbors", 6.0f, 64.0f, 16.0f, true},
+      {"Div Sigma", 0.5f, 10.0f, 2.0f, false, 0.25f},
+      {"Side +|-|Both", 0.0f, 2.0f, 2.0f, true},
+      {"Gate Raw", 0.0f, 1.0f, 0.0f, true}},
+     nullptr, divSelectPoints},
+    {"Morphology", nullptr, ModeCategory::Filter, ApplyKind::Recolor, morphologyColors,
      {{"Voxel %", 1.0f, 10.0f, 4.0f, false}, {"Erode Iters", 1.0f, 4.0f, 2.0f, true}},
      nullptr, morphologyPoints},
     {"Protrusion (MLS+PFOR)", nullptr, ModeCategory::Filter, ApplyKind::Recolor,
-     protrusionColors, 4,
+     protrusionColors,
      {{"Radius %", 0.5f, 10.0f, 2.0f, false},
       {"Sig Thresh", 0.3f, 5.0f, 1.0f, false, 0.1f},
       {"K Neighbors", 4.0f, 64.0f, 16.0f, true},
       {"Beta", 0.0f, 0.1f, 0.05f, false, 0.001f}},
      protrusionFit, protrusionFit},
-    {"Bump: Detect", nullptr, ModeCategory::Filter, ApplyKind::Recolor, bumpDetectColors, 4,
+    {"Bump: Detect", nullptr, ModeCategory::Filter, ApplyKind::Recolor, bumpDetectColors,
      {kBumpParams[0], kBumpParams[1], kBumpParams[2], kBumpParams[3]}},
-    {"Bump: Remove", nullptr, ModeCategory::Filter, ApplyKind::Remove, bumpDetectColors, 4,
+    {"Bump: Remove", nullptr, ModeCategory::Filter, ApplyKind::Remove, bumpDetectColors,
      {kBumpParams[0], kBumpParams[1], kBumpParams[2], kBumpParams[3]}, nullptr,
      bumpRemovePoints},
-    {"Smooth (bilateral)", runSmooth, ModeCategory::Transform, ApplyKind::Draw, nullptr, 2,
+    {"Smooth (bilateral)", runSmooth, ModeCategory::Transform, ApplyKind::Draw, nullptr,
      {{"Iterations", 1.0f, 20.0f, 5.0f, true}, {"Lambda", 0.1f, 1.0f, 0.5f, false}},
      nullptr, smoothStagePoints},
-    {"ICP Register", runICP, ModeCategory::Transform, ApplyKind::Draw, nullptr, 1,
+    {"ICP Register", runICP, ModeCategory::Transform, ApplyKind::Draw, nullptr,
      {{"Iterations", 5.0f, 100.0f, 40.0f, true}}},
 };
 constexpr int kModeCount = (int)(sizeof(kModes) / sizeof(kModes[0]));
@@ -1653,11 +1962,11 @@ ApplyKind modeApplyKind(int index) {
 
 int modeParamCount(int index) {
     if (index < 0 || index >= kModeCount) return 0;
-    return kModes[index].numParams;
+    return (int)kModes[index].params.size();
 }
 
 ModeParam modeParam(int index, int p) {
-    if (index < 0 || index >= kModeCount || p < 0 || p >= kModes[index].numParams)
+    if (index < 0 || index >= kModeCount || p < 0 || p >= (int)kModes[index].params.size())
         return {"?", 0.0f, 1.0f, 0.0f, false};
     return kModes[index].params[p];
 }
@@ -1665,8 +1974,14 @@ ModeParam modeParam(int index, int p) {
 void runModeColors(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
                    debug::DebugDraw& extras, const ProgressFn& progress) {
     colors.clear();
+    clearLegend();  // modes with a numeric scale re-publish during the run
     if (index < 0 || index >= kModeCount || !kModes[index].colorFn) return;
     kModes[index].colorFn(in, colors, extras, progress);
+}
+
+ModeLegend modeLastLegend() {
+    std::lock_guard<std::mutex> lk(g_legendMx);
+    return g_legend;
 }
 
 void runModeMask(int index, const ModeInput& in, std::vector<uint8_t>& mask,
@@ -1692,6 +2007,18 @@ bool modeAppliesMesh(int index) {
 bool modeCanTransformPoints(int index) {
     if (index < 0 || index >= kModeCount) return false;
     return kModes[index].pointsFn != nullptr;
+}
+
+bool modeFitIsDistinct(int index) {
+    if (index < 0 || index >= kModeCount) return false;
+    return kModes[index].fitFn != nullptr && kModes[index].fitFn != kModes[index].pointsFn;
+}
+
+bool modeSupportsCandidates(int index) {
+    if (index < 0 || index >= kModeCount) return false;
+    ColorFn f = kModes[index].colorFn;  // the filters that call keepNonCandidates
+    return f == sorColors || f == rorColors || f == pforColors || f == qforColors ||
+           f == qforDivColors || f == qforDevColors || f == pforDivColors;
 }
 
 void runModePoints(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& outPoints,

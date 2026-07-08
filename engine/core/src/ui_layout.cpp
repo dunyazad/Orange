@@ -5,14 +5,24 @@
 
 #include "orange/ecs/components.h"
 
-// Tiny line-based key/value store for the draggable widgets' last positions:
+// Tiny line-based key/value store for the draggable widgets' last positions
+// and the app-wide UI font size:
 //   fps  <relX> <relY>
 //   tree <relX> <relY> <expanded0> <expanded1>
+//   font <px>
 // Positions are viewport fractions (the same units the widgets store); the input
 // systems clamp them on screen, so a stale value from a different window size is
 // harmless.
 
 namespace orange::core {
+
+namespace {
+float g_uiFontPx = 40.0f;  // default = the legend's text size
+}
+float uiFontPx() { return g_uiFontPx; }
+void  setUiFontPx(float px) {
+    g_uiFontPx = px < 12.0f ? 12.0f : (px > 64.0f ? 64.0f : px);
+}
 
 void saveWidgetLayout(const entt::registry& world, const std::string& path) {
     std::ofstream f(path, std::ios::trunc);
@@ -31,6 +41,7 @@ void saveWidgetLayout(const entt::registry& world, const std::string& path) {
           << (w.expanded[1] ? 1 : 0) << '\n';
         break;
     }
+    f << "font " << g_uiFontPx << '\n';
 }
 
 void loadWidgetLayout(entt::registry& world, const std::string& path) {
@@ -56,6 +67,10 @@ void loadWidgetLayout(entt::registry& world, const std::string& path) {
                 w.expanded[1] = e1 != 0;
                 break;
             }
+        } else if (tag == "font") {
+            float px = 0.0f;
+            if (!(f >> px)) break;
+            setUiFontPx(px);
         } else {
             std::getline(f, tag);  // skip the rest of an unknown line
         }

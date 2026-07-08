@@ -23,6 +23,7 @@
 #include "orange/core/compare.h"
 #include "orange/core/debug_draw.h"
 #include "orange/core/draw_mode.h"
+#include "orange/core/ui_layout.h"  // core::uiFontPx (View > Font Size...)
 #include "orange/core/geometry.h"
 #include "orange/core/kdtree.h"
 #include "orange/core/loose_octree.h"
@@ -39,8 +40,13 @@ namespace orange::ecs {
 namespace {
 // Shared GUI text height (px) for every overlay widget -- menu bar, toolbar,
 // tree view, and all dialogs render at this one size so the chrome is uniform.
-// (The FPS graph's tiny internal labels are the one intentional exception.)
-constexpr float kUiTextPx = 20.0f;
+// Runtime-adjustable (View > Font Size...): the value lives in
+// core::uiFontPx(); uiScale() converts the legacy 20px-era layout literals.
+// The former constexpr constants below are macros so every use site rescales
+// live without touching hundreds of lines.
+float uiPx() { return core::uiFontPx(); }
+float uiScale() { return core::uiFontPx() / 20.0f; }
+#define kUiTextPx (uiPx())
 
 // Persistent GPU resources for immediate-mode debug drawing. Raw handles (like
 // the overlay widgets) so the registry's teardown never outlives the renderer.
@@ -213,12 +219,24 @@ struct ModeCache {
     // ends or the selection/mode changes.
     entt::entity recoloredSrc = entt::null;
 
+    // Latest recolor result kept for the legend's range filter: thumbs on the
+    // color bar hide points whose scalar falls outside [selMin, selMax]
+    // without re-running the mode.
+    std::vector<Eigen::Vector3f> lastColors;
+    std::vector<float>           lastScalars;  // empty = mode has no scalar
+    float appliedMin = 0.0f, appliedMax = 1.0f;
+
     ~ModeCache() {
         // Never join (could block for minutes) nor std::terminate at teardown: a
         // detached worker is self-contained and dies with the process.
         if (worker.joinable()) worker.detach();
     }
 };
+
+// Legend helpers defined with the legend/dialog UI further down; used by
+// processingModeSystem's range filter and Extract.
+CompareLegend* activeModeLegend(entt::registry& world);
+float legendSelValue(const CompareLegend& lg, float sel);
 
 // Replace a point cloud's vertex set: new GPU buffer + mesh (the old buffer may
 // be smaller than a restore), refreshed bounds and pick positions. Shared by the
@@ -389,6 +407,17 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
                                   vs.vertices.size() * sizeof(render::Vertex));
         }
         cache.recoloredSrc = entt::null;
+        cache.lastColors.clear();
+        cache.lastScalars.clear();
+        cache.appliedMin = 0.0f;
+        cache.appliedMax = 1.0f;
+        // The recolor's legend goes with it (Compare's own legend stays).
+        auto lgv = world.view<CompareLegend>();
+        for (auto le : lgv) {
+            auto& lg = lgv.get<CompareLegend>(le);
+            if (lg.fromMode) { lg.visible = false; lg.fromMode = false; }
+            break;
+        }
     };
 
     // 1) Harvest a finished background job (non-blocking: only join once done).
@@ -485,6 +514,38 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
                 cache.recoloredSrc = src;
                 cache.verts        = std::move(cache.job->verts);
                 cache.hideSource   = false;
+                // Heatmap modes publish a numeric scale: show it as the color-
+                // bar legend (hide a previous MODE legend when this mode has
+                // none; a 3D-Compare legend is left alone).
+                {
+                    modes::ModeLegend ml = modes::modeLastLegend();
+                    auto lgv = world.view<CompareLegend>();
+                    for (auto le : lgv) {
+                        auto& lg = lgv.get<CompareLegend>(le);
+                        if (ml.valid) {
+                            lg.title    = modes::modeName(state.index);
+                            lg.range    = ml.range;
+                            lg.isSigned = ml.isSigned;
+                            lg.bands    = ml.bands;
+                            lg.rms      = -1.0f;
+                            lg.fromMode = true;
+                            lg.visible  = true;
+                            lg.selMin   = 0.0f;  // fresh legend: full range
+                            lg.selMax   = 1.0f;
+                            lg.dragThumb = -1;
+                        } else if (lg.fromMode) {
+                            lg.visible  = false;
+                            lg.fromMode = false;
+                        }
+                        break;
+                    }
+                    // Keep the result around for the legend's range filter.
+                    cache.lastColors  = colors;
+                    cache.lastScalars = ml.valid ? std::move(ml.scalars)
+                                                 : std::vector<float>{};
+                    cache.appliedMin  = 0.0f;
+                    cache.appliedMax  = 1.0f;
+                }
                 SDL_Log("processingModeSystem: %s done (recolored %zu points)",
                         modes::modeName(state.index), n);
             } else if (cache.job->applyKind == modes::ApplyKind::Remove && src != entt::null &&
@@ -621,10 +682,7 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
 
         // Current parameter values (modes fall back to their defaults).
         std::vector<float> params;
-        if (dlg) {
-            int n = modes::modeParamCount(state.index);
-            params.assign(dlg->values, dlg->values + (n < 8 ? n : 8));
-        }
+        if (dlg) params = dlg->values;  // sized to the mode's param count on bind
 
         auto job = std::make_shared<ModeJob>();
         job->gen   = want;
@@ -719,6 +777,116 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
     // (Recolor results paint the source itself, so it must stay visible; a
     // stale result from a previous selection must not hide the new source).
     syncHidden(cache.hideSource && !hasFixed && cache.selSig == selSig ? src : entt::null);
+
+    // Legend range filter: when the color-bar thumbs move, repaint the
+    // recolored cloud with out-of-range points hidden (NaN positions clip on
+    // the GPU; VertexSource keeps the pristine originals for the restore).
+    if (cache.recoloredSrc != entt::null && world.valid(cache.recoloredSrc) &&
+        world.all_of<VertexSource>(cache.recoloredSrc) && !cache.lastScalars.empty()) {
+        float wantMin = 0.0f, wantMax = 1.0f;
+        const CompareLegend* lgp = nullptr;
+        auto lgv = world.view<CompareLegend>();
+        for (auto le : lgv) { lgp = &lgv.get<CompareLegend>(le); break; }
+        if (lgp && lgp->visible && lgp->fromMode) {
+            wantMin = lgp->selMin;
+            wantMax = lgp->selMax;
+        }
+        if (wantMin != cache.appliedMin || wantMax != cache.appliedMax) {
+            // Thumbs parked at the ends mean "unbounded" (the range only spans
+            // the 95th percentile; the tails must not clip at full span).
+            float lo = -FLT_MAX, hi = FLT_MAX;
+            if (lgp && wantMin > 0.001f)
+                lo = lgp->isSigned ? -lgp->range + wantMin * 2.0f * lgp->range
+                                   : wantMin * lgp->range;
+            if (lgp && wantMax < 0.999f)
+                hi = lgp->isSigned ? -lgp->range + wantMax * 2.0f * lgp->range
+                                   : wantMax * lgp->range;
+            const auto& vs = world.get<VertexSource>(cache.recoloredSrc);
+            std::vector<render::Vertex> painted = vs.vertices;
+            const float nanv = std::nanf("");
+            size_t n = std::min({painted.size(), cache.lastScalars.size(),
+                                 cache.lastColors.size()});
+            for (size_t i = 0; i < n; ++i) {
+                if (cache.lastColors[i].x() >= 0.0f) {
+                    painted[i].color[0] = cache.lastColors[i].x();
+                    painted[i].color[1] = cache.lastColors[i].y();
+                    painted[i].color[2] = cache.lastColors[i].z();
+                }
+                if (cache.lastScalars[i] < lo || cache.lastScalars[i] > hi)
+                    painted[i].position[0] = painted[i].position[1] =
+                        painted[i].position[2] = nanv;
+            }
+            renderer.updateBuffer(vs.vbo, painted.data(),
+                                  painted.size() * sizeof(render::Vertex));
+            cache.appliedMin = wantMin;
+            cache.appliedMax = wantMax;
+        }
+    }
+
+    // "Extract" (params-dialog legend strip): spawn the points inside the
+    // legend's [selMin, selMax] range as a NEW point cloud (original colors,
+    // same transform as the source; undoable).
+    {
+        ModeParamsDialog* dlg2 = nullptr;
+        auto dv2 = world.view<ModeParamsDialog>();
+        for (auto e : dv2) { dlg2 = &dv2.get<ModeParamsDialog>(e); break; }
+        CompareLegend* lgp = dlg2 && dlg2->requestExtract ? activeModeLegend(world) : nullptr;
+        if (dlg2 && dlg2->requestExtract) dlg2->requestExtract = false;
+        if (lgp && cache.recoloredSrc != entt::null && world.valid(cache.recoloredSrc) &&
+            world.all_of<VertexSource>(cache.recoloredSrc) && !cache.lastScalars.empty()) {
+            float lo = -FLT_MAX, hi = FLT_MAX;  // parked thumbs = unbounded tails
+            if (lgp->selMin > 0.001f) lo = legendSelValue(*lgp, lgp->selMin);
+            if (lgp->selMax < 0.999f) hi = legendSelValue(*lgp, lgp->selMax);
+            const auto& vs = world.get<VertexSource>(cache.recoloredSrc);
+            std::vector<render::Vertex> kept;
+            size_t n = std::min(vs.vertices.size(), cache.lastScalars.size());
+            kept.reserve(n);
+            for (size_t i = 0; i < n; ++i)
+                if (cache.lastScalars[i] >= lo && cache.lastScalars[i] <= hi)
+                    kept.push_back(vs.vertices[i]);
+            if (kept.empty()) {
+                SDL_Log("processingModeSystem: Extract found no points in range");
+            } else {
+                render::BufferDesc bd;
+                bd.type  = render::BufferType::Vertex;
+                bd.usage = render::BufferUsage::Static;
+                bd.data  = kept.data();
+                bd.size  = kept.size() * sizeof(render::Vertex);
+                render::BufferHandle vbo = renderer.createBuffer(bd);
+                render::MeshDesc md;
+                md.vertexBuffer = vbo;
+                md.layout       = render::Vertex::layout();
+                md.vertexCount  = (uint32_t)kept.size();
+                md.topology     = render::PrimitiveTopology::Points;
+
+                auto e = world.create();
+                world.emplace<Transform>(e, world.all_of<Transform>(cache.recoloredSrc)
+                                                ? world.get<Transform>(cache.recoloredSrc)
+                                                : Transform{});
+                Renderable r;
+                r.mesh       = renderer.createMesh(md);
+                r.pointCloud = true;
+                Eigen::Vector3f mn = Eigen::Vector3f::Constant(FLT_MAX);
+                Eigen::Vector3f mx = Eigen::Vector3f::Constant(-FLT_MAX);
+                PickGeometry pick;
+                pick.positions.reserve(kept.size());
+                for (const auto& v : kept) {
+                    Eigen::Vector3f p(v.position[0], v.position[1], v.position[2]);
+                    pick.positions.push_back(p);
+                    mn = mn.cwiseMin(p);
+                    mx = mx.cwiseMax(p);
+                }
+                r.boundsMin = mn;
+                r.boundsMax = mx;
+                world.emplace<Renderable>(e, r);
+                world.emplace<PickGeometry>(e, std::move(pick));
+                world.emplace<VertexSource>(e, VertexSource{vbo, std::move(kept)});
+                pushSpawnOp(world, e, "Extract");
+                SDL_Log("processingModeSystem: Extract -> %u points",
+                        (unsigned)world.get<VertexSource>(e).vertices.size());
+            }
+        }
+    }
 
     debug::DebugDraw::instance().addRaw(cache.verts);
 }
@@ -1120,8 +1288,8 @@ constexpr int kFpsVerts = kFpsQuads * 4;  // = 1024
 
 // VSYNC checkbox, defined in PIXELS so it stays square regardless of the panel's
 // aspect ratio. Anchored to the panel's top-right corner.
-constexpr float kVsCbPx  = 16.0f;  // square side
-constexpr float kVsCbPad = 9.0f;   // inset from the top/right edges
+#define kVsCbPx  (0.8f * uiPx())   // square side
+#define kVsCbPad (0.45f * uiPx())  // inset from the top/right edges
 
 // The checkbox as a screen-pixel rect (top-left origin). Shared by the geometry
 // builder (draw) and the input system (hit-test) so they line up.
@@ -1301,9 +1469,9 @@ void buildFpsGeometry(const FpsWidget& wgt, render::Vertex* out) {
 // --- Tree-view (scene outliner) widget -------------------------------------
 constexpr int   kTreeQuads  = 600;            // dynamic mesh capacity
 constexpr int   kTreeVerts  = kTreeQuads * 4;
-constexpr float kTreeTitleH = 34.0f;          // title bar (drag handle) height, px
-constexpr float kTreeRowH   = 30.0f;          // row height, px
-constexpr float kTreeTextPx = kUiTextPx;       // glyph height, px (large & readable)
+#define kTreeTitleH (1.7f * uiPx())           // title bar (drag handle) height, px
+#define kTreeRowH   (1.5f * uiPx())           // row height, px
+#define kTreeTextPx (uiPx())                  // glyph height, px
 
 // One row of the outliner -- a group header or an entity leaf. Rebuilt from the
 // world each frame (shared by the input hit-test and the geometry builder so they
@@ -1460,11 +1628,11 @@ struct CtrlRects { CRect mode, minus, plus; };
 
 CtrlRects controlRects(const CameraControls& cc) {
     CtrlRects r;
-    float pad = 6.0f;
+    float pad = 6.0f * uiScale(), bw = 30.0f * uiScale();
     r.mode  = {cc.x + pad, cc.y + pad, cc.w - 2 * pad, cc.h * 0.42f};
     float row2 = cc.y + cc.h * 0.50f, bh = cc.h * 0.42f;
-    r.minus = {cc.x + pad, row2, 30.0f, bh};
-    r.plus  = {cc.x + cc.w - pad - 30.0f, row2, 30.0f, bh};
+    r.minus = {cc.x + pad, row2, bw, bh};
+    r.plus  = {cc.x + cc.w - pad - bw, row2, bw, bh};
     return r;
 }
 
@@ -1561,11 +1729,11 @@ struct CsRects { CRect enable, axis, flip, track; };
 // only the track (groove) is stored; the input system maps clicks across it.
 CsRects crossSectionRects(const CrossSection& cs) {
     CsRects r;
-    const float pad = 8.0f;
-    r.enable = {cs.x + cs.w - pad - 16.0f, cs.y + 6.0f, 16.0f, 16.0f};
-    r.axis   = {cs.x + pad, cs.y + 30.0f, 46.0f, 22.0f};
-    r.flip   = {cs.x + cs.w - pad - 52.0f, cs.y + 30.0f, 52.0f, 22.0f};
-    r.track  = {cs.x + 12.0f, cs.y + 72.0f, cs.w - 24.0f, 6.0f};
+    const float s = uiScale(), pad = 8.0f * s;
+    r.enable = {cs.x + cs.w - pad - 16.0f * s, cs.y + 6.0f * s, 16.0f * s, 16.0f * s};
+    r.axis   = {cs.x + pad, cs.y + 30.0f * s, 46.0f * s, 22.0f * s};
+    r.flip   = {cs.x + cs.w - pad - 52.0f * s, cs.y + 30.0f * s, 52.0f * s, 22.0f * s};
+    r.track  = {cs.x + 12.0f * s, cs.y + 72.0f * s, cs.w - 24.0f * s, 6.0f * s};
     return r;
 }
 
@@ -1680,7 +1848,24 @@ constexpr int kLegendVerts = kLegendQuads * 4;
 
 // Close-box rect (screen px). Shared by the builder and the input system.
 CRect legendCloseRect(const CompareLegend& lg) {
-    return {lg.x + lg.w - 26.0f, lg.y + 6.0f, 20.0f, 20.0f};
+    float u = uiPx();
+    return {lg.x + lg.w - 2.2f * u, lg.y + 0.5f * u, 1.6f * u, 1.6f * u};
+}
+// Color-bar geometry in PANEL pixels, shared by the builder and the thumb
+// hit-testing. All track the app font size.
+#define kLgBarL    (0.6f * uiPx())
+#define kLgBarR    (2.0f * uiPx())
+#define kLgBarT    (2.2f * uiPx())
+#define kLgBarPadB (2.0f * uiPx())
+float legendBarBottom(const CompareLegend& lg) { return lg.h - kLgBarPadB; }
+// Thumb center Y in panel px for a normalized selection (0 = bottom).
+float legendThumbY(const CompareLegend& lg, float sel) {
+    float barB = legendBarBottom(lg);
+    return barB - (barB - kLgBarT) * sel;
+}
+// Selection value in scalar units.
+float legendSelValue(const CompareLegend& lg, float sel) {
+    return lg.isSigned ? -lg.range + sel * 2.0f * lg.range : sel * lg.range;
 }
 
 // Vertical banded color bar (top = +range / red, bottom = -range / blue) with a
@@ -1720,8 +1905,14 @@ void buildCompareLegendGeometry(const CompareLegend& lg, render::Vertex* out) {
 
     solid(0, 0, 1, 1, 0.10f, 0.11f, 0.13f, 0.0f);  // panel background
 
-    const float th = kUiTextPx / lg.h;
-    text("Compare", nx(10), nyTop(24), th, 0.85f, 0.88f, 0.92f, 0.6f);
+    float th = uiPx() / lg.h;  // the app font size IS the legend's size
+    {   // shrink long titles (mode names) to the panel width
+        float tw   = f.textWidth(lg.title.c_str(), th) * xs;
+        float maxW = (lg.w - 3.2f * uiPx()) / lg.w;
+        if (tw > maxW) th *= maxW / tw;
+    }
+    text(lg.title.c_str(), nx(0.4f * uiPx()), nyTop(1.1f * uiPx()), th,
+         0.85f, 0.88f, 0.92f, 0.6f);
 
     // Close box.
     CRect cb = legendCloseRect(lg);
@@ -1733,13 +1924,14 @@ void buildCompareLegendGeometry(const CompareLegend& lg, render::Vertex* out) {
          (cy0 + cy1) * 0.5f - xh * 0.32f, xh, 0.85f, 0.88f, 0.92f, 0.6f);
 
     // Color bar: bands stacked bottom (lowest deviation) -> top (highest).
-    const float barL = 12.0f, barR = 40.0f, barT = 44.0f, barB = lg.h - 40.0f;
-    const int   n    = lg.bands > 1 ? lg.bands : 1;
+    // bands == 1 means a smooth ramp: draw it as 32 thin strips.
+    const float barL = kLgBarL, barR = kLgBarR, barT = kLgBarT, barB = legendBarBottom(lg);
+    const int   n    = lg.bands > 1 ? lg.bands : 32;
     for (int b = 0; b < n; ++b) {
         float t0 = (float)b / n, t1 = (float)(b + 1) / n;   // 0 = bottom
         // Band-center deviation -> exact painted color.
         float tc  = (t0 + t1) * 0.5f;
-        float dev = lg.isSigned ? -lg.range + tc * 2.0f * lg.range : tc * lg.range;
+        float dev = legendSelValue(lg, tc);
         Eigen::Vector3f c = geometry::compareBandColor(dev, lg.range, lg.isSigned, lg.bands);
         float py0 = barB - (barB - barT) * t0;  // band bottom (px from panel top)
         float py1 = barB - (barB - barT) * t1;  // band top
@@ -1747,20 +1939,43 @@ void buildCompareLegendGeometry(const CompareLegend& lg, render::Vertex* out) {
     }
 
     // Tick labels at 0, 1/4, 1/2, 3/4, 1 of the bar (bottom -> top).
-    const float lh = 15.0f / lg.h;
+    const float u  = uiPx();
+    const float lh = 0.75f * u / lg.h;
     char buf[24];
     for (int k = 0; k <= 4; ++k) {
         float t   = (float)k / 4.0f;
-        float dev = lg.isSigned ? -lg.range + t * 2.0f * lg.range : t * lg.range;
+        float dev = legendSelValue(lg, t);
         std::snprintf(buf, sizeof(buf), lg.isSigned ? "%+.3g" : "%.3g", dev);
         float py = barB - (barB - barT) * t;  // px from top
-        solid(nx(barR), nyTop(py + 1), nx(barR + 5), nyTop(py - 1),  // tick mark
+        solid(nx(barR), nyTop(py + 2), nx(barR + 0.25f * u), nyTop(py - 2),  // tick mark
               0.62f, 0.66f, 0.72f, 0.35f);
-        text(buf, nx(barR + 9), nyTop(py + 5), lh, 0.80f, 0.84f, 0.90f, 0.6f);
+        text(buf, nx(barR + 0.4f * u), nyTop(py + 0.25f * u), lh, 0.80f, 0.84f, 0.90f, 0.6f);
     }
 
-    std::snprintf(buf, sizeof(buf), "RMS %.3g", lg.rms);
-    text(buf, nx(12), nyTop(lg.h - 12.0f), lh, 0.72f, 0.78f, 0.85f, 0.6f);
+    // Range-selection thumbs (mode legends): dim the excluded bar segments and
+    // draw a labeled handle at each end of the kept range.
+    if (lg.fromMode) {
+        float yMin = legendThumbY(lg, lg.selMin), yMax = legendThumbY(lg, lg.selMax);
+        if (lg.selMin > 0.001f)  // below-min mask
+            solid(nx(barL), nyTop(barB), nx(barR), nyTop(yMin), 0.13f, 0.14f, 0.17f, 0.42f);
+        if (lg.selMax < 0.999f)  // above-max mask
+            solid(nx(barL), nyTop(yMax), nx(barR), nyTop(barT), 0.13f, 0.14f, 0.17f, 0.42f);
+        auto thumb = [&](float py, float sel, bool isMin) {
+            solid(nx(barL - 0.2f * u), nyTop(py + 5), nx(barR + 0.2f * u), nyTop(py - 5),
+                  0.92f, 0.94f, 0.98f, 0.55f);  // handle bar
+            std::snprintf(buf, sizeof(buf), lg.isSigned ? "%+.3g" : "%.3g",
+                          legendSelValue(lg, sel));
+            float ty = isMin ? py + 0.85f * u : py - 0.35f * u;  // below min / above max
+            text(buf, nx(barL), nyTop(ty), lh, 0.95f, 0.96f, 1.0f, 0.6f);
+        };
+        thumb(yMin, lg.selMin, true);
+        thumb(yMax, lg.selMax, false);
+    }
+
+    if (lg.rms >= 0.0f) {  // mode legends have no RMS
+        std::snprintf(buf, sizeof(buf), "RMS %.3g", lg.rms);
+        text(buf, nx(0.6f * u), nyTop(lg.h - 0.6f * u), lh, 0.72f, 0.78f, 0.85f, 0.6f);
+    }
 
     for (int i = q * 4; i < kLegendVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
@@ -1914,28 +2129,42 @@ constexpr int kModeDlgVerts = kModeDlgQuads * 4;
 
 struct ModeDlgRects {
     CRect track[8]; CRect minus[8]; CRect plus[8]; CRect apply; CRect fit; CRect close;
+    CRect lgBar;    // horizontal legend color bar (when the mode has a legend)
+    CRect extract;  // "Extract" button under the bar
 };
-ModeDlgRects modeDlgRects(const ModeParamsDialog& d, int nParams) {
+// Extra dialog height when the legend strip (bar + labels + Extract) shows.
+#define kModeDlgLegendH (4.8f * uiPx())
+// All row metrics scale with the app font size (uiScale() = 1 at the legacy
+// 20px layout the literals were designed for).
+ModeDlgRects modeDlgRects(const ModeParamsDialog& d, int nParams, bool hasLegend) {
     ModeDlgRects r;
-    const float pad = 16.0f, btn = 18.0f, gap = 6.0f;
+    const float s = uiScale();
+    const float pad = 16.0f * s, btn = 18.0f * s, gap = 6.0f * s;
     for (int i = 0; i < nParams && i < 8; ++i) {
-        float rowTop = d.y + 42.0f + i * 36.0f;
+        float rowTop = d.y + (42.0f + i * 36.0f) * s;
         // Track leaves room for the -/+ nudge buttons on its right.
         float trackW = d.w - 2 * pad - 2 * (btn + gap);
-        r.track[i] = {d.x + pad, rowTop + 22.0f, trackW, 6.0f};
-        float by = rowTop + 22.0f + 3.0f - btn * 0.5f;  // centered on the groove
+        r.track[i] = {d.x + pad, rowTop + 22.0f * s, trackW, 6.0f * s};
+        float by = rowTop + (22.0f + 3.0f) * s - btn * 0.5f;  // centered on the groove
         r.minus[i] = {d.x + pad + trackW + gap, by, btn, btn};
         r.plus[i]  = {d.x + pad + trackW + gap + btn + gap, by, btn, btn};
     }
+    if (hasLegend) {
+        float lt  = d.y + (42.0f + (nParams < 8 ? nParams : 8) * 36.0f + 4.0f) * s;
+        r.lgBar   = {d.x + pad, lt + 24.0f * s, d.w - 2 * pad, 16.0f * s};
+        r.extract = {d.x + pad, lt + 62.0f * s, d.w - 2 * pad, 26.0f * s};
+    } else {
+        r.lgBar = r.extract = {0, 0, 0, 0};
+    }
     if ((modes::modeCanFit(d.modeIndex) || modes::modeAppliesMesh(d.modeIndex)) &&
         d.pipeNodeId < 0) {
-        r.apply = {d.x + pad, (float)(d.y + d.h) - 74.0f, d.w - 2 * pad, 28.0f};
-        r.fit   = {d.x + pad, (float)(d.y + d.h) - 38.0f, d.w - 2 * pad, 28.0f};
+        r.apply = {d.x + pad, (float)(d.y + d.h) - 74.0f * s, d.w - 2 * pad, 28.0f * s};
+        r.fit   = {d.x + pad, (float)(d.y + d.h) - 38.0f * s, d.w - 2 * pad, 28.0f * s};
     } else {
-        r.apply = {d.x + pad, (float)(d.y + d.h) - 38.0f, d.w - 2 * pad, 28.0f};
+        r.apply = {d.x + pad, (float)(d.y + d.h) - 38.0f * s, d.w - 2 * pad, 28.0f * s};
         r.fit   = {0, 0, 0, 0};
     }
-    r.close = {(float)(d.x + d.w) - 24.0f, (float)d.y + 7.0f, 16.0f, 16.0f};
+    r.close = {(float)(d.x + d.w) - 24.0f * s, (float)d.y + 7.0f * s, 16.0f * s, 16.0f * s};
     return r;
 }
 
@@ -1953,7 +2182,19 @@ float modeParamSnap(const modes::ModeParam& s, float v) {
     return clampf(v, s.minV, s.maxV);
 }
 
-void buildModeParamsDialogGeometry(const ModeParamsDialog& d, render::Vertex* out) {
+// The mode legend shown INSIDE the params dialog (and driving its range strip):
+// the shared CompareLegend component while a mode owns it.
+CompareLegend* activeModeLegend(entt::registry& world) {
+    auto v = world.view<CompareLegend>();
+    for (auto e : v) {
+        auto& lg = v.get<CompareLegend>(e);
+        return lg.visible && lg.fromMode ? &lg : nullptr;
+    }
+    return nullptr;
+}
+
+void buildModeParamsDialogGeometry(const ModeParamsDialog& d, const CompareLegend* lg,
+                                   render::Vertex* out) {
     const core::Font& f = *d.font;
     int q = 0;
     const float wu = f.whiteU, wv = f.whiteV;
@@ -1987,15 +2228,16 @@ void buildModeParamsDialogGeometry(const ModeParamsDialog& d, render::Vertex* ou
         y1 = 1.0f - (rr.y - d.y) / d.h;     y0 = 1.0f - (rr.y + rr.h - d.y) / d.h;
     };
 
+    const float sc = uiScale();
     solid(0, 0, 1, 1, 0.10f, 0.11f, 0.13f, 0.0f);                       // panel background
-    solid(0, 1.0f - 28.0f / d.h, 1, 1, 0.16f, 0.18f, 0.22f, 0.05f);     // title bar
+    solid(0, 1.0f - 28.0f * sc / d.h, 1, 1, 0.16f, 0.18f, 0.22f, 0.05f);  // title bar
 
     const int nParams = modes::modeParamCount(d.modeIndex);
-    ModeDlgRects R = modeDlgRects(d, nParams);
+    ModeDlgRects R = modeDlgRects(d, nParams, lg != nullptr);
     float x0, y0, x1, y1;
 
     float th = kUiTextPx / d.h;
-    text(modes::modeName(d.modeIndex), 12.0f / d.w, 1.0f - 7.0f / d.h - th, th,
+    text(modes::modeName(d.modeIndex), 12.0f * sc / d.w, 1.0f - 7.0f * sc / d.h - th, th,
          0.88f, 0.90f, 0.94f, 0.6f);
 
     // Close button (x).
@@ -2013,7 +2255,7 @@ void buildModeParamsDialogGeometry(const ModeParamsDialog& d, render::Vertex* ou
         float val = d.values[i];
 
         float lh = kUiTextPx / d.h;
-        float labelY = 1.0f - (trk.y - 18.0f - d.y) / d.h;
+        float labelY = 1.0f - (trk.y - 18.0f * sc - d.y) / d.h;
         text(s.name, (trk.x - d.x) / d.w, labelY, lh, 0.80f, 0.84f, 0.90f, 0.6f);
 
         if (s.isInt)                              std::snprintf(buf, sizeof(buf), "%d", (int)std::lround(val));
@@ -2028,9 +2270,9 @@ void buildModeParamsDialogGeometry(const ModeParamsDialog& d, render::Vertex* ou
         solid(x0, y0, x1, y1, 0.20f, 0.21f, 0.25f, 0.3f);              // groove
         float hxn = (hx - d.x) / d.w;
         solid(x0, y0, hxn, y1, 0.30f, 0.55f, 0.95f, 0.35f);            // filled
-        float hw = 5.0f / d.w;
-        float hy0 = 1.0f - (trk.y + trk.h * 0.5f + 9.0f - d.y) / d.h;
-        float hy1 = 1.0f - (trk.y + trk.h * 0.5f - 9.0f - d.y) / d.h;
+        float hw = 5.0f * sc / d.w;
+        float hy0 = 1.0f - (trk.y + trk.h * 0.5f + 9.0f * sc - d.y) / d.h;
+        float hy1 = 1.0f - (trk.y + trk.h * 0.5f - 9.0f * sc - d.y) / d.h;
         solid(hxn - hw, hy0, hxn + hw, hy1, 0.95f, 0.95f, 0.95f, 0.5f);  // handle
 
         // -/+ nudge buttons (one step per click).
@@ -2043,6 +2285,42 @@ void buildModeParamsDialogGeometry(const ModeParamsDialog& d, render::Vertex* ou
             text(signs[b], (x0 + x1) * 0.5f - textW(signs[b], sh) * 0.5f,
                  (y0 + y1) * 0.5f - sh * 0.35f, sh, 0.85f, 0.90f, 0.95f, 0.6f);
         }
+    }
+
+    // Legend strip: horizontal color bar + range thumbs + Extract button.
+    if (lg) {
+        const CRect& bar = R.lgBar;
+        toN(bar, x0, y0, x1, y1);
+        const int strips = lg->bands > 1 ? lg->bands : 32;
+        for (int b = 0; b < strips; ++b) {
+            float t0 = (float)b / strips, t1 = (float)(b + 1) / strips;  // 0 = left = min
+            float dev = legendSelValue(*lg, (t0 + t1) * 0.5f);
+            Eigen::Vector3f c =
+                geometry::compareBandColor(dev, lg->range, lg->isSigned, lg->bands);
+            solid(x0 + (x1 - x0) * t0, y0, x0 + (x1 - x0) * t1, y1, c.x(), c.y(), c.z(),
+                  0.3f);
+        }
+        // Dim the excluded ends + white thumb handles at selMin/selMax.
+        float xMin = x0 + (x1 - x0) * lg->selMin, xMax = x0 + (x1 - x0) * lg->selMax;
+        if (lg->selMin > 0.001f) solid(x0, y0, xMin, y1, 0.13f, 0.14f, 0.17f, 0.42f);
+        if (lg->selMax < 0.999f) solid(xMax, y0, x1, y1, 0.13f, 0.14f, 0.17f, 0.42f);
+        float tw2 = 3.0f / d.w, ty0 = y0 - 5.0f / d.h, ty1 = y1 + 5.0f / d.h;
+        solid(xMin - tw2, ty0, xMin + tw2, ty1, 0.95f, 0.95f, 0.98f, 0.55f);
+        solid(xMax - tw2, ty0, xMax + tw2, ty1, 0.95f, 0.95f, 0.98f, 0.55f);
+        // Thumb values above the bar (min left-aligned, max right-aligned).
+        float lh2 = kUiTextPx / d.h;
+        std::snprintf(buf, sizeof(buf), lg->isSigned ? "%+.3g" : "%.3g",
+                      legendSelValue(*lg, lg->selMin));
+        text(buf, x0, y1 + 4.0f / d.h, lh2, 0.90f, 0.92f, 0.98f, 0.6f);
+        std::snprintf(buf, sizeof(buf), lg->isSigned ? "%+.3g" : "%.3g",
+                      legendSelValue(*lg, lg->selMax));
+        text(buf, x1 - textW(buf, lh2), y1 + 4.0f / d.h, lh2, 0.90f, 0.92f, 0.98f, 0.6f);
+        // Extract button.
+        toN(R.extract, x0, y0, x1, y1);
+        solid(x0, y0, x1, y1, 0.45f, 0.34f, 0.16f, 0.3f);
+        float eh = (y1 - y0) * 0.62f;
+        text("Extract", (x0 + x1) * 0.5f - textW("Extract", eh) * 0.5f,
+             (y0 + y1) * 0.5f - eh * 0.35f, eh, 0.98f, 0.92f, 0.80f, 0.6f);
     }
 
     // Apply button.
@@ -2068,26 +2346,69 @@ void buildModeParamsDialogGeometry(const ModeParamsDialog& d, render::Vertex* ou
 // --- Pipeline Design dialog (Blueprint-style node canvas, modeless) -----------
 constexpr int kPipeDlgQuads = 2048;
 constexpr int kPipeDlgVerts = kPipeDlgQuads * 4;
-constexpr float kPipeText    = kUiTextPx * 2.0f;              // 2x UI font in this dialog
-constexpr float kPipeTitleH  = 44.0f;                         // title bar (fits 2x text)
-constexpr float kPipeGrip    = 18.0f;  // resize-grip square (bottom-right)
-constexpr float kPipeNodeW   = 200.0f, kPipeNodeH = 68.0f;    // node box (px)
-constexpr float kPipePinR    = 9.0f;                          // pin half-size (px)
-constexpr float kPipePalette = 52.0f;                         // bottom palette bar (px)
+#define kPipeText   (uiPx())                  // one app-wide text size
+#define kPipeTitleH (2.2f * uiPx())           // title bar
+#define kPipeGrip   (0.9f * uiPx())           // resize-grip square (bottom-right)
+#define kPipeNodeW  (10.0f * uiPx())          // node box (px)
+#define kPipeNodeH  (3.4f * uiPx())
+#define kPipePinR   (0.45f * uiPx())          // pin half-size (px)
+#define kPipeBtnW   (6.0f * uiPx())           // palette button (px)
+#define kPipeBtnH   (1.3f * uiPx())
+constexpr float kPipeBtnGap  = 5.0f;
 
-// Per-kind display label + backing mode (nullptr = host-handled Source/Output).
-struct PipeKindInfo { const char* label; const char* modeName; bool fit; };
-const PipeKindInfo kPipeKinds[(int)PipeNodeKind::Count] = {
-    {"Source",   nullptr,              false},
-    {"SOR",      "Outlier: SOR",       false},
-    {"ROR",      "Outlier: ROR",       false},
-    {"PFOR",     "Outlier: PFOR",      false},
-    {"PFOR Fit", "Outlier: PFOR",      true},
-    {"Smooth",   "Smooth (bilateral)", false},
-    {"Bump Rm",  "Bump: Remove",       false},
-    {"MLS",      "Surface Dev (MLS)",  false},  // MLS projection (pointsFn = mlsFit)
-    {"Output",   nullptr,              false},
+// One palette entry. The list is generated from the modes registry: Source,
+// then a stage for every mode with a points->points action, plus a
+// "<name> Fit" stage where the mode's Fit action is distinct, then Output.
+// Adding a mode in modes.cpp makes it appear on the palette automatically.
+struct PipeStageInfo {
+    PipeNodeRole role;
+    std::string  label;  // compact palette/node caption
+    std::string  mode;   // backing mode display name (Stage only)
+    bool         fit = false;
 };
+const std::vector<PipeStageInfo>& pipeStageList() {
+    static const std::vector<PipeStageInfo> list = [] {
+        // Registry names are descriptive; compact them for 86px buttons.
+        auto shortLabel = [](std::string s) {
+            auto rep = [&](const char* a, const char* b) {
+                size_t p = s.find(a);
+                if (p != std::string::npos) s.replace(p, std::strlen(a), b);
+            };
+            rep("Outlier: ", "");
+            rep("Divergence Select", "Div Select");
+            rep(" (Dev Gate)", " Dev");
+            rep(" (bilateral)", "");
+            rep("Surface Dev (MLS)", "MLS");
+            rep(" (MLS+PFOR)", "");
+            rep(" (Div Gate)", " Div");
+            rep("Bump: Remove", "Bump Rm");
+            rep("Morphology", "Morph");
+            rep("SDF Filter", "SDF");
+            return s;
+        };
+        std::vector<PipeStageInfo> v;
+        v.push_back({PipeNodeRole::Source, "Source", "", false});
+        for (int i = 0; i < modes::modeCount(); ++i) {
+            std::string name = modes::modeName(i);
+            if (modes::modeCanTransformPoints(i))
+                v.push_back({PipeNodeRole::Stage, shortLabel(name), name, false});
+            if (modes::modeFitIsDistinct(i))
+                v.push_back({PipeNodeRole::Stage, shortLabel(name) + " Fit", name, true});
+        }
+        v.push_back({PipeNodeRole::Output, "Output", "", false});
+        return v;
+    }();
+    return list;
+}
+// Palette caption for a node (stage label, or the raw mode name if the mode
+// vanished from the registry after a file load).
+std::string pipeNodeLabel(const PipeNode& n) {
+    if (n.role == PipeNodeRole::Source) return "Source";
+    if (n.role == PipeNodeRole::Output) return "Output";
+    for (const auto& s : pipeStageList())
+        if (s.role == PipeNodeRole::Stage && s.mode == n.mode && s.fit == n.fit) return s.label;
+    return n.mode.empty() ? "?" : n.mode;
+}
 
 CRect pipeCloseRect(const PipelineDialog& d) {
     return {(float)(d.x + d.w) - 34.0f, (float)d.y + 10.0f, 24.0f, 24.0f};
@@ -2106,26 +2427,49 @@ void pipePinCenters(const CRect& nr, float& inX, float& inY, float& outX, float&
     inX  = nr.x;             inY  = nr.y + nr.h * 0.5f;
     outX = nr.x + nr.w;      outY = nr.y + nr.h * 0.5f;
 }
+// Condition (candidate-set) input pin: lower-left, only on candidate-aware stages.
+void pipeCondPinCenter(const CRect& nr, float& cx, float& cy) {
+    cx = nr.x;
+    cy = nr.y + nr.h * 0.85f;
+}
+bool pipeNodeHasCondPin(const PipeNode& n) {
+    return n.role == PipeNodeRole::Stage &&
+           modes::modeSupportsCandidates(modes::modeIndexByName(n.mode.c_str()));
+}
 CRect pipeNodeCloseRect(const CRect& nr) {
     return {nr.x + nr.w - 24.0f, nr.y + 3.0f, 20.0f, 20.0f};
 }
-// Palette buttons (node kinds), then Save/Load, then Run along the bottom bar.
+// Palette buttons wrap into as many bottom-bar rows as the stage list needs
+// at the dialog's current width; Save/Load/Run live in the title bar.
+int pipePaletteCols(const PipelineDialog& d) {
+    int c = (int)((d.w - 16.0f) / (kPipeBtnW + kPipeBtnGap));
+    return c < 1 ? 1 : c;
+}
+int pipePaletteRows(const PipelineDialog& d) {
+    int slots = (int)pipeStageList().size();
+    int cols  = pipePaletteCols(d);
+    return (slots + cols - 1) / cols;
+}
+float pipePaletteH(const PipelineDialog& d) {
+    return pipePaletteRows(d) * (kPipeBtnH + kPipeBtnGap) + 7.0f;
+}
 CRect pipePaletteRect(const PipelineDialog& d, int slot) {
-    float bw = 68.0f;  // 9 kinds + Save/Load/Run must fit the default width
-    return {d.x + 8.0f + slot * (bw + 5.0f), (float)(d.y + d.h) - kPipePalette + 6.0f,
-            bw, kPipePalette - 12.0f};
+    int cols = pipePaletteCols(d);
+    int row = slot / cols, col = slot % cols;
+    return {d.x + 8.0f + col * (kPipeBtnW + kPipeBtnGap),
+            (float)(d.y + d.h) - pipePaletteH(d) + 6.0f + row * (kPipeBtnH + kPipeBtnGap),
+            kPipeBtnW, kPipeBtnH};
 }
 CRect pipeRunRect(const PipelineDialog& d) {
-    return {(float)(d.x + d.w) - 90.0f - kPipeGrip, (float)(d.y + d.h) - kPipePalette + 6.0f,
-            90.0f, kPipePalette - 12.0f};
+    return {(float)(d.x + d.w) - 34.0f - 5.0f - 76.0f, (float)d.y + 10.0f, 76.0f, 24.0f};
 }
 CRect pipeSaveRect(const PipelineDialog& d) {
     CRect run = pipeRunRect(d);
-    return {run.x - 2 * (70.0f + 5.0f), run.y, 70.0f, run.h};
+    return {run.x - 2 * (62.0f + 5.0f), run.y, 62.0f, run.h};
 }
 CRect pipeLoadRect(const PipelineDialog& d) {
     CRect run = pipeRunRect(d);
-    return {run.x - (70.0f + 5.0f), run.y, 70.0f, run.h};
+    return {run.x - (62.0f + 5.0f), run.y, 62.0f, run.h};
 }
 const PipeNode* pipeFindNode(const PipelineDialog& d, int id) {
     for (const auto& n : d.nodes)
@@ -2138,18 +2482,17 @@ PipeNode* pipeFindNodeMut(PipelineDialog& d, int id) {
     return nullptr;
 }
 // Number of editable params of a node's backing mode (0 for Source/Output).
-int pipeNodeParamCount(PipeNodeKind kind) {
-    const char* mn = kPipeKinds[(int)kind].modeName;
-    if (!mn) return 0;
-    return modes::modeParamCount(modes::modeIndexByName(mn));
+int pipeNodeParamCount(const PipeNode& n) {
+    if (n.role != PipeNodeRole::Stage) return 0;
+    return modes::modeParamCount(modes::modeIndexByName(n.mode.c_str()));
 }
 // Seed a fresh node's params from the mode's registered defaults.
 void pipeInitNodeParams(PipeNode& n) {
-    const char* mn = kPipeKinds[(int)n.kind].modeName;
-    if (!mn) return;
-    int idx = modes::modeIndexByName(mn);
+    if (n.role != PipeNodeRole::Stage) return;
+    int idx = modes::modeIndexByName(n.mode.c_str());
     int cnt = modes::modeParamCount(idx);
-    for (int i = 0; i < cnt && i < 4; ++i) n.params[i] = modes::modeParam(idx, i).defV;
+    n.params.resize(cnt);
+    for (int i = 0; i < cnt; ++i) n.params[i] = modes::modeParam(idx, i).defV;
 }
 
 // Graph persistence: a simple line format next to the exe.
@@ -2160,13 +2503,20 @@ std::string pipeGraphPath() {
 void pipeSaveGraph(const PipelineDialog& d) {
     std::ofstream f(pipeGraphPath(), std::ios::trunc);
     if (!f) { SDL_Log("Pipeline: save failed (%s)", pipeGraphPath().c_str()); return; }
-    f << "ver 2\n";  // v2: PipeNodeKind::MLS inserted before Output
+    // v2: MLS kind inserted; v3: per-node param count (was fixed 4);
+    // v4: role + fit + mode NAME (trailing, may contain spaces) replace the
+    // kind int, so stages survive mode reordering/insertion in modes.cpp.
+    f << "ver 4\n";
     f << "pan " << d.panX << " " << d.panY << "\n";
-    for (const auto& n : d.nodes)
-        f << "node " << n.id << " " << (int)n.kind << " " << n.x << " " << n.y << " "
-          << n.params[0] << " " << n.params[1] << " " << n.params[2] << " " << n.params[3]
-          << "\n";
-    for (const auto& l : d.links) f << "link " << l.from << " " << l.to << "\n";
+    for (const auto& n : d.nodes) {
+        f << "node " << n.id << " " << (int)n.role << " " << (n.fit ? 1 : 0) << " "
+          << n.x << " " << n.y << " " << n.params.size();
+        for (float p : n.params) f << " " << p;
+        if (n.role == PipeNodeRole::Stage) f << " " << n.mode;
+        f << "\n";
+    }
+    for (const auto& l : d.links)
+        f << "link " << l.from << " " << l.to << " " << l.toPin << "\n";
     SDL_Log("Pipeline: saved %zu node(s), %zu link(s)", d.nodes.size(), d.links.size());
 }
 void pipeLoadGraph(PipelineDialog& d) {
@@ -2188,18 +2538,62 @@ void pipeLoadGraph(PipelineDialog& d) {
             ss >> panX >> panY;
         } else if (tag == "node") {
             PipeNode n;
-            int kind = 0;
-            ss >> n.id >> kind >> n.x >> n.y >> n.params[0] >> n.params[1] >> n.params[2] >>
-                n.params[3];
-            // v1 files predate PipeNodeKind::MLS: their Output was 7.
-            if (ver < 2 && kind == 7) kind = (int)PipeNodeKind::Output;
-            if (kind < 0 || kind >= (int)PipeNodeKind::Count) continue;
-            n.kind = (PipeNodeKind)kind;
-            maxId  = std::max(maxId, n.id);
+            std::vector<float> vals;
+            if (ver >= 4) {
+                int role = 0, fit = 0;
+                size_t pn = 0;
+                ss >> n.id >> role >> fit >> n.x >> n.y >> pn;
+                for (float v; vals.size() < pn && (ss >> v);) vals.push_back(v);
+                if (role < 0 || role > (int)PipeNodeRole::Output) continue;
+                n.role = (PipeNodeRole)role;
+                n.fit  = fit != 0;
+                if (n.role == PipeNodeRole::Stage) {  // rest of the line = mode name
+                    std::string name;
+                    std::getline(ss, name);
+                    size_t b = name.find_first_not_of(' ');
+                    n.mode = b == std::string::npos ? std::string() : name.substr(b);
+                }
+            } else {
+                // v1-v3 stored a kind int indexing the old fixed table.
+                int kind = 0;
+                ss >> n.id >> kind >> n.x >> n.y;
+                if (ver >= 3) {
+                    size_t pn = 0;
+                    ss >> pn;
+                    for (float v; vals.size() < pn && (ss >> v);) vals.push_back(v);
+                } else {  // v1/v2 wrote exactly 4 values per node
+                    for (float v; vals.size() < 4 && (ss >> v);) vals.push_back(v);
+                }
+                if (ver < 2 && kind == 7) kind = 8;  // v1 predates the MLS kind
+                struct Legacy { PipeNodeRole role; const char* mode; bool fit; };
+                static const Legacy kLegacy[9] = {
+                    {PipeNodeRole::Source, "", false},
+                    {PipeNodeRole::Stage, "Outlier: SOR", false},
+                    {PipeNodeRole::Stage, "Outlier: ROR", false},
+                    {PipeNodeRole::Stage, "Outlier: PFOR", false},
+                    {PipeNodeRole::Stage, "Outlier: PFOR", true},
+                    {PipeNodeRole::Stage, "Smooth (bilateral)", false},
+                    {PipeNodeRole::Stage, "Bump: Remove", false},
+                    {PipeNodeRole::Stage, "Surface Dev (MLS)", false},
+                    {PipeNodeRole::Output, "", false},
+                };
+                if (kind < 0 || kind >= 9) continue;
+                n.role = kLegacy[kind].role;
+                n.mode = kLegacy[kind].mode;
+                n.fit  = kLegacy[kind].fit;
+            }
+            // Size to the backing mode's CURRENT param count (defaults), then
+            // overlay whatever the file had -- old files stay loadable when a
+            // mode gains parameters.
+            pipeInitNodeParams(n);
+            for (size_t i = 0; i < vals.size() && i < n.params.size(); ++i)
+                n.params[i] = vals[i];
+            maxId = std::max(maxId, n.id);
             nodes.push_back(n);
         } else if (tag == "link") {
             PipeLink l;
             ss >> l.from >> l.to;
+            if (!(ss >> l.toPin)) l.toPin = 0;  // pre-v4 links: main pin
             links.push_back(l);
         }
     }
@@ -2289,22 +2683,24 @@ void buildPipelineDialogGeometry(const PipelineDialog& d, render::Vertex* out) {
 
     solid(0, 0, 1, 1, 0.10f, 0.11f, 0.13f, 0.0f);                          // panel background
     solid(0, 1.0f - kPipeTitleH / d.h, 1, 1, 0.16f, 0.18f, 0.22f, 0.05f);  // title bar
-    // Bottom palette bar.
-    solid(0, 0, 1, kPipePalette / d.h, 0.13f, 0.14f, 0.17f, 0.1f);
+    // Bottom palette bar (as many rows as the stage list needs at this width).
+    solid(0, 0, 1, pipePaletteH(d) / d.h, 0.13f, 0.14f, 0.17f, 0.1f);
 
     float x0, y0, x1, y1;
     float th = kPipeText / d.h;
-    text("Pipeline Design", 12.0f / d.w, 1.0f - 6.0f / d.h - th, th,
+    text("Pipeline Design", 12.0f / d.w,
+         1.0f - (kPipeTitleH * 0.5f + kPipeText * 0.5f) / d.h, th,
          0.88f, 0.90f, 0.94f, 0.6f);
 
     // Close button (x).
     toN(pipeCloseRect(d), x0, y0, x1, y1);
     solid(x0, y0, x1, y1, 0.34f, 0.20f, 0.22f, 0.5f);
-    float ch = (y1 - y0) * 0.7f;
+    float ch = kPipeText / d.h;
     text("x", (x0 + x1) * 0.5f - textW("x", ch) * 0.5f, (y0 + y1) * 0.5f - ch * 0.35f, ch,
          0.92f, 0.86f, 0.86f, 0.6f);
 
-    // Wires (under the nodes).
+    // Wires (under the nodes). Condition wires land on the lower cond pin and
+    // draw amber so the two inputs read apart at a glance.
     for (const auto& l : d.links) {
         const PipeNode* a = pipeFindNode(d, l.from);
         const PipeNode* b = pipeFindNode(d, l.to);
@@ -2313,7 +2709,9 @@ void buildPipelineDialogGeometry(const PipelineDialog& d, render::Vertex* out) {
         float ix, iy, ox, oy, ix2, iy2, ox2, oy2;
         pipePinCenters(ra, ix, iy, ox, oy);
         pipePinCenters(rb, ix2, iy2, ox2, oy2);
-        wirePx(ox, oy, ix2, iy2, 0.55f, 0.75f, 0.95f);
+        if (l.toPin == 1) pipeCondPinCenter(rb, ix2, iy2);
+        if (l.toPin == 1) wirePx(ox, oy, ix2, iy2, 0.95f, 0.75f, 0.35f);
+        else              wirePx(ox, oy, ix2, iy2, 0.55f, 0.75f, 0.95f);
     }
     // Pending wire follows the cursor.
     if (d.linkFrom >= 0) {
@@ -2336,21 +2734,21 @@ void buildPipelineDialogGeometry(const PipelineDialog& d, render::Vertex* out) {
         // Body + header strip.
         solid(x0, y0, x1, y1, hov ? 0.22f : 0.17f, hov ? 0.26f : 0.20f, hov ? 0.34f : 0.27f,
               0.3f);
-        bool src = n.kind == PipeNodeKind::Source, outk = n.kind == PipeNodeKind::Output;
+        bool src = n.role == PipeNodeRole::Source, outk = n.role == PipeNodeRole::Output;
         solid(x0, y1 - 28.0f / d.h, x1, y1,
               src ? 0.18f : (outk ? 0.38f : 0.24f),
               src ? 0.40f : (outk ? 0.24f : 0.33f),
               src ? 0.26f : (outk ? 0.20f : 0.50f), 0.35f);
         // Label (in the header strip).
-        const char* lbl = kPipeKinds[(int)n.kind].label;
+        std::string lbl = pipeNodeLabel(n);
         float tx = x0 + 8.0f / d.w;
-        text(lbl, tx, y1 - 25.0f / d.h, lh * 0.62f, 0.92f, 0.94f, 0.98f, 0.6f);
+        text(lbl.c_str(), tx, y1 - 25.0f / d.h, lh, 0.92f, 0.94f, 0.98f, 0.6f);
         // Param summary (body line, e.g. "16 / 0.050").
-        int pc = pipeNodeParamCount(n.kind);
+        int pc = pipeNodeParamCount(n);
         if (pc > 0) {
-            int idx = modes::modeIndexByName(kPipeKinds[(int)n.kind].modeName);
+            int idx = modes::modeIndexByName(n.mode.c_str());
             std::string s;
-            for (int pi = 0; pi < pc && pi < 4; ++pi) {
+            for (int pi = 0; pi < pc && pi < (int)n.params.size(); ++pi) {
                 modes::ModeParam mp = modes::modeParam(idx, pi);
                 if (mp.isInt) std::snprintf(pbuf, sizeof(pbuf), "%d", (int)std::lround(n.params[pi]));
                 else if (mp.step > 0.0f && mp.step < 0.01f)
@@ -2359,13 +2757,13 @@ void buildPipelineDialogGeometry(const PipelineDialog& d, render::Vertex* out) {
                 if (!s.empty()) s += " / ";
                 s += pbuf;
             }
-            text(s.c_str(), tx, y0 + 10.0f / d.h, lh * 0.55f, 0.70f, 0.80f, 0.92f, 0.6f);
+            text(s.c_str(), tx, y0 + 10.0f / d.h, lh, 0.70f, 0.80f, 0.92f, 0.6f);
         }
         // Node close (x).
         CRect cxr = pipeNodeCloseRect(nr);
         float cx0, cy0, cx1, cy1;
         toN(cxr, cx0, cy0, cx1, cy1);
-        text("x", cx0 + 3.0f / d.w, cy0 + 1.0f / d.h, lh * 0.6f, 0.90f, 0.60f, 0.60f, 0.6f);
+        text("x", cx0 + 3.0f / d.w, cy0 + 1.0f / d.h, lh, 0.90f, 0.60f, 0.60f, 0.6f);
         // Pins.
         float ix, iy, ox, oy;
         pipePinCenters(nr, ix, iy, ox, oy);
@@ -2378,18 +2776,29 @@ void buildPipelineDialogGeometry(const PipelineDialog& d, render::Vertex* out) {
         };
         if (!src) pin(ix, iy, false);
         if (!outk) pin(ox, oy, d.linkFrom == n.id);
+        if (pipeNodeHasCondPin(n)) {  // amber condition pin (candidate set in)
+            float cx2, cy2;
+            pipeCondPinCenter(nr, cx2, cy2);
+            float p0x = (cx2 - kPipePinR - d.x) / d.w, p1x = (cx2 + kPipePinR - d.x) / d.w;
+            float p0y = 1.0f - (cy2 + kPipePinR - d.y) / d.h;
+            float p1y = 1.0f - (cy2 - kPipePinR - d.y) / d.h;
+            solid(p0x, p0y, p1x, p1y, 0.95f, 0.75f, 0.35f, 0.5f);
+        }
     }
 
     // Palette buttons + Save/Load + Run.
     auto button = [&](const CRect& br, const char* lbl2, float r, float g, float b) {
         toN(br, x0, y0, x1, y1);
         solid(x0, y0, x1, y1, r, g, b, 0.4f);
-        float bh = (y1 - y0) * 0.55f;
+        float bh = kPipeText / d.h;  // same size as every other label
         text(lbl2, (x0 + x1) * 0.5f - textW(lbl2, bh) * 0.5f, (y0 + y1) * 0.5f - bh * 0.35f,
              bh, 0.88f, 0.92f, 0.96f, 0.6f);
     };
-    for (int s = 0; s < (int)PipeNodeKind::Count; ++s)
-        button(pipePaletteRect(d, s), kPipeKinds[s].label, 0.20f, 0.24f, 0.30f);
+    const auto& stages = pipeStageList();
+    for (int s = 0; s < (int)stages.size(); ++s)
+        button(pipePaletteRect(d, s), stages[s].label.c_str(),
+               stages[s].role == PipeNodeRole::Stage ? 0.20f : 0.24f,
+               stages[s].role == PipeNodeRole::Stage ? 0.24f : 0.30f, 0.30f);
     button(pipeSaveRect(d), "Save", 0.26f, 0.26f, 0.36f);
     button(pipeLoadRect(d), "Load", 0.26f, 0.26f, 0.36f);
     button(pipeRunRect(d), "Run", 0.20f, 0.42f, 0.30f);
@@ -2411,7 +2820,8 @@ constexpr int kConfirmVerts = kConfirmQuads * 4;
 
 struct ConfirmRects { CRect yes; CRect no; };
 ConfirmRects confirmRects(const ConfirmDialog& d) {
-    const float bw = 92.0f, bh = 30.0f, pad = 16.0f, gap = 10.0f;
+    const float s = uiScale();
+    const float bw = 92.0f * s, bh = 30.0f * s, pad = 16.0f * s, gap = 10.0f * s;
     float by = (float)(d.y + d.h) - pad - bh;
     ConfirmRects r;
     r.yes = {(float)(d.x + d.w) - pad - bw, by, bw, bh};
@@ -2453,15 +2863,19 @@ void buildConfirmDialogGeometry(const ConfirmDialog& d, render::Vertex* out) {
         y1 = 1.0f - (rr.y - d.y) / d.h;  y0 = 1.0f - (rr.y + rr.h - d.y) / d.h;
     };
 
+    const float sc = uiScale();
     solid(0, 0, 1, 1, 0.10f, 0.11f, 0.13f, 0.0f);                    // panel
-    solid(0, 1.0f - 28.0f / d.h, 1, 1, 0.16f, 0.18f, 0.22f, 0.05f);  // title bar
+    solid(0, 1.0f - 28.0f * sc / d.h, 1, 1, 0.16f, 0.18f, 0.22f, 0.05f);  // title bar
     float th = kUiTextPx / d.h;
-    text(d.title.c_str(), 12.0f / d.w, 1.0f - 7.0f / d.h - th, th, 0.88f, 0.90f, 0.94f, 0.6f);
+    text(d.title.c_str(), 12.0f * sc / d.w, 1.0f - 7.0f * sc / d.h - th, th,
+         0.88f, 0.90f, 0.94f, 0.6f);
 
     float mh = kUiTextPx / d.h;
-    text(d.line1.c_str(), 16.0f / d.w, 1.0f - 46.0f / d.h, mh, 0.85f, 0.88f, 0.92f, 0.6f);
+    text(d.line1.c_str(), 16.0f * sc / d.w, 1.0f - 58.0f * sc / d.h, mh,
+         0.85f, 0.88f, 0.92f, 0.6f);
     if (!d.line2.empty())
-        text(d.line2.c_str(), 16.0f / d.w, 1.0f - 68.0f / d.h, mh, 0.70f, 0.82f, 0.98f, 0.6f);
+        text(d.line2.c_str(), 16.0f * sc / d.w, 1.0f - 84.0f * sc / d.h, mh,
+             0.70f, 0.82f, 0.98f, 0.6f);
 
     ConfirmRects R = confirmRects(d);
     float x0, y0, x1, y1;
@@ -2478,17 +2892,115 @@ void buildConfirmDialogGeometry(const ConfirmDialog& d, render::Vertex* out) {
     for (int i = q * 4; i < kConfirmVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
 }
 
+// --- Font Size dialog (View menu) -------------------------------------------
+// A slider (12..64 px) plus a numeric input box; both drive core::setUiFontPx,
+// which every overlay reads live -- the whole UI rescales as you drag.
+constexpr int kFontDlgQuads = 128;
+constexpr int kFontDlgVerts = kFontDlgQuads * 4;
+constexpr float kFontPxMin = 12.0f, kFontPxMax = 64.0f;
+
+struct FontDlgRects { CRect track; CRect box; CRect close; };
+FontDlgRects fontDlgRects(const FontSizeDialog& d) {
+    FontDlgRects r;
+    const float s = uiScale(), pad = 16.0f * s;
+    float rowY = d.y + 52.0f * s;
+    float boxW = 64.0f * s;
+    r.track = {d.x + pad, rowY + 8.0f * s, d.w - 2 * pad - boxW - 10.0f * s, 6.0f * s};
+    r.box   = {(float)(d.x + d.w) - pad - boxW, rowY - 6.0f * s, boxW, 28.0f * s};
+    r.close = {(float)(d.x + d.w) - 24.0f * s, (float)d.y + 7.0f * s, 16.0f * s, 16.0f * s};
+    return r;
+}
+
+void buildFontSizeDialogGeometry(const FontSizeDialog& d, render::Vertex* out) {
+    const core::Font& f = *d.font;
+    int q = 0;
+    const float wu = f.whiteU, wv = f.whiteV;
+    auto quad = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                    float u0, float v0, float u1, float v1, float z) {
+        if (q >= kFontDlgQuads) return;
+        out[q * 4 + 0] = {{x0, y0, z}, {r, g, b}, {u0, v1}};
+        out[q * 4 + 1] = {{x1, y0, z}, {r, g, b}, {u1, v1}};
+        out[q * 4 + 2] = {{x1, y1, z}, {r, g, b}, {u1, v0}};
+        out[q * 4 + 3] = {{x0, y1, z}, {r, g, b}, {u0, v0}};
+        ++q;
+    };
+    auto solid = [&](float x0, float y0, float x1, float y1, float r, float g, float b,
+                     float z) { quad(x0, y0, x1, y1, r, g, b, wu, wv, wu, wv, z); };
+    const float xs = static_cast<float>(d.h) / static_cast<float>(d.w);
+    auto text = [&](const char* s2, float penX, float baseY, float h, float r, float g,
+                    float b, float z) {
+        for (; *s2; ++s2) {
+            const core::Glyph& gl = f.glyph(*s2);
+            if (gl.w > 0 && gl.h > 0) {
+                float x0 = penX + gl.xoff * h * xs, y1 = baseY - gl.yoff * h;
+                float x1 = x0 + gl.w * h * xs, y0 = y1 - gl.h * h;
+                quad(x0, y0, x1, y1, r, g, b, gl.u0, gl.v0, gl.u1, gl.v1, z);
+            }
+            penX += gl.advance * h * xs;
+        }
+    };
+    auto textW = [&](const char* s2, float h) { return f.textWidth(s2, h) * xs; };
+    auto toN = [&](const CRect& rr, float& x0, float& y0, float& x1, float& y1) {
+        x0 = (rr.x - d.x) / d.w;            x1 = (rr.x + rr.w - d.x) / d.w;
+        y1 = 1.0f - (rr.y - d.y) / d.h;     y0 = 1.0f - (rr.y + rr.h - d.y) / d.h;
+    };
+
+    const float sc = uiScale();
+    solid(0, 0, 1, 1, 0.10f, 0.11f, 0.13f, 0.0f);
+    solid(0, 1.0f - 28.0f * sc / d.h, 1, 1, 0.16f, 0.18f, 0.22f, 0.05f);
+
+    FontDlgRects R = fontDlgRects(d);
+    float x0, y0, x1, y1;
+    float th = kUiTextPx / d.h;
+    text("Font Size", 12.0f * sc / d.w, 1.0f - 7.0f * sc / d.h - th, th,
+         0.88f, 0.90f, 0.94f, 0.6f);
+
+    toN(R.close, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.34f, 0.20f, 0.22f, 0.5f);
+    float ch = (y1 - y0) * 0.7f;
+    text("x", (x0 + x1) * 0.5f - textW("x", ch) * 0.5f, (y0 + y1) * 0.5f - ch * 0.35f, ch,
+         0.92f, 0.86f, 0.86f, 0.6f);
+
+    // Slider (12..64) with the handle at the current size.
+    const float cur = core::uiFontPx();
+    float t = (cur - kFontPxMin) / (kFontPxMax - kFontPxMin);
+    toN(R.track, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, 0.20f, 0.21f, 0.25f, 0.3f);
+    float hxn = x0 + (x1 - x0) * clampf(t, 0.0f, 1.0f);
+    solid(x0, y0, hxn, y1, 0.30f, 0.55f, 0.95f, 0.35f);
+    float hw = 5.0f * sc / d.w;
+    float hy0 = 1.0f - (R.track.y + R.track.h * 0.5f + 9.0f * sc - d.y) / d.h;
+    float hy1 = 1.0f - (R.track.y + R.track.h * 0.5f - 9.0f * sc - d.y) / d.h;
+    solid(hxn - hw, hy0, hxn + hw, hy1, 0.95f, 0.95f, 0.95f, 0.5f);
+
+    // Number box: shows the edit buffer while focused (with a caret), else the
+    // current value. Click to focus, type digits, Enter to apply.
+    toN(R.box, x0, y0, x1, y1);
+    solid(x0, y0, x1, y1, d.editing ? 0.16f : 0.13f, d.editing ? 0.22f : 0.15f,
+          d.editing ? 0.34f : 0.19f, 0.3f);
+    char buf[16];
+    if (d.editing)
+        std::snprintf(buf, sizeof(buf), "%s_", d.editBuf.c_str());
+    else
+        std::snprintf(buf, sizeof(buf), "%d", (int)std::lround(cur));
+    float bh = (y1 - y0) * 0.62f;
+    text(buf, (x0 + x1) * 0.5f - textW(buf, bh) * 0.5f, (y0 + y1) * 0.5f - bh * 0.35f, bh,
+         0.90f, 0.94f, 1.0f, 0.6f);
+
+    for (int i = q * 4; i < kFontDlgVerts; ++i) out[i] = {{0, 0, 0}, {0, 0, 0}};
+}
+
 // --- Top menu bar ----------------------------------------------------------
 constexpr int   kMenuQuads = 1024;          // must match kMenuQ in main.cpp
 constexpr int   kMenuVerts = kMenuQuads * 4;
-constexpr float kMenuTitlePad = 14.0f;      // l/r padding around a bar title (px)
-constexpr float kMenuItemH    = 38.0f;      // dropdown item row height (px)
-constexpr float kMenuSepH     = 11.0f;      // separator row height (px)
-constexpr float kMenuCheckW   = 24.0f;      // left gutter holding the check tick
-constexpr float kMenuPadX     = 14.0f;      // dropdown left/right padding
-constexpr float kMenuShortGap = 28.0f;      // gap between label and the shortcut
-constexpr float kMenuMinDropW = 190.0f;     // minimum dropdown width (px)
-constexpr float kMenuTextH    = kUiTextPx;  // dropdown/title text px height
+#define kMenuTitlePad (0.7f * uiPx())       // l/r padding around a bar title (px)
+#define kMenuItemH    (1.9f * uiPx())       // dropdown item row height (px)
+#define kMenuSepH     (0.55f * uiPx())      // separator row height (px)
+#define kMenuCheckW   (1.2f * uiPx())       // left gutter holding the check tick
+#define kMenuPadX     (0.7f * uiPx())       // dropdown left/right padding
+#define kMenuShortGap (1.4f * uiPx())       // gap between label and the shortcut
+#define kMenuMinDropW (9.5f * uiPx())       // minimum dropdown width (px)
+#define kMenuTextH    (uiPx())              // dropdown/title text px height
 
 // Left edge (px) of menu title `i` and (via out_x1) its right edge. Titles are laid
 // out left to right, each `textWidth + 2*pad` wide. Identical maths in the builder
@@ -2683,11 +3195,11 @@ void buildMenuGeometry(const MenuBar& mb, render::Vertex* out, uint32_t viewport
 namespace {
 // --- Left selection toolbar geometry ---------------------------------------
 constexpr float kTbX       = 8.0f;                 // left margin (px)
-constexpr float kTbTop     = kMenuBarHeight + 10.0f;
-constexpr float kTbBtn     = 46.0f;                // button size (px, square)
+#define kTbTop      ((float)kMenuBarHeight + 10.0f)
+#define kTbBtn      (2.3f * uiPx())               // button size (px, square)
 constexpr float kTbGap     = 4.0f;                 // gap between buttons in a group
 constexpr float kTbGroupGap= 14.0f;               // gap between groups
-constexpr float kTbText    = kUiTextPx;           // button caption px height
+#define kTbText     (uiPx())                      // button caption px height
 constexpr int   kTbQuads   = 512;
 constexpr int   kTbVerts   = kTbQuads * 4;
 
@@ -2864,6 +3376,7 @@ void menuBarInputSystem(entt::registry& world, core::Input& input,
     auto view = world.view<MenuBar>();
     for (auto e : view) { mb = &view.get<MenuBar>(e); break; }
     if (!mb || !mb->visible || !mb->font) return;
+    mb->height = kMenuBarHeight;  // tracks the app font size
 
     const core::Font& f = *mb->font;
     const float th   = kMenuTextH;
@@ -3004,6 +3517,8 @@ std::vector<Menu> defaultAppMenus() {
         sep(),
         act("Z-Up / Y-Up",   A::ToggleUpAxis),
         act("Perspective / Ortho", A::ToggleProjection),
+        sep(),
+        act("Font Size...",  A::FontSizeDialogToggle),
     }});
     menus.push_back({"Render", {
         chk("Lighting",      A::ToggleLighting, "`"),
@@ -3781,11 +4296,17 @@ void fpsWidgetInputSystem(entt::registry& world, core::Input& input, float dt,
             wgt.accumFrames = 0;
         }
 
-        // Place the panel from its viewport-relative anchor, so it tracks window
-        // resizes; clamp so it stays fully on-screen.
+        // Panel size tracks the app font size. Place from the viewport-relative
+        // anchor (resize-stable); clamp on-screen AND clear of the scaled
+        // selection toolbar on the far left.
+        wgt.w = (int)(260.0f * uiScale());
+        wgt.h = (int)(132.0f * uiScale());
+        float minX = kTbX + kTbBtn + 8.0f;
         float maxX = static_cast<float>(viewportW) - wgt.w;
         float maxY = static_cast<float>(viewportH) - wgt.h;
-        wgt.x = static_cast<int>(clampf(wgt.relX * viewportW, 0.0f, (std::max)(0.0f, maxX)));
+        wgt.x = static_cast<int>(clampf(wgt.relX * viewportW,
+                                        (std::min)(minX, (std::max)(0.0f, maxX)),
+                                        (std::max)(0.0f, maxX)));
         wgt.y = static_cast<int>(clampf(wgt.relY * viewportH, 0.0f, (std::max)(0.0f, maxY)));
 
         float mx = input.mousePosX, my = input.mousePosY;
@@ -3827,10 +4348,30 @@ void treeViewInputSystem(entt::registry& world, core::Input& input, uint32_t vie
         auto& tv = view.get<TreeView>(e);
         if (!tv.visible) continue;
 
+        // Panel size tracks the app font size; keep the panel clear of the
+        // (also scaled) selection toolbar on the far left.
+        tv.w = (int)(252.0f * uiScale());
+        tv.h = (int)(340.0f * uiScale());
+        float minX = kTbX + kTbBtn + 8.0f;
         float maxX = (float)viewportW - tv.w;
         float maxY = (float)viewportH - tv.h;
-        tv.x = (int)clampf(tv.relX * viewportW, 0.0f, (std::max)(0.0f, maxX));
+        tv.x = (int)clampf(tv.relX * viewportW, (std::min)(minX, (std::max)(0.0f, maxX)),
+                           (std::max)(0.0f, maxX));
         tv.y = (int)clampf(tv.relY * viewportH, 0.0f, (std::max)(0.0f, maxY));
+        // Keep clear of the FPS widget while not being dragged: the stacked
+        // top-left defaults were tuned per font size, so a size change can
+        // land the panels on top of each other.
+        if (!tv.dragging) {
+            auto fv = world.view<FpsWidget>();
+            for (auto fe : fv) {
+                const auto& fw = fv.get<FpsWidget>(fe);
+                bool overlap = tv.x < fw.x + fw.w && tv.x + tv.w > fw.x &&
+                               tv.y < fw.y + fw.h && tv.y + tv.h > fw.y;
+                if (overlap) tv.y = (int)clampf((float)(fw.y + fw.h + 6), 0.0f,
+                                                (std::max)(0.0f, maxY));
+                break;
+            }
+        }
 
         std::vector<TreeRow> rows;
         buildTreeRows(world, tv, rows);
@@ -3917,10 +4458,12 @@ void cameraControlsInputSystem(entt::registry& world, core::Input& input, float 
     for (auto e : view) { cc = &view.get<CameraControls>(e); break; }
     if (!cc) return;
 
-    // Position under the gizmo (top-right). Gizmo: size 150, margin 14, itself
-    // pushed down by the menu bar.
+    // Panel size tracks the app font size. Position under the gizmo
+    // (top-right): gizmo box 150, margin 14, pushed down by the menu bar.
+    cc->w = (int)(184.0f * uiScale());
+    cc->h = (int)(76.0f * uiScale());
     cc->x = static_cast<int>(viewportW) - cc->w - 14;
-    cc->y = kMenuBarHeight + 14 + 150 + 10;
+    cc->y = kMenuBarHeight + (int)((14 + 150 + 10) * uiScale());
     if (cc->x < 0) cc->x = 0;
 
     Camera* cam = nullptr;
@@ -3997,8 +4540,12 @@ void crossSectionInputSystem(entt::registry& world, core::Input& input,
     for (auto e : view) { cs = &view.get<CrossSection>(e); break; }
     if (!cs) return;
 
-    // Position top-right, directly under the camera-controls panel.
-    int baseY = kMenuBarHeight + 14 + 150 + 10 + 76 + 10;
+    // Panel size tracks the app font size; position top-right, directly under
+    // the camera-controls panel.
+    const float s = uiScale();
+    cs->w = (int)(184.0f * s);
+    cs->h = (int)(96.0f * s);
+    int baseY = kMenuBarHeight + (int)((14 + 150 + 10 + 76 + 10) * s);
     auto ccv = world.view<CameraControls>();
     for (auto e : ccv) { const auto& cc = ccv.get<CameraControls>(e); baseY = cc.y + cc.h + 10; break; }
     cs->x = static_cast<int>(viewportW) - cs->w - 14;
@@ -4045,24 +4592,164 @@ void compareLegendInputSystem(entt::registry& world, core::Input& input,
         auto& lg = view.get<CompareLegend>(e);
         if (!lg.visible) continue;
 
-        // Top-right column, directly under the cross-section panel.
-        int baseY = kMenuBarHeight + 14 + 150 + 10 + 76 + 10 + 96 + 10;
-        auto csv = world.view<CrossSection>();
-        for (auto ce : csv) { const auto& cs = csv.get<CrossSection>(ce); baseY = cs.y + cs.h + 10; break; }
-        lg.x = static_cast<int>(viewportW) - lg.w - 14;
-        lg.y = baseY;
-        if (lg.x < 0) lg.x = 0;
+        // Panel size tracks the app font size (View > Font Size...).
+        lg.w = (int)(7.5f * uiPx());
+        lg.h = (int)(17.0f * uiPx());
+        // Top-right column, directly under the cross-section panel -- until the
+        // user drags it somewhere (userPlaced).
+        if (!lg.userPlaced) {
+            int baseY = kMenuBarHeight + 14 + 150 + 10 + 76 + 10 + 96 + 10;
+            auto csv = world.view<CrossSection>();
+            for (auto ce : csv) { const auto& cs = csv.get<CrossSection>(ce); baseY = cs.y + cs.h + 10; break; }
+            lg.x = static_cast<int>(viewportW) - lg.w - 14;
+            lg.y = baseY;
+            if (lg.x < 0) lg.x = 0;
+        }
 
         float mx = input.mousePosX, my = input.mousePosY;
-        bool  inPanel = mx >= lg.x && mx <= lg.x + lg.w && my >= lg.y && my <= lg.y + lg.h;
+
+        // Selection-thumb drag (mode legends): my -> normalized bar position.
+        auto selFromMouse = [&]() {
+            float barB = legendBarBottom(lg);
+            float t    = (barB - (my - lg.y)) / (barB - kLgBarT);
+            return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        };
+        if (!input.buttonLeft) { lg.dragThumb = -1; lg.dragging = false; }
+        if (lg.dragThumb >= 0) {
+            float t = selFromMouse();
+            if (lg.dragThumb == 0) lg.selMin = std::min(t, lg.selMax - 0.01f);
+            else                   lg.selMax = std::max(t, lg.selMin + 0.01f);
+            input.captured = true;
+            break;
+        }
+        if (lg.dragging) {  // panel move
+            lg.x = (int)(mx - lg.dragDX);
+            lg.y = (int)(my - lg.dragDY);
+            int maxX = (int)viewportW - lg.w, maxY = (int)viewportH - lg.h;
+            lg.x = lg.x < 0 ? 0 : (lg.x > maxX ? (maxX < 0 ? 0 : maxX) : lg.x);
+            lg.y = lg.y < 0 ? 0 : (lg.y > maxY ? (maxY < 0 ? 0 : maxY) : lg.y);
+            input.captured = true;
+            break;
+        }
+
+        bool inPanel = mx >= lg.x && mx <= lg.x + lg.w && my >= lg.y && my <= lg.y + lg.h;
         if (!inPanel) continue;
-        CRect cb = legendCloseRect(lg);
-        if (input.leftClicked && mx >= cb.x && mx <= cb.x + cb.w && my >= cb.y &&
-            my <= cb.y + cb.h)
-            lg.visible = false;
+        if (input.leftClicked) {
+            CRect cb = legendCloseRect(lg);
+            if (mx >= cb.x && mx <= cb.x + cb.w && my >= cb.y && my <= cb.y + cb.h) {
+                lg.visible = false;
+                input.captured = true;
+                break;
+            }
+            // Thumb grab (mode legends only): a band around each handle.
+            if (lg.fromMode && mx >= lg.x + kLgBarL - 20 && mx <= lg.x + kLgBarR + 20) {
+                float yMin = lg.y + legendThumbY(lg, lg.selMin);
+                float yMax = lg.y + legendThumbY(lg, lg.selMax);
+                if (std::abs(my - yMin) <= 14.0f &&
+                    std::abs(my - yMin) <= std::abs(my - yMax))
+                    lg.dragThumb = 0;
+                else if (std::abs(my - yMax) <= 14.0f)
+                    lg.dragThumb = 1;
+                if (lg.dragThumb >= 0) {
+                    input.captured = true;
+                    break;
+                }
+            }
+            // Anywhere else on the panel: start moving it.
+            lg.dragging   = true;
+            lg.userPlaced = true;
+            lg.dragDX     = mx - lg.x;
+            lg.dragDY     = my - lg.y;
+        }
         input.captured = true;
         break;
     }
+}
+
+void fontSizeDialogInputSystem(entt::registry& world, core::Input& input,
+                               uint32_t viewportW, uint32_t viewportH) {
+    FontSizeDialog* d = nullptr;
+    auto view = world.view<FontSizeDialog>();
+    for (auto e : view) { d = &view.get<FontSizeDialog>(e); break; }
+    if (!d || !d->visible) {
+        if (d) { d->dragSlider = false; d->dragging = false; d->editing = false; }
+        return;
+    }
+
+    // Panel size tracks the very value it edits.
+    const float s = uiScale();
+    d->w = (int)(280.0f * s);
+    d->h = (int)(96.0f * s);
+    if (!d->placed) {
+        d->x = (static_cast<int>(viewportW) - d->w) / 2;
+        d->y = (static_cast<int>(viewportH) - d->h) / 3;
+        d->placed = true;
+    }
+
+    float mx = input.mousePosX, my = input.mousePosY;
+    auto  hit = [&](const CRect& r) {
+        return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
+    };
+    FontDlgRects R = fontDlgRects(*d);
+    bool inPanel = mx >= d->x && mx <= d->x + d->w && my >= d->y && my <= d->y + d->h;
+
+    // Number-box editing: digits append, backspace deletes, Enter applies.
+    if (d->editing) {
+        for (const char* c = input.text; *c; ++c)
+            if (*c >= '0' && *c <= '9' && d->editBuf.size() < 3) d->editBuf += *c;
+        if (input.backspace && !d->editBuf.empty()) d->editBuf.pop_back();
+        if (input.enter) {
+            if (!d->editBuf.empty()) core::setUiFontPx((float)std::atoi(d->editBuf.c_str()));
+            d->editing = false;
+        }
+        if (input.leftClicked && !hit(R.box)) {  // click-away commits too
+            if (!d->editBuf.empty()) core::setUiFontPx((float)std::atoi(d->editBuf.c_str()));
+            d->editing = false;
+        }
+    }
+
+    if (input.leftClicked && hit(R.close)) {
+        d->visible = false; d->dragging = false; d->editing = false;
+        input.captured = true;
+        return;
+    }
+    if (input.leftClicked && hit(R.box)) {
+        d->editing = true;
+        d->editBuf.clear();
+        input.captured = true;
+        return;
+    }
+
+    // Slider.
+    if (input.leftClicked) {
+        CRect band = {R.track.x - 6.0f, R.track.y - 11.0f * s, R.track.w + 12.0f,
+                      R.track.h + 22.0f * s};
+        if (hit(band)) d->dragSlider = true;
+    }
+    if (!input.buttonLeft) d->dragSlider = false;
+    if (d->dragSlider) {
+        float t = R.track.w > 0 ? (mx - R.track.x) / R.track.w : 0.0f;
+        core::setUiFontPx(kFontPxMin + clampf(t, 0.0f, 1.0f) * (kFontPxMax - kFontPxMin));
+        input.captured = true;
+        return;
+    }
+
+    // Title-bar drag.
+    CRect titleBar = {(float)d->x, (float)d->y, (float)d->w - 28.0f * s, 28.0f * s};
+    if (input.leftClicked && hit(titleBar)) {
+        d->dragging = true;
+        d->dragDX = mx - d->x;
+        d->dragDY = my - d->y;
+    }
+    if (!input.buttonLeft) d->dragging = false;
+    if (d->dragging) {
+        d->x = (int)(mx - d->dragDX);
+        d->y = (int)(my - d->dragDY);
+        input.captured = true;
+        return;
+    }
+
+    if (inPanel) input.captured = true;
 }
 
 void poissonDialogInputSystem(entt::registry& world, core::Input& input,
@@ -4156,18 +4843,62 @@ void modeParamsDialogInputSystem(entt::registry& world, core::Input& input,
         d->placed = true;
     }
 
+    // The legend strip appears once the mode's recolor published a scale
+    // (async), and everything tracks the app font size: recompute per frame.
+    CompareLegend* lg = d->pipeNodeId < 0 ? activeModeLegend(world) : nullptr;
+    const float s = uiScale();
+    d->w = (int)(280.0f * s);
+    d->h = (int)((42.0f + nParams * 36.0f + 46.0f +
+                  ((modes::modeCanFit(d->modeIndex) ||
+                    modes::modeAppliesMesh(d->modeIndex)) &&
+                           d->pipeNodeId < 0
+                       ? 36.0f
+                       : 0.0f)) *
+                 s) +
+           (lg ? (int)kModeDlgLegendH : 0);
+
     float mx = input.mousePosX, my = input.mousePosY;
     auto  hit = [&](const CRect& r) {
         return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
     };
-    ModeDlgRects R = modeDlgRects(*d, nParams);
+    ModeDlgRects R = modeDlgRects(*d, nParams, lg != nullptr);
     bool inPanel = mx >= d->x && mx <= d->x + d->w && my >= d->y && my <= d->y + d->h;
+
+    // Legend range thumbs (horizontal): drag maps mouse X to [0,1].
+    if (lg) {
+        if (!input.buttonLeft) lg->dragThumb = -1;
+        auto selFromX = [&]() {
+            float t = R.lgBar.w > 0 ? (mx - R.lgBar.x) / R.lgBar.w : 0.0f;
+            return clampf(t, 0.0f, 1.0f);
+        };
+        if (lg->dragThumb >= 0) {
+            float t = selFromX();
+            if (lg->dragThumb == 0) lg->selMin = std::min(t, lg->selMax - 0.01f);
+            else                    lg->selMax = std::max(t, lg->selMin + 0.01f);
+            input.captured = true;
+            return;
+        }
+        CRect band = {R.lgBar.x - 8.0f, R.lgBar.y - 10.0f, R.lgBar.w + 16.0f,
+                      R.lgBar.h + 20.0f};
+        if (input.leftClicked && hit(band)) {
+            float t = selFromX();
+            lg->dragThumb =
+                std::abs(t - lg->selMin) <= std::abs(t - lg->selMax) ? 0 : 1;
+            input.captured = true;
+            return;
+        }
+        if (input.leftClicked && hit(R.extract)) {
+            d->requestExtract = true;
+            input.captured    = true;
+            return;
+        }
+    }
 
     if (input.leftClicked && hit(R.close)) {
         d->visible = false; d->dragging = false; input.captured = true; return;
     }
 
-    CRect titleBar = {(float)d->x, (float)d->y, (float)d->w - 28.0f, 28.0f};
+    CRect titleBar = {(float)d->x, (float)d->y, (float)d->w - 28.0f * s, 28.0f * s};
     if (input.leftClicked && hit(titleBar)) {
         d->dragging = true;
         d->dragDX = mx - d->x;
@@ -4256,10 +4987,13 @@ void pipelineDialogInputSystem(entt::registry& world, core::Input& input,
         d->placed = true;
     }
     if (d->nodes.empty()) {
-        PipeNode s{d->nextId++, PipeNodeKind::Source, 16.0f, 60.0f};
-        PipeNode o{d->nextId++, PipeNodeKind::Output, d->w - kPipeNodeW - 40.0f, 60.0f};
-        d->nodes.push_back(s);
-        d->nodes.push_back(o);
+        PipeNode s;
+        s.id = d->nextId++; s.role = PipeNodeRole::Source; s.x = 16.0f; s.y = 60.0f;
+        PipeNode o;
+        o.id = d->nextId++; o.role = PipeNodeRole::Output;
+        o.x = d->w - kPipeNodeW - 40.0f; o.y = 60.0f;
+        d->nodes.push_back(std::move(s));
+        d->nodes.push_back(std::move(o));
     }
 
     // The mode-params dialog, when bound to one of our nodes, writes its
@@ -4276,8 +5010,8 @@ void pipelineDialogInputSystem(entt::registry& world, core::Input& input,
             pd->pipeNodeId = -1;
             pd->visible    = false;
         } else {
-            int cnt = pipeNodeParamCount(n->kind);
-            for (int i = 0; i < cnt && i < 4; ++i) n->params[i] = pd->values[i];
+            int cnt = std::min((int)n->params.size(), (int)pd->values.size());
+            for (int i = 0; i < cnt; ++i) n->params[i] = pd->values[i];
         }
     }
 
@@ -4310,9 +5044,10 @@ void pipelineDialogInputSystem(entt::registry& world, core::Input& input,
         return;
     }
 
-    // Title-bar drag.
+    // Title-bar drag (the Save/Load/Run buttons living in the bar win first).
     CRect titleBar = {(float)d->x, (float)d->y, (float)d->w - 38.0f, kPipeTitleH};
-    if (input.leftClicked && hit(titleBar)) {
+    if (input.leftClicked && hit(titleBar) && !hit(pipeRunRect(*d)) &&
+        !hit(pipeSaveRect(*d)) && !hit(pipeLoadRect(*d))) {
         d->dragging = true;
         d->dragDX = mx - d->x;
         d->dragDY = my - d->y;
@@ -4330,15 +5065,18 @@ void pipelineDialogInputSystem(entt::registry& world, core::Input& input,
 
     // Palette buttons (add node at the canvas center) + Save/Load + Run.
     if (input.leftClicked) {
-        for (int s = 0; s < (int)PipeNodeKind::Count; ++s) {
+        const auto& stages = pipeStageList();
+        for (int s = 0; s < (int)stages.size(); ++s) {
             if (!hit(pipePaletteRect(*d, s))) continue;
             PipeNode n;
             n.id   = d->nextId++;
-            n.kind = (PipeNodeKind)s;
+            n.role = stages[s].role;
+            n.mode = stages[s].mode;
+            n.fit  = stages[s].fit;
             n.x    = d->w * 0.5f - kPipeNodeW * 0.5f - d->panX;
             n.y    = d->h * 0.4f - d->panY;
             pipeInitNodeParams(n);
-            d->nodes.push_back(n);
+            d->nodes.push_back(std::move(n));
             input.captured = true;
             return;
         }
@@ -4388,25 +5126,30 @@ void pipelineDialogInputSystem(entt::registry& world, core::Input& input,
                        std::abs(my - py) <= kPipePinR + 3.0f;
             };
             // Output pin: start a pending wire.
-            if (n.kind != PipeNodeKind::Output && nearPin(ox, oy)) {
+            if (n.role != PipeNodeRole::Output && nearPin(ox, oy)) {
                 d->linkFrom    = n.id;
                 input.captured = true;
                 return;
             }
-            // Input pin: finish the pending wire, or unplug an existing one.
-            if (n.kind != PipeNodeKind::Source && nearPin(ix, iy)) {
+            // Input pins (main, and the amber condition pin on candidate-aware
+            // stages): finish the pending wire, or unplug an existing one.
+            int pinHit = -1;
+            if (n.role != PipeNodeRole::Source && nearPin(ix, iy)) pinHit = 0;
+            if (pinHit < 0 && pipeNodeHasCondPin(n)) {
+                float cx2, cy2;
+                pipeCondPinCenter(nr, cx2, cy2);
+                if (nearPin(cx2, cy2)) pinHit = 1;
+            }
+            if (pinHit >= 0) {
+                int to = n.id;  // one wire per input pin: replace/unplug
+                d->links.erase(std::remove_if(d->links.begin(), d->links.end(),
+                                              [to, pinHit](const PipeLink& l) {
+                                                  return l.to == to && l.toPin == pinHit;
+                                              }),
+                               d->links.end());
                 if (d->linkFrom >= 0 && d->linkFrom != n.id) {
-                    int to = n.id;  // one wire per input: replace
-                    d->links.erase(std::remove_if(d->links.begin(), d->links.end(),
-                                                  [to](const PipeLink& l) { return l.to == to; }),
-                                   d->links.end());
-                    d->links.push_back({d->linkFrom, n.id});
+                    d->links.push_back({d->linkFrom, n.id, pinHit});
                     d->linkFrom = -1;
-                } else {
-                    int to = n.id;
-                    d->links.erase(std::remove_if(d->links.begin(), d->links.end(),
-                                                  [to](const PipeLink& l) { return l.to == to; }),
-                                   d->links.end());
                 }
                 input.captured = true;
                 return;
@@ -4418,12 +5161,15 @@ void pipelineDialogInputSystem(entt::registry& world, core::Input& input,
                 d->dragNode = n.id;
                 d->nodeDX   = mx - nr.x;
                 d->nodeDY   = my - nr.y;
-                int cnt = pipeNodeParamCount(n.kind);
+                int cnt = pipeNodeParamCount(n);
                 if (pd && cnt > 0) {
-                    pd->modeIndex  = modes::modeIndexByName(kPipeKinds[(int)n.kind].modeName);
+                    pd->modeIndex  = modes::modeIndexByName(n.mode.c_str());
                     pd->pipeNodeId = n.id;
-                    for (int pi = 0; pi < cnt && pi < 4; ++pi) pd->values[pi] = n.params[pi];
-                    pd->h       = 42 + cnt * 36 + 46;  // no Fit row in node mode
+                    pd->values.assign(cnt, 0.0f);
+                    for (int pi = 0; pi < cnt && pi < (int)n.params.size(); ++pi)
+                        pd->values[pi] = n.params[pi];
+                    // Height/width recomputed per frame by its input system.
+                    pd->h       = (int)((42.0f + cnt * 36.0f + 46.0f) * uiScale());
                     pd->visible = true;
                 } else if (pd && pd->pipeNodeId >= 0) {
                     pd->pipeNodeId = -1;  // clicked a param-less node: unbind
@@ -4434,7 +5180,7 @@ void pipelineDialogInputSystem(entt::registry& world, core::Input& input,
             }
         }
         // Empty canvas click: cancel pending wire / start panning.
-        if (inPanel && my > d->y + kPipeTitleH && my < d->y + d->h - kPipePalette) {
+        if (inPanel && my > d->y + kPipeTitleH && my < d->y + d->h - pipePaletteH(*d)) {
             if (d->linkFrom >= 0) {
                 d->linkFrom = -1;
             } else {
@@ -4479,6 +5225,19 @@ void confirmDialogInputSystem(entt::registry& world, core::Input& input,
     auto view = world.view<ConfirmDialog>();
     for (auto e : view) { d = &view.get<ConfirmDialog>(e); break; }
     if (!d || !d->visible) return;
+
+    // Size tracks the app font, widened to fit the message lines (line2 is
+    // often a full file path).
+    const float s = uiScale();
+    float wantW = 460.0f * s;
+    if (d->font) {
+        float tw = d->font->textWidth(d->line1.c_str(), uiPx());
+        if (!d->line2.empty())
+            tw = (std::max)(tw, d->font->textWidth(d->line2.c_str(), uiPx()));
+        wantW = (std::max)(wantW, tw + 40.0f * s);
+    }
+    d->w = (int)(std::min)(wantW, (float)viewportW - 20.0f);
+    d->h = (int)(150.0f * s);
 
     if (!d->placed) {
         d->x = ((int)viewportW - d->w) / 2;
@@ -5248,6 +6007,34 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         break;
     }
 
+    // --- Font Size dialog overlay --------------------------------------
+    auto fdview = world.view<FontSizeDialog>();
+    for (auto entity : fdview) {
+        const auto& fd = fdview.get<FontSizeDialog>(entity);
+        if (!fd.visible || !fd.font || fd.mesh == render::kInvalidMesh) break;
+
+        render::Vertex verts[kFontDlgVerts];
+        buildFontSizeDialogGeometry(fd, verts);
+        renderer.updateBuffer(fd.vbo, verts, sizeof(verts));
+
+        render::OverlayContext ov;
+        ov.x = fd.x; ov.y = fd.y; ov.width = fd.w; ov.height = fd.h;
+        ov.clearDepth = true;
+        Eigen::Matrix4f ovView = Eigen::Matrix4f::Identity();
+        Eigen::Matrix4f ovProj = math::ortho(0.0f, 1.0f, 0.0f, 1.0f, -1.0f, 1.0f);
+        std::memcpy(ov.view, ovView.data(), sizeof(ov.view));
+        std::memcpy(ov.proj, ovProj.data(), sizeof(ov.proj));
+        renderer.beginOverlay(ov);
+
+        render::DrawItem item;
+        item.mesh    = fd.mesh;
+        item.texture = fd.atlas;
+        Eigen::Matrix4f model = Eigen::Matrix4f::Identity();
+        std::memcpy(item.model, model.data(), sizeof(item.model));
+        renderer.submit(item);
+        break;
+    }
+
     // --- Poisson reconstruction dialog overlay ------------------------
     auto pdview = world.view<PoissonDialog>();
     for (auto entity : pdview) {
@@ -5283,7 +6070,8 @@ void renderSystem(entt::registry& world, render::IRenderer& renderer,
         if (!md.visible || !md.font || md.mesh == render::kInvalidMesh) break;
 
         render::Vertex verts[kModeDlgVerts];
-        buildModeParamsDialogGeometry(md, verts);
+        buildModeParamsDialogGeometry(
+            md, md.pipeNodeId < 0 ? activeModeLegend(world) : nullptr, verts);
         renderer.updateBuffer(md.vbo, verts, sizeof(verts));
 
         render::OverlayContext ov;
@@ -5482,6 +6270,16 @@ struct PipeRunJob {
 struct PipeRunCache {
     std::shared_ptr<PipeRunJob> job;
     std::thread                 worker;
+    // The cloud the last run read from. A run SPAWNS its result as a new
+    // cloud, so the "exactly one cloud in the scene" fallback stops resolving
+    // right after the first run -- with nothing selected, Run #2 would
+    // silently do nothing. Falling back to the previous source keeps repeated
+    // Runs working on the same input.
+    entt::entity lastSource = entt::null;
+    // The previous run's spawned outputs: a re-run REPLACES them (undoable).
+    // Stacking a new cloud over the visually identical old one made parameter
+    // tweaks look like they had no effect.
+    std::vector<entt::entity> lastResults;
     ~PipeRunCache() {
         if (worker.joinable()) worker.detach();  // self-contained; dies with the process
     }
@@ -5497,6 +6295,18 @@ void pipelineGraphSystem(entt::registry& world, render::IRenderer& renderer) {
     // (each undoable).
     if (cache.job && cache.job->done.load(std::memory_order_acquire)) {
         if (cache.worker.joinable()) cache.worker.join();
+        // Replace the previous run's outputs (unless the user deleted them
+        // already) so a re-run updates the result instead of stacking clouds.
+        {
+            std::vector<entt::entity> prev;
+            for (auto pe : cache.lastResults)
+                if (world.valid(pe) && world.all_of<Renderable>(pe)) prev.push_back(pe);
+            if (!prev.empty() && !cache.job->results.empty()) {
+                pushDeleteOp(world, prev, "Pipeline Re-run");
+                for (auto pe : prev) world.destroy(pe);
+            }
+            cache.lastResults.clear();
+        }
         size_t spawned = 0;
         for (const auto& pts : cache.job->results) {
             if (pts.empty()) continue;
@@ -5533,6 +6343,7 @@ void pipelineGraphSystem(entt::registry& world, render::IRenderer& renderer) {
             world.emplace<PickGeometry>(e, std::move(pick));
             world.emplace<VertexSource>(e, VertexSource{vbo, std::move(verts)});
             pushSpawnOp(world, e, "Pipeline Result");
+            cache.lastResults.push_back(e);
             SDL_Log("pipelineGraphSystem: output %zu: %zu -> %zu points", spawned,
                     cache.job->inCount, pts.size());
             ++spawned;
@@ -5552,15 +6363,16 @@ void pipelineGraphSystem(entt::registry& world, render::IRenderer& renderer) {
     // Validate: at least one Source and one Output on the canvas.
     bool hasSource = false, hasOutput = false;
     for (const auto& n : d->nodes) {
-        hasSource |= n.kind == PipeNodeKind::Source;
-        hasOutput |= n.kind == PipeNodeKind::Output;
+        hasSource |= n.role == PipeNodeRole::Source;
+        hasOutput |= n.role == PipeNodeRole::Output;
     }
     if (!hasSource || !hasOutput) {
         SDL_Log("pipelineGraphSystem: graph needs a Source and an Output node");
         return;
     }
 
-    // Source cloud: first selected entity with points, else the only one.
+    // Source cloud: first selected entity with points, else the previous
+    // run's source (still alive), else the only cloud in the scene.
     entt::entity src = entt::null, only = entt::null;
     size_t count = 0;
     auto v = world.view<Renderable, PickGeometry>();
@@ -5570,11 +6382,16 @@ void pipelineGraphSystem(entt::registry& world, render::IRenderer& renderer) {
         only = e;
         if (v.get<Renderable>(e).selected) { src = e; break; }
     }
+    if (src == entt::null && cache.lastSource != entt::null &&
+        world.valid(cache.lastSource) && world.all_of<Renderable, PickGeometry>(cache.lastSource) &&
+        !world.get<PickGeometry>(cache.lastSource).positions.empty())
+        src = cache.lastSource;
     if (src == entt::null && count == 1) src = only;
     if (src == entt::null) {
         SDL_Log("pipelineGraphSystem: no source cloud (select one)");
         return;
     }
+    cache.lastSource = src;
     std::vector<Eigen::Vector3f> raw = world.get<PickGeometry>(src).positions;
     Eigen::Matrix4f M = Eigen::Matrix4f::Identity();
     if (world.all_of<Transform>(src)) M = world.get<Transform>(src).matrix();
@@ -5604,7 +6421,7 @@ void pipelineGraphSystem(entt::registry& world, render::IRenderer& renderer) {
         };
         size_t stageTotal = 0;
         for (const auto& n : nodes)
-            if (n.kind != PipeNodeKind::Source && n.kind != PipeNodeKind::Output) ++stageTotal;
+            if (n.role == PipeNodeRole::Stage) ++stageTotal;
         std::atomic<size_t> stageDone{0};
         using Cloud = std::shared_ptr<std::vector<Eigen::Vector3f>>;
         std::unordered_map<int, Cloud> memo;
@@ -5616,24 +6433,48 @@ void pipelineGraphSystem(entt::registry& world, render::IRenderer& renderer) {
             const PipeNode* n = findNode(id);
             if (!n) return nullptr;
             Cloud result;
-            if (n->kind == PipeNodeKind::Source) {
+            if (n->role == PipeNodeRole::Source) {
                 result = source;
             } else {
                 const PipeLink* inL = nullptr;
-                for (const auto& l : links)
-                    if (l.to == id) { inL = &l; break; }
+                const PipeLink* condL = nullptr;
+                for (const auto& l : links) {
+                    if (l.to != id) continue;
+                    if (l.toPin == 1) condL = &l;
+                    else              inL = &l;
+                }
                 Cloud up = inL ? eval(inL->from) : nullptr;
                 if (up) {
-                    if (n->kind == PipeNodeKind::Output) {
+                    if (n->role == PipeNodeRole::Output) {
                         result = up;
                     } else {
-                        const PipeKindInfo& info = kPipeKinds[(int)n->kind];
-                        int idx = info.modeName ? modes::modeIndexByName(info.modeName) : -1;
+                        int idx = modes::modeIndexByName(n->mode.c_str());
                         if (idx >= 0) {
                             modes::ModeInput in;
                             in.points = *up;
-                            int pc = modes::modeParamCount(idx);
-                            in.params.assign(n->params, n->params + (pc < 4 ? pc : 4));
+                            in.params = n->params;
+                            // Condition pin: the upstream cloud on the amber pin
+                            // is the CANDIDATE set -- the filter may only touch
+                            // main-input points that also appear there (matched
+                            // bit-exact; selection stages pass points through
+                            // unmodified, so coordinates survive intact).
+                            if (condL && modes::modeSupportsCandidates(idx)) {
+                                Cloud cond = eval(condL->from);
+                                if (cond) {
+                                    auto key = [](const Eigen::Vector3f& p) {
+                                        uint32_t k[3];
+                                        std::memcpy(k, p.data(), sizeof(k));
+                                        return ((uint64_t)k[0] << 32 | k[1]) ^
+                                               ((uint64_t)k[2] * 0x9E3779B97F4A7C15ull);
+                                    };
+                                    std::unordered_set<uint64_t> set;
+                                    set.reserve(cond->size() * 2);
+                                    for (const auto& p : *cond) set.insert(key(p));
+                                    in.candidates.resize(in.points.size());
+                                    for (size_t pi = 0; pi < in.points.size(); ++pi)
+                                        in.candidates[pi] = set.count(key(in.points[pi])) ? 1 : 0;
+                                }
+                            }
                             auto next = std::make_shared<std::vector<Eigen::Vector3f>>();
                             size_t sdone = stageDone.load(std::memory_order_relaxed);
                             auto prog = [job, sdone, stageTotal](float f) {
@@ -5641,7 +6482,7 @@ void pipelineGraphSystem(entt::registry& world, render::IRenderer& renderer) {
                                     stageTotal ? ((float)sdone + f) / (float)stageTotal : f,
                                     std::memory_order_relaxed);
                             };
-                            if (info.fit)
+                            if (n->fit)
                                 modes::runModeFit(idx, in, *next, prog);
                             else
                                 modes::runModePoints(idx, in, *next, prog);
@@ -5659,7 +6500,7 @@ void pipelineGraphSystem(entt::registry& world, render::IRenderer& renderer) {
         };
 
         for (const auto& n : nodes) {
-            if (n.kind != PipeNodeKind::Output) continue;
+            if (n.role != PipeNodeRole::Output) continue;
             Cloud r = eval(n.id);
             if (r && !r->empty()) job->results.push_back(*r);
         }
