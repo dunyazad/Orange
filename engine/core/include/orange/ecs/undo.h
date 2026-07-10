@@ -36,6 +36,7 @@ struct EntitySnapshot {
     entt::entity entity = entt::null;  // current incarnation (updated on rebuild)
     std::vector<render::Vertex> vertices;
     std::vector<uint32_t>       indices;  // triangle list; empty + pointCloud => Points
+    std::vector<Eigen::Vector3f> normals;  // SourceNormals (oriented; may be empty)
     Transform      transform;
     core::DrawMode drawMode   = core::DrawMode::Solid;
     uint32_t       colorMode  = 0;

@@ -949,6 +949,9 @@ EntitySnapshotPtr captureEntity(entt::registry& world, entt::entity e) {
     snap->vertices   = world.get<VertexSource>(e).vertices;
     snap->indices    = world.all_of<PickGeometry>(e) ? world.get<PickGeometry>(e).indices
                                                      : std::vector<uint32_t>{};
+    snap->normals.clear();
+    if (auto* sn = world.try_get<SourceNormals>(e))
+        if (sn->normals.size() == snap->vertices.size()) snap->normals = sn->normals;
     snap->transform  = world.all_of<Transform>(e) ? world.get<Transform>(e) : Transform{};
     snap->drawMode   = r.drawMode;
     snap->colorMode  = r.colorMode;
@@ -1007,6 +1010,8 @@ void rebuildEntity(entt::registry& world, render::IRenderer& renderer,
     world.emplace<Renderable>(e, r);
     world.emplace<PickGeometry>(e, std::move(pick));
     world.emplace<VertexSource>(e, VertexSource{vbo, snap->vertices});
+    if (snap->normals.size() == snap->vertices.size())
+        world.emplace<SourceNormals>(e, SourceNormals{snap->normals});
     world.emplace<UndoRef>(e, UndoRef{snap});
     snap->entity = e;
 }
