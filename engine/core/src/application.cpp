@@ -145,7 +145,7 @@ void syncModeParamsDialog(entt::registry& world, int modeIndex) {
                                   : modes::modeParam(modeIndex, i).defV;
         }
         d.pipeNodeId = -1;  // regular mode editing detaches any pipeline-node binding
-        d.h       = 42 + n * 36 + 46 +
+        d.h       = 42 + n * 48 + 46 +
                     ((modes::modeCanFit(modeIndex) || modes::modeAppliesMesh(modeIndex)) ? 36 : 0);
         d.visible = true;
         break;

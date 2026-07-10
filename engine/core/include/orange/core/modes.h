@@ -76,6 +76,11 @@ ApplyKind modeApplyKind(int index);
 // A tunable parameter of a mode, edited in the ModeParamsDialog. Values reach
 // the mode through ModeInput::params (index-aligned with modeParam order);
 // "%" parameters are percentages of the input's bounding-box diagonal.
+// A name starting with "--" is a section HEADER: the dialog draws it as a
+// labeled divider with a CHECKBOX instead of a slider, and its params slot
+// holds the section's enable flag (0 = off, 1 = on; clicking toggles). Modes
+// that don't read the flag just leave defV there -- the index alignment above
+// stays trivial either way.
 struct ModeParam {
     const char* name;
     float minV, maxV, defV;
@@ -84,6 +89,9 @@ struct ModeParam {
 };
 int       modeParamCount(int index);
 ModeParam modeParam(int index, int p);
+inline bool modeParamIsHeader(const ModeParam& p) {
+    return p.name && p.name[0] == '-' && p.name[1] == '-';
+}
 
 // Run a Recolor mode: fills `colors` (one entry per input point; a color with
 // x < 0 keeps that point's original color). Extra non-point visualization

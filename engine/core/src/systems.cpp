@@ -670,14 +670,21 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
         modes::ModeInput fixedInput;
         std::vector<Eigen::Vector3f> raw;
         std::vector<Eigen::Vector3f> rawN;  // source-file oriented normals (may be empty)
+        std::vector<uint32_t> rawI;  // triangle indices -- oriented-normal fallback
         Eigen::Matrix4f M = Eigen::Matrix4f::Identity();
         if (hasFixed) {
             fixedInput = ctx.get<modes::ModeInput>();
         } else {
-            raw = world.get<PickGeometry>(src).positions;  // vector copy
+            const auto& pg = world.get<PickGeometry>(src);
+            raw = pg.positions;  // vector copy
             if (world.all_of<Transform>(src)) M = world.get<Transform>(src).matrix();
             if (auto* sn = world.try_get<SourceNormals>(src))
                 if (sn->normals.size() == raw.size()) rawN = sn->normals;
+            // No file normals but a real triangle mesh: its winding gives
+            // consistently ORIENTED vertex normals (computed on the worker) --
+            // far better input for the normal-field modes than the per-point
+            // PCA estimate, whose signs are ambiguous.
+            if (rawN.empty() && !pg.indices.empty()) rawI = pg.indices;
         }
 
         // Current parameter values (modes fall back to their defaults).
@@ -712,7 +719,8 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
         bool useFixed = hasFixed;
         cache.worker = std::thread(
             [job, idx, useFixed, fixed = std::move(fixedInput), raw = std::move(raw),
-             rawN = std::move(rawN), M, params = std::move(params)]() mutable {
+             rawN = std::move(rawN), rawI = std::move(rawI), M,
+             params = std::move(params)]() mutable {
                 modes::ModeInput in;
                 if (useFixed) {
                     in = std::move(fixed);
@@ -727,6 +735,23 @@ void processingModeSystem(entt::registry& world, render::IRenderer& renderer) {
                         in.normals.resize(rawN.size());
                         for (size_t i = 0; i < rawN.size(); ++i)
                             in.normals[i] = (N * rawN[i]).normalized();
+                    } else if (!rawI.empty()) {
+                        // Area-weighted vertex normals from the triangle winding
+                        // (world-space points, so no inverse-transpose needed).
+                        in.normals.assign(in.points.size(), Eigen::Vector3f::Zero());
+                        for (size_t t = 0; t + 2 < rawI.size(); t += 3) {
+                            const Eigen::Vector3f& a = in.points[rawI[t]];
+                            Eigen::Vector3f fn = (in.points[rawI[t + 1]] - a)
+                                                     .cross(in.points[rawI[t + 2]] - a);
+                            in.normals[rawI[t]] += fn;
+                            in.normals[rawI[t + 1]] += fn;
+                            in.normals[rawI[t + 2]] += fn;
+                        }
+                        for (auto& n : in.normals) {
+                            float l2 = n.squaredNorm();
+                            n = l2 > 1e-24f ? Eigen::Vector3f(n / std::sqrt(l2))
+                                            : Eigen::Vector3f::UnitY();
+                        }
                     }
                 }
                 in.params = std::move(params);
@@ -2124,11 +2149,12 @@ void buildPoissonDialogGeometry(const PoissonDialog& d, render::Vertex* out) {
 // --- Mode-parameters dialog (generic sliders for the active geometry mode) ----
 // Same visual language as the Poisson dialog, but the rows come from the modes
 // registry (modes::modeParam) so every parameterised mode shares one panel.
-constexpr int kModeDlgQuads = 256;
+constexpr int kModeDlgQuads = 512;  // 9+ param rows x per-glyph quads
+
 constexpr int kModeDlgVerts = kModeDlgQuads * 4;
 
 struct ModeDlgRects {
-    CRect track[8]; CRect minus[8]; CRect plus[8]; CRect apply; CRect fit; CRect close;
+    CRect track[12]; CRect minus[12]; CRect plus[12]; CRect apply; CRect fit; CRect close;
     CRect lgBar;    // horizontal legend color bar (when the mode has a legend)
     CRect extract;  // "Extract" button under the bar
 };
@@ -2140,17 +2166,20 @@ ModeDlgRects modeDlgRects(const ModeParamsDialog& d, int nParams, bool hasLegend
     ModeDlgRects r;
     const float s = uiScale();
     const float pad = 16.0f * s, btn = 18.0f * s, gap = 6.0f * s;
-    for (int i = 0; i < nParams && i < 8; ++i) {
-        float rowTop = d.y + (42.0f + i * 36.0f) * s;
+    // Row pitch 48: label line (~uiPx tall) + groove/handle band. The label
+    // baseline sits at rowTop + 18 (see the geometry builder) so glyph tops
+    // stay inside the row instead of colliding with the previous row's handle.
+    for (int i = 0; i < nParams && i < 12; ++i) {
+        float rowTop = d.y + (42.0f + i * 48.0f) * s;
         // Track leaves room for the -/+ nudge buttons on its right.
         float trackW = d.w - 2 * pad - 2 * (btn + gap);
-        r.track[i] = {d.x + pad, rowTop + 22.0f * s, trackW, 6.0f * s};
-        float by = rowTop + (22.0f + 3.0f) * s - btn * 0.5f;  // centered on the groove
+        r.track[i] = {d.x + pad, rowTop + 30.0f * s, trackW, 6.0f * s};
+        float by = rowTop + (30.0f + 3.0f) * s - btn * 0.5f;  // centered on the groove
         r.minus[i] = {d.x + pad + trackW + gap, by, btn, btn};
         r.plus[i]  = {d.x + pad + trackW + gap + btn + gap, by, btn, btn};
     }
     if (hasLegend) {
-        float lt  = d.y + (42.0f + (nParams < 8 ? nParams : 8) * 36.0f + 4.0f) * s;
+        float lt  = d.y + (42.0f + (nParams < 12 ? nParams : 12) * 48.0f + 4.0f) * s;
         r.lgBar   = {d.x + pad, lt + 24.0f * s, d.w - 2 * pad, 16.0f * s};
         r.extract = {d.x + pad, lt + 62.0f * s, d.w - 2 * pad, 26.0f * s};
     } else {
@@ -2166,6 +2195,14 @@ ModeDlgRects modeDlgRects(const ModeParamsDialog& d, int nParams, bool hasLegend
     }
     r.close = {(float)(d.x + d.w) - 24.0f * s, (float)d.y + 7.0f * s, 16.0f * s, 16.0f * s};
     return r;
+}
+
+// Section-header checkbox (the header row's enable flag): left-aligned on the
+// row, centered on the header text line. Shared by the geometry builder and
+// the input hit test.
+CRect modeHeaderCheckRect(const CRect& trk, float s) {
+    float sz = 16.0f * s;
+    return {trk.x, trk.y - 26.0f * s, sz, sz};
 }
 
 // One increment of param `s` for the -/+ buttons and slider snapping.
@@ -2247,15 +2284,52 @@ void buildModeParamsDialogGeometry(const ModeParamsDialog& d, const CompareLegen
     text("x", (x0 + x1) * 0.5f - textW("x", ch) * 0.5f, (y0 + y1) * 0.5f - ch * 0.35f, ch,
          0.92f, 0.86f, 0.86f, 0.6f);
 
-    // Sliders.
+    // Sliders (a "--" name is a section header: centered label between divider
+    // lines, no slider row).
     char buf[32];
-    for (int i = 0; i < nParams && i < 8; ++i) {
+    for (int i = 0; i < nParams && i < 12; ++i) {
         modes::ModeParam s = modes::modeParam(d.modeIndex, i);
         const CRect& trk = R.track[i];
         float val = d.values[i];
 
         float lh = kUiTextPx / d.h;
-        float labelY = 1.0f - (trk.y - 18.0f * sc - d.y) / d.h;
+        // Label baseline 12px above the groove: with the 48px row pitch the
+        // glyph tops stay below the previous row's handle band.
+        float labelY = 1.0f - (trk.y - 12.0f * sc - d.y) / d.h;
+        if (modes::modeParamIsHeader(s)) {
+            // Header = labeled divider + section-enable checkbox (the row's
+            // value slot). Box geometry must match modeHeaderCheckRect.
+            const bool on = val != 0.0f;
+            // Strip the "--" fencing off the stored name.
+            const char* nm = s.name + 2;
+            while (*nm == ' ' || *nm == '-') ++nm;
+            size_t len = std::strlen(nm);
+            while (len && (nm[len - 1] == ' ' || nm[len - 1] == '-')) --len;
+            char hbuf[32];
+            std::snprintf(hbuf, sizeof(hbuf), "%.*s", (int)(len < 31 ? len : 31), nm);
+            float tw = textW(hbuf, lh);
+            float cx = (trk.x - d.x) / d.w;
+            float cw = (R.plus[i].x + R.plus[i].w - trk.x) / d.w;  // full row width
+            float midY = labelY + lh * 0.30f;  // divider through the cap midline
+            float lineH = 1.5f * sc / d.h;
+            float tx0 = cx + (cw - tw) * 0.5f;
+            CRect cb = modeHeaderCheckRect(R.track[i], sc);
+            float bx0, by0, bx1, by1;
+            toN(cb, bx0, by0, bx1, by1);
+            solid(bx0, by0, bx1, by1, 0.70f, 0.74f, 0.80f, 0.3f);  // border
+            float inx = 2.0f * sc / d.w, iny = 2.0f * sc / d.h;
+            solid(bx0 + inx, by0 + iny, bx1 - inx, by1 - iny, 0.13f, 0.14f, 0.17f, 0.35f);
+            if (on)
+                solid(bx0 + 2 * inx, by0 + 2 * iny, bx1 - 2 * inx, by1 - 2 * iny,
+                      0.30f, 0.75f, 0.42f, 0.4f);  // green tick fill
+            float hr = on ? 0.62f : 0.45f, hg = on ? 0.72f : 0.50f, hb = on ? 0.86f : 0.58f;
+            solid((cb.x + cb.w + 6.0f * sc - d.x) / d.w, midY, tx0 - 6.0f * sc / d.w,
+                  midY + lineH, 0.36f, 0.40f, 0.48f, 0.3f);
+            solid(tx0 + tw + 6.0f * sc / d.w, midY, cx + cw, midY + lineH,
+                  0.36f, 0.40f, 0.48f, 0.3f);
+            text(hbuf, tx0, labelY, lh, hr, hg, hb, 0.6f);
+            continue;
+        }
         text(s.name, (trk.x - d.x) / d.w, labelY, lh, 0.80f, 0.84f, 0.90f, 0.6f);
 
         if (s.isInt)                              std::snprintf(buf, sizeof(buf), "%d", (int)std::lround(val));
@@ -2750,6 +2824,7 @@ void buildPipelineDialogGeometry(const PipelineDialog& d, render::Vertex* out) {
             std::string s;
             for (int pi = 0; pi < pc && pi < (int)n.params.size(); ++pi) {
                 modes::ModeParam mp = modes::modeParam(idx, pi);
+                if (modes::modeParamIsHeader(mp)) continue;  // header slot, no value
                 if (mp.isInt) std::snprintf(pbuf, sizeof(pbuf), "%d", (int)std::lround(n.params[pi]));
                 else if (mp.step > 0.0f && mp.step < 0.01f)
                     std::snprintf(pbuf, sizeof(pbuf), "%.3f", n.params[pi]);
@@ -4848,7 +4923,7 @@ void modeParamsDialogInputSystem(entt::registry& world, core::Input& input,
     CompareLegend* lg = d->pipeNodeId < 0 ? activeModeLegend(world) : nullptr;
     const float s = uiScale();
     d->w = (int)(280.0f * s);
-    d->h = (int)((42.0f + nParams * 36.0f + 46.0f +
+    d->h = (int)((42.0f + nParams * 48.0f + 46.0f +
                   ((modes::modeCanFit(d->modeIndex) ||
                     modes::modeAppliesMesh(d->modeIndex)) &&
                            d->pipeNodeId < 0
@@ -4928,10 +5003,25 @@ void modeParamsDialogInputSystem(entt::registry& world, core::Input& input,
         return;
     }
 
-    // -/+ nudge buttons: one step per click.
+    // Header checkboxes: toggle the section's enable flag.
     if (input.leftClicked) {
-        for (int i = 0; i < nParams && i < 8; ++i) {
+        for (int i = 0; i < nParams && i < 12; ++i) {
+            if (!modes::modeParamIsHeader(modes::modeParam(d->modeIndex, i))) continue;
+            CRect cb = modeHeaderCheckRect(R.track[i], s);
+            CRect band = {cb.x - 4.0f, cb.y - 4.0f, cb.w + 8.0f, cb.h + 8.0f};
+            if (hit(band)) {
+                d->values[i] = d->values[i] != 0.0f ? 0.0f : 1.0f;
+                input.captured = true;
+                return;
+            }
+        }
+    }
+
+    // -/+ nudge buttons: one step per click. Header rows have no controls.
+    if (input.leftClicked) {
+        for (int i = 0; i < nParams && i < 12; ++i) {
             modes::ModeParam s = modes::modeParam(d->modeIndex, i);
+            if (modes::modeParamIsHeader(s)) continue;
             float st = modeParamStep(s);
             if (hit(R.minus[i])) {
                 d->values[i] = modeParamSnap(s, d->values[i] - st);
@@ -4947,7 +5037,8 @@ void modeParamsDialogInputSystem(entt::registry& world, core::Input& input,
     }
 
     if (input.leftClicked) {
-        for (int i = 0; i < nParams && i < 8; ++i) {
+        for (int i = 0; i < nParams && i < 12; ++i) {
+            if (modes::modeParamIsHeader(modes::modeParam(d->modeIndex, i))) continue;
             const CRect& t = R.track[i];
             CRect band = {t.x - 6.0f, t.y - 11.0f, t.w + 12.0f, t.h + 22.0f};
             if (hit(band)) { d->dragSlider = i; break; }
@@ -5169,7 +5260,7 @@ void pipelineDialogInputSystem(entt::registry& world, core::Input& input,
                     for (int pi = 0; pi < cnt && pi < (int)n.params.size(); ++pi)
                         pd->values[pi] = n.params[pi];
                     // Height/width recomputed per frame by its input system.
-                    pd->h       = (int)((42.0f + cnt * 36.0f + 46.0f) * uiScale());
+                    pd->h       = (int)((42.0f + cnt * 48.0f + 46.0f) * uiScale());
                     pd->visible = true;
                 } else if (pd && pd->pipeNodeId >= 0) {
                     pd->pipeNodeId = -1;  // clicked a param-less node: unbind

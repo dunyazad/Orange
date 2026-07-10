@@ -774,7 +774,7 @@ int main(int argc, char** argv) {
     }
 
     // Mode-parameters dialog (generic sliders for the active geometry mode).
-    const int kModeDlgQ = 256, kModeDlgV = kModeDlgQ * 4;  // must match kModeDlgQuads in systems.cpp
+    const int kModeDlgQ = 512, kModeDlgV = kModeDlgQ * 4;  // must match kModeDlgQuads in systems.cpp
     const std::vector<render::Vertex> mdInit(kModeDlgV, render::Vertex{{0, 0, 0}, {0, 0, 0}});
     std::vector<uint32_t> mdIdx;
     for (uint32_t q = 0; q < static_cast<uint32_t>(kModeDlgQ); ++q) {

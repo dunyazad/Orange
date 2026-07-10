@@ -36,6 +36,13 @@ set_target_properties(orange_poisson_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME orange_poisson_tests COMMAND orange_poisson_tests)
 
+# Headless mode-runner on a real PLY: runs any Recolor mode, prints class
+# counts, writes a recolored PLY for the --shot viewer (manual, not a CTest).
+add_executable(orange_margin_probe probe_margin.cpp)
+target_link_libraries(orange_margin_probe PRIVATE orange::core)
+set_target_properties(orange_margin_probe PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 # Numeric build check on a real PLY (manual; needs an external file, not a CTest).
 add_executable(orange_ply_check check_ply.cpp)
 target_link_libraries(orange_ply_check PRIVATE orange::core)

@@ -339,9 +339,12 @@ static void test_qfor_div_gate() {
     };
     orange::debug::DebugDraw extras;
 
-    // Side = 2 (both directions): the spikes' anomaly clears the gate, QFOR's
-    // residual removes them; false positives stay rare.
-    in.params = {24.0f, 3.0f, 2.0f, 2.0f, 1.0f};
+    // Params: {div on, Div K, Sigma Thresh, Side, Raw Field,
+    //          qfor on, K, Alpha, Sparse Skip} -- indices 0/5 are the section
+    // headers' enable checkboxes.
+    // Side = 2 (both directions), anomaly gate: the spikes' anomaly clears the
+    // gate, QFOR's residual removes them; false positives stay rare.
+    in.params = {1.0f, 24.0f, 2.0f, 2.0f, 0.0f, 1.0f, 24.0f, 3.0f, 1.0f};
     std::vector<Eigen::Vector3f> colors;
     orange::modes::runModeColors(idx, in, colors, extras);
     CHECK(colors.size() == in.points.size());
@@ -357,20 +360,47 @@ static void test_qfor_div_gate() {
 
     // Side = 0 (positive-anomaly gate): the spikes' anomaly is negative ->
     // gated OUT -> they survive, residual notwithstanding.
-    in.params = {24.0f, 3.0f, 2.0f, 0.0f, 1.0f};
+    in.params = {1.0f, 24.0f, 2.0f, 0.0f, 0.0f, 1.0f, 24.0f, 3.0f, 1.0f};
     orange::modes::runModeColors(idx, in, colors, extras);
     int spikeKept = 0;
     for (int i : spikes) spikeKept += !dropped(colors, i);
     CHECK(spikeKept == (int)spikes.size());
 
-    // Gate Raw = 1: the RAW divergence (the Normal Divergence heatmap's
-    // signal) is positive over the whole convex sphere, so Side = 0 now gates
-    // everything in -- the spikes drop again.
-    in.params = {24.0f, 3.0f, 2.0f, 0.0f, 1.0f, 1.0f};
+    // Raw Field = 1, Sigma Thresh = 0 (strict sign test): the RAW divergence
+    // is positive over the whole convex sphere, so Side = 0 gates everything
+    // in -- the spikes drop again. Div K (16) deliberately differs from
+    // QFOR's K (24): the gate and the quadric fit use independent neighbour
+    // counts.
+    in.params = {1.0f, 16.0f, 0.0f, 0.0f, 1.0f, 1.0f, 24.0f, 3.0f, 1.0f};
     orange::modes::runModeColors(idx, in, colors, extras);
     int spikeDropsRaw = 0;
     for (int i : spikes) spikeDropsRaw += dropped(colors, i);
     CHECK(spikeDropsRaw == (int)spikes.size());
+
+    // Divergence checkbox OFF: no gate -- plain QFOR over the whole cloud, so
+    // the spikes drop even though Side = 0 (anomaly negative) protected them
+    // above.
+    in.params = {0.0f, 24.0f, 2.0f, 0.0f, 0.0f, 1.0f, 24.0f, 3.0f, 1.0f};
+    orange::modes::runModeColors(idx, in, colors, extras);
+    int divOffDrops = 0;
+    for (int i : spikes) divOffDrops += dropped(colors, i);
+    CHECK(divOffDrops == (int)spikes.size());
+
+    // QFOR checkbox OFF: the gate alone is the filter. Raw divergence > 0
+    // covers (nearly) the whole convex sphere -- most of the cloud drops,
+    // residual never consulted.
+    in.params = {1.0f, 24.0f, 0.0f, 0.0f, 1.0f, 0.0f, 24.0f, 3.0f, 1.0f};
+    orange::modes::runModeColors(idx, in, colors, extras);
+    int gateOnly = 0;
+    for (size_t i = 0; i < colors.size(); ++i) gateOnly += dropped(colors, i);
+    CHECK(gateOnly >= (int)in.points.size() * 9 / 10);
+
+    // Both checkboxes OFF: nothing drops.
+    in.params = {0.0f, 24.0f, 0.0f, 0.0f, 1.0f, 0.0f, 24.0f, 3.0f, 1.0f};
+    orange::modes::runModeColors(idx, in, colors, extras);
+    int bothOff = 0;
+    for (size_t i = 0; i < colors.size(); ++i) bothOff += dropped(colors, i);
+    CHECK(bothOff == 0);
 
     // PFOR (Div Gate): same gate, plane-distance core. Side = 2 drops the
     // spikes; Side = 0 (their anomaly is negative) protects them.
@@ -441,6 +471,133 @@ static void test_qfor_dev_gate() {
     CHECK(tiltedDrops == (int)tilted.size());
     CHECK(cleanKept == (int)clean.size());
     CHECK(totalDrops <= (int)tilted.size() + (int)in.points.size() / 20);
+}
+
+// --- SFOR: algebraic-sphere outlier filter ------------------------------------
+// A unit sphere fits ITSELF exactly, so SFOR must catch every radial spike
+// with (near) zero false positives, and Fit must pull the spikes back to
+// radius ~1.
+static void test_sfor() {
+    std::printf("[sfor]\n");
+    const int idx = orange::modes::modeIndexByName("Outlier: SFOR");
+    CHECK(idx >= 0);
+    CHECK(orange::modes::modeSupportsCandidates(idx));
+
+    orange::modes::ModeInput in;
+    for (int a = 0; a < 24; ++a)
+        for (int b = 1; b < 12; ++b) {
+            float phi = 2.0f * 3.14159265f * a / 24.0f, th = 3.14159265f * b / 12.0f;
+            in.points.emplace_back(std::sin(th) * std::cos(phi), std::cos(th),
+                                   std::sin(th) * std::sin(phi));
+        }
+    std::vector<int> spikes = {40, 120, 200};
+    for (int i : spikes) in.points[i] *= 1.25f;
+
+    const Eigen::Vector3f dropRed(0.5f, 0.12f, 0.12f);
+    std::vector<Eigen::Vector3f> colors;
+    orange::debug::DebugDraw extras;
+    orange::modes::runModeColors(idx, in, colors, extras);
+    CHECK(colors.size() == in.points.size());
+    int spikeDrops = 0, fp = 0;
+    std::vector<uint8_t> isSpike(in.points.size(), 0);
+    for (int i : spikes) isSpike[i] = 1;
+    for (size_t i = 0; i < colors.size(); ++i) {
+        bool drop = (colors[i] - dropRed).squaredNorm() < 1e-8f;
+        if (isSpike[i]) spikeDrops += drop;
+        else fp += drop;
+    }
+    CHECK(spikeDrops == (int)spikes.size());
+    CHECK(fp <= (int)in.points.size() / 50);  // sphere fits itself: ~0 FP
+
+    std::vector<Eigen::Vector3f> fitted;
+    orange::modes::runModeFit(idx, in, fitted);
+    bool back = true;
+    for (int i : spikes) back = back && std::fabs(fitted[i].norm() - 1.0f) < 0.05f;
+    CHECK(back);
+}
+
+// --- RIMLS: edge-preserving filter ---------------------------------------------
+// A sharp roof (two planes meeting at a ridge) with per-face normals. RIMLS
+// must remove the injected spikes WITHOUT flagging the crease points -- the
+// robust normal weight keeps the far face out of each point's reference
+// surface, so the edge is not rounded into a false outlier.
+static void test_rimls() {
+    std::printf("[rimls]\n");
+    const int idx = orange::modes::modeIndexByName("Outlier: RIMLS");
+    CHECK(idx >= 0);
+
+    orange::modes::ModeInput in;
+    std::vector<int> ridge;
+    const float s = 1.0f / std::sqrt(2.0f);
+    for (int gy = 0; gy < 24; ++gy)
+        for (int gx = 0; gx < 24; ++gx) {
+            float x = -1.0f + gx * (2.0f / 23.0f);
+            float y = -1.0f + gy * (2.0f / 23.0f);
+            float z = -std::fabs(x);  // roof with the ridge along x = 0
+            if (std::fabs(x) < 0.05f) ridge.push_back((int)in.points.size());
+            in.points.emplace_back(x, y, z);
+            in.normals.emplace_back(x < 0.0f ? Eigen::Vector3f(-s, 0, s)
+                                             : Eigen::Vector3f(s, 0, s));
+        }
+    std::vector<int> spikes = {100, 300, 480};
+    for (int i : spikes) in.points[i] += in.normals[i] * 0.25f;
+
+    const Eigen::Vector3f dropRed(0.5f, 0.12f, 0.12f);
+    std::vector<Eigen::Vector3f> colors;
+    orange::debug::DebugDraw extras;
+    in.params = {6.0f, 3.0f, 0.5f};  // radius wide enough to see past the spikes
+    orange::modes::runModeColors(idx, in, colors, extras);
+    CHECK(colors.size() == in.points.size());
+    int spikeDrops = 0, ridgeDrops = 0;
+    std::vector<uint8_t> isSpike(in.points.size(), 0);
+    for (int i : spikes) isSpike[i] = 1;
+    for (int i : ridge)
+        if (!isSpike[i]) ridgeDrops += (colors[i] - dropRed).squaredNorm() < 1e-8f;
+    for (int i : spikes) spikeDrops += (colors[i] - dropRed).squaredNorm() < 1e-8f;
+    CHECK(spikeDrops == (int)spikes.size());
+    CHECK(ridgeDrops == 0);  // the crease must survive
+}
+
+// --- RANSAC Shapes: plane + sphere get separated --------------------------------
+static void test_ransac_shapes() {
+    std::printf("[ransac shapes]\n");
+    const int idx = orange::modes::modeIndexByName("RANSAC Shapes");
+    CHECK(idx >= 0);
+
+    orange::modes::ModeInput in;
+    size_t nPlane = 0;
+    for (int gy = 0; gy < 20; ++gy)
+        for (int gx = 0; gx < 20; ++gx) {
+            in.points.emplace_back(-1.0f + gx / 9.5f, -1.0f + gy / 9.5f, 0.0f);
+            ++nPlane;
+        }
+    for (int a = 0; a < 18; ++a)
+        for (int b = 1; b < 17; ++b) {  // sphere r=0.5 at (3,0,0.5)
+            float phi = 2.0f * 3.14159265f * a / 18.0f, th = 3.14159265f * b / 17.0f;
+            in.points.emplace_back(3.0f + 0.5f * std::sin(th) * std::cos(phi),
+                                   0.5f * std::sin(th) * std::sin(phi),
+                                   0.5f + 0.5f * std::cos(th));
+        }
+
+    std::vector<Eigen::Vector3f> colors;
+    orange::debug::DebugDraw extras;
+    in.params = {1.0f, 10.0f, 4.0f};
+    orange::modes::runModeColors(idx, in, colors, extras);
+    CHECK(colors.size() == in.points.size());
+    // Plane points share one assigned color, sphere points another, distinct.
+    auto assigned = [&](size_t i) { return colors[i].x() >= 0.0f; };
+    size_t pa = 0, sa = 0;
+    for (size_t i = 0; i < nPlane; ++i) pa += assigned(i);
+    for (size_t i = nPlane; i < colors.size(); ++i) sa += assigned(i);
+    CHECK(pa > nPlane * 8 / 10);
+    CHECK(sa > (colors.size() - nPlane) * 8 / 10);
+    // Majority colors of the two groups must differ.
+    Eigen::Vector3f cp = Eigen::Vector3f::Zero(), csx = Eigen::Vector3f::Zero();
+    for (size_t i = 0; i < nPlane; ++i)
+        if (assigned(i)) { cp = colors[i]; break; }
+    for (size_t i = nPlane; i < colors.size(); ++i)
+        if (assigned(i)) { csx = colors[i]; break; }
+    CHECK((cp - csx).squaredNorm() > 1e-4f);
 }
 
 // --- mesh IO roundtrip ------------------------------------------------------
@@ -612,6 +769,9 @@ int main() {
     test_qfor();
     test_qfor_div_gate();
     test_qfor_dev_gate();
+    test_sfor();
+    test_rimls();
+    test_ransac_shapes();
     test_processing();
     test_ui_layout();
     test_io();

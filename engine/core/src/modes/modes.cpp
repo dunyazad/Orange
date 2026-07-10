@@ -9,6 +9,7 @@
 #include <functional>
 #include <mutex>
 #include <numeric>
+#include <random>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -622,7 +623,12 @@ std::vector<float> normalDivergenceField(const ModeInput& in, int k,
             float d2 = d.squaredNorm();
             if (d2 < 1e-20f) continue;
             Eigen::Vector3f nj = nrm[nbr[t]];
-            if (nj.dot(nrm[i]) < 0.0f) nj = -nj;  // orientation-flip guard
+            // Orientation-flip guard -- only for ESTIMATED normals (their signs
+            // are per-point ambiguous). Source-oriented normals skip it: on a
+            // sharp crease with dihedral > 90 deg the dot goes negative for
+            // real geometry, and flipping there inverts the divergence sign
+            // (sharp convex read as concave and vice versa).
+            if (!haveN && nj.dot(nrm[i]) < 0.0f) nj = -nj;
             s += (nj - nrm[i]).dot(d) / d2;
             ++n;
         }
@@ -726,16 +732,20 @@ std::vector<uint8_t> divergenceGate(const ModeInput& in, int k, float sigmaMul, 
 // K/2 found neighbours (under-sampled reference surface, judged as inliers);
 // off = judge everything the 6-unknown fit can mathematically handle (floor of
 // 9 neighbours stays -- below that the LS system is not overdetermined).
+// `passes` = IRLS fit/reweight rounds (the plain QFOR mode exposes it as its
+// "Iterations" param; more rounds reject clustered spikes harder). `kIdx` is
+// the params index K is read from (0 in the plain mode; the gated variants
+// place their section headers first, shifting it).
 std::vector<float> qforResiduals(const ModeInput& in, std::vector<Eigen::Vector3f>& normals,
                                  const ProgressFn& progress, float p0, float p1,
-                                 bool halfKSkip) {
+                                 bool halfKSkip, int passes = 2, int kIdx = 0) {
     const auto& pts = in.points;
     std::vector<float> res(pts.size(), 0.0f);
     normals.assign(pts.size(), Eigen::Vector3f::UnitY());
     geometry::SparseGrid grid;
     Eigen::Vector3f mn, mx;
     buildGrid(pts, grid, mn, mx);
-    const int k = (int)std::lround(P(in, 0, 24.0f));
+    const int k = (int)std::lround(P(in, kIdx, 24.0f));
 
     parallelFor(pts.size(), progress, p0, p1, [&](size_t i) {
         thread_local std::vector<unsigned int> nbr, oth;
@@ -765,14 +775,16 @@ std::vector<float> qforResiduals(const ModeInput& in, std::vector<Eigen::Vector3
         const Eigen::Vector3f di = pts[i] - c;
         const float ui = di.dot(t1) * s, vi = di.dot(t2) * s, wi = di.dot(n);
 
-        // Two-pass robust LS (same trick as mlsCompute): the first fit's
-        // high-residual neighbours -- other spikes sitting in this window --
-        // are down-weighted for the refit, so one outlier can't drag another
-        // outlier's reference surface toward itself.
+        // Iteratively reweighted robust LS (same trick as mlsCompute): each
+        // pass down-weights the previous fit's high-residual neighbours --
+        // other spikes sitting in this window -- so one outlier can't drag
+        // another outlier's reference surface toward itself. More passes =
+        // tighter rejection of clustered contamination, slightly slower.
         thread_local std::vector<float> rob, rres;
         rob.assign(oth.size(), 1.0f);
         float d = wi;  // degenerate fit: fall back to the plane residual
-        for (int pass = 0; pass < 2; ++pass) {
+        const int nPass = passes < 1 ? 1 : passes;
+        for (int pass = 0; pass < nPass; ++pass) {
             Eigen::Matrix<float, 6, 6> A = Eigen::Matrix<float, 6, 6>::Zero();
             Eigen::Matrix<float, 6, 1> b = Eigen::Matrix<float, 6, 1>::Zero();
             for (size_t t = 0; t < oth.size(); ++t) {
@@ -787,7 +799,7 @@ std::vector<float> qforResiduals(const ModeInput& in, std::vector<Eigen::Vector3
             Eigen::Matrix<float, 6, 1> q = ldlt.solve(b);
             d = wi - (q[0] * ui * ui + q[1] * ui * vi + q[2] * vi * vi +
                       q[3] * ui + q[4] * vi + q[5]);
-            if (pass == 1) break;
+            if (pass == nPass - 1) break;
             rres.resize(oth.size());
             for (size_t t = 0; t < oth.size(); ++t) {
                 float u = loc[t].x(), v = loc[t].y();
@@ -813,15 +825,22 @@ std::vector<float> qforResiduals(const ModeInput& in, std::vector<Eigen::Vector3
 }
 
 // Robust global outlier threshold over the residuals: alpha * (1.4826 * MAD).
-float qforThreshold(const ModeInput& in, const std::vector<float>& res) {
+// `alphaIdx` = the params index Alpha is read from (1 in the plain mode).
+float qforThreshold(const ModeInput& in, const std::vector<float>& res, int alphaIdx = 1) {
     std::vector<float> mag(res.size());
     for (size_t i = 0; i < res.size(); ++i) mag[i] = std::fabs(res[i]);
     size_t h = mag.size() / 2;
     std::nth_element(mag.begin(), mag.begin() + h, mag.end());
     float sigma = 1.4826f * mag[h];
+    // Floor: a numerically perfect region (exact plane/sphere) has MAD ~ float
+    // noise, and an unfloored sigma would flag that noise -- or the ~1e-4
+    // reference-surface approximation error the estimators themselves leave
+    // (e.g. RIMLS at a crease). 1e-4 of the diag (3 sigma = 0.03% of the
+    // model) is still far below any real scanner's noise, so the floor never
+    // bites real data.
     Eigen::Vector3f mn, mx;
-    sigma = std::max(sigma, boundsExtent(in.points, mn, mx).norm() * 1e-7f);  // exact-plane guard
-    return P(in, 1, 3.0f) * sigma;
+    sigma = std::max(sigma, boundsExtent(in.points, mn, mx).norm() * 1e-4f);
+    return P(in, alphaIdx, 3.0f) * sigma;
 }
 
 void qforColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
@@ -831,7 +850,8 @@ void qforColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
     if (pts.size() < 16) return;
     std::vector<Eigen::Vector3f> nrm;
     std::vector<float> res =
-        qforResiduals(in, nrm, progress, 0.0f, 0.98f, P(in, 2, 1.0f) != 0.0f);
+        qforResiduals(in, nrm, progress, 0.0f, 0.98f, P(in, 2, 1.0f) != 0.0f,
+                      (int)std::lround(P(in, 3, 2.0f)));
     const float thresh = qforThreshold(in, res);
     std::vector<uint8_t> keep(pts.size());
     for (size_t i = 0; i < pts.size(); ++i) keep[i] = std::fabs(res[i]) <= thresh;
@@ -848,11 +868,164 @@ void qforFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
     if (pts.size() < 16) return;
     std::vector<Eigen::Vector3f> nrm;
     std::vector<float> res =
-        qforResiduals(in, nrm, progress, 0.0f, 0.98f, P(in, 2, 1.0f) != 0.0f);
+        qforResiduals(in, nrm, progress, 0.0f, 0.98f, P(in, 2, 1.0f) != 0.0f,
+                      (int)std::lround(P(in, 3, 2.0f)));
     const float thresh = qforThreshold(in, res);
     for (size_t i = 0; i < pts.size(); ++i)
         if (std::fabs(res[i]) > thresh && isCandidate(in, i))
             fitted[i] = pts[i] - nrm[i] * res[i];
+}
+
+// --- Filter: Sphere-Fitting Outlier Removal (SFOR, APSS-style) -----------------
+// The algebraic-sphere counterpart of QFOR. A sphere absorbs uniform curvature
+// exactly like the quadric does, but the fit is even simpler: with the Kasa
+// trick the sphere |p - m|^2 = r^2 rewrites as  2 m.p + t = |p|^2  with
+// t = r^2 - |m|^2 -- LINEAR in the unknowns (m, t), so it is a tiny 4x4 least
+// squares and needs NO local frame at all (rotation-symmetric). That makes it
+// cheaper than QFOR and more stable on strongly curved regions where a
+// height-field quadric struggles. Leave-one-out as always. A near-flat
+// neighbourhood blows the radius up; past 50x the neighbourhood extent the fit
+// falls back to the PCA plane residual. Thresholding mirrors QFOR: global
+// robust MAD scale, outlier when |res| > Alpha * sigma.
+// Params: 0 = K, 1 = Alpha, 2 = Sparse Skip.
+std::vector<float> sforResiduals(const ModeInput& in, std::vector<Eigen::Vector3f>& dirs,
+                                 const ProgressFn& progress, float p0, float p1,
+                                 bool halfKSkip) {
+    // dirs[i] = unit direction that pushes point i onto its reference surface
+    // (radial for a sphere fit, the plane normal for the flat fallback).
+    const auto& pts = in.points;
+    std::vector<float> res(pts.size(), 0.0f);
+    dirs.assign(pts.size(), Eigen::Vector3f::UnitY());
+    geometry::SparseGrid grid;
+    Eigen::Vector3f mn, mx;
+    buildGrid(pts, grid, mn, mx);
+    const int k = (int)std::lround(P(in, 0, 24.0f));
+
+    parallelFor(pts.size(), progress, p0, p1, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr, oth;
+        thread_local std::vector<float> dist;
+        Eigen::Vector3f c, eval; Eigen::Matrix3f evec;
+        grid.kNearestNeighbors(pts, pts[i], k + 1, nbr, dist);
+        if ((int)nbr.size() - 1 < (halfKSkip ? std::max(9, k / 2) : 9)) return;
+        oth.assign(nbr.begin() + 1, nbr.end());  // leave-one-out
+        if (!neighbourhoodPCA(pts, oth, c, eval, evec)) return;
+        const float extent = std::sqrt(std::max(eval.y(), 1e-12f));
+
+        // Robust sphere fit via LMedS (least MEDIAN of squares): draw a handful
+        // of exact 4-point sphere hypotheses, score each by the MEDIAN
+        // geometric distance of all neighbours, keep the best, then refit Kasa
+        // least squares on that hypothesis's inliers only. A plain (even
+        // IRLS-reweighted) Kasa fit is ALGEBRAIC -- one far spike shifts it
+        // enough to paint whole neighbourhoods as outliers; the median score
+        // simply never rewards a hypothesis for chasing the spike.
+        thread_local std::vector<float> rr, tmp;
+        rr.resize(oth.size());
+        auto sphereFrom4 = [&](const Eigen::Vector3f q[4], Eigen::Vector3f& m0,
+                               float& r0) {
+            Eigen::Matrix4f A;
+            Eigen::Vector4f rhs;
+            for (int t = 0; t < 4; ++t) {
+                A.row(t) << 2 * q[t].x(), 2 * q[t].y(), 2 * q[t].z(), 1.0f;
+                rhs(t) = q[t].squaredNorm();
+            }
+            Eigen::FullPivLU<Eigen::Matrix4f> lu(A);
+            if (!lu.isInvertible()) return false;
+            Eigen::Vector4f x = lu.solve(rhs);
+            m0 = Eigen::Vector3f(x.x(), x.y(), x.z());
+            float r2 = x.w() + m0.squaredNorm();
+            if (r2 <= 0.0f) return false;
+            r0 = std::sqrt(r2);
+            return true;
+        };
+        std::minstd_rand lrng((unsigned)(i * 2654435761u + 1u));  // deterministic per point
+        Eigen::Vector3f bestM = Eigen::Vector3f::Zero();
+        float bestR = 0.0f, bestMed = FLT_MAX;
+        for (int hyp = 0; hyp < 12; ++hyp) {
+            Eigen::Vector3f q[4];
+            for (int t = 0; t < 4; ++t) q[t] = pts[oth[lrng() % oth.size()]] - c;
+            Eigen::Vector3f m0;
+            float r0;
+            if (!sphereFrom4(q, m0, r0) || r0 > 50.0f * extent) continue;
+            for (size_t t = 0; t < oth.size(); ++t)
+                rr[t] = std::fabs((pts[oth[t]] - c - m0).norm() - r0);
+            tmp = rr;
+            std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+            float med = tmp[tmp.size() / 2];
+            if (med < bestMed) { bestMed = med; bestM = m0; bestR = r0; }
+        }
+        bool sphere = bestMed < FLT_MAX;
+        Eigen::Vector3f m = bestM;
+        float r = bestR;
+        if (sphere) {  // final Kasa refit on the best hypothesis's inliers
+            float cut = 3.0f * std::max(1.4826f * bestMed, 1e-4f * extent);
+            Eigen::Matrix4f A = Eigen::Matrix4f::Zero();
+            Eigen::Vector4f b = Eigen::Vector4f::Zero();
+            int used = 0;
+            for (size_t t = 0; t < oth.size(); ++t) {
+                Eigen::Vector3f q = pts[oth[t]] - c;
+                if (std::fabs((q - bestM).norm() - bestR) > cut) continue;
+                Eigen::Vector4f row(2.0f * q.x(), 2.0f * q.y(), 2.0f * q.z(), 1.0f);
+                A += row * row.transpose();
+                b += row * q.squaredNorm();
+                ++used;
+            }
+            Eigen::LDLT<Eigen::Matrix4f> ldlt(A);
+            if (used >= 6 && ldlt.info() == Eigen::Success) {
+                Eigen::Vector4f x = ldlt.solve(b);
+                Eigen::Vector3f m1(x.x(), x.y(), x.z());
+                float r2 = x.w() + m1.squaredNorm();
+                if (r2 > 0.0f && std::sqrt(r2) < 50.0f * extent) {
+                    m = m1;
+                    r = std::sqrt(r2);
+                }
+            }
+            sphere = r > 0.0f && r < 50.0f * extent;
+        }
+        if (sphere) {
+            Eigen::Vector3f rad = (pts[i] - c) - m;
+            float L = rad.norm();
+            if (L > 1e-12f) {
+                res[i]  = L - r;  // outside the sphere +, inside -
+                dirs[i] = rad / L;
+                return;
+            }
+        }
+        // Flat fallback: PCA plane residual (exactly PFOR's measure).
+        Eigen::Vector3f n = evec.col(0);
+        res[i]  = (pts[i] - c).dot(n);
+        dirs[i] = n;
+    });
+    return res;
+}
+
+void sforColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
+    const auto& pts = in.points;
+    if (pts.size() < 16) return;
+    std::vector<Eigen::Vector3f> dirs;
+    std::vector<float> res =
+        sforResiduals(in, dirs, progress, 0.0f, 0.98f, P(in, 2, 1.0f) != 0.0f);
+    const float thresh = qforThreshold(in, res);  // same Alpha-at-param-1 contract
+    std::vector<uint8_t> keep(pts.size());
+    for (size_t i = 0; i < pts.size(); ++i) keep[i] = std::fabs(res[i]) <= thresh;
+    keepNonCandidates(in, keep);
+    keepToColors(keep, colors);
+}
+
+// SFOR "Fit": pull the outliers onto the fitted sphere (radially) or plane.
+void sforFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+             const ProgressFn& progress) {
+    const auto& pts = in.points;
+    fitted = pts;
+    if (pts.size() < 16) return;
+    std::vector<Eigen::Vector3f> dirs;
+    std::vector<float> res =
+        sforResiduals(in, dirs, progress, 0.0f, 0.98f, P(in, 2, 1.0f) != 0.0f);
+    const float thresh = qforThreshold(in, res);
+    for (size_t i = 0; i < pts.size(); ++i)
+        if (std::fabs(res[i]) > thresh && isCandidate(in, i))
+            fitted[i] = pts[i] - dirs[i] * res[i];
 }
 
 // --- Filter: QFOR gated by normal divergence ----------------------------------
@@ -861,13 +1034,23 @@ void qforFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
 // something is happening" (spike tips fan normals OUT, pits fan them IN).
 // Points outside the gate are always kept, however far off their quadric they
 // sit -- this protects deliberate sharp detail whose normal field is orderly.
-// The gate tests the divergence ANOMALY (raw field minus the neighbourhood
-// median -- see normalDivergenceAnomaly; raw divergence is curvature-dominated
-// and gated ~everything on curved models), against Div Sigma multiples of its
-// robust MAD scale. Side picks the direction: 0 = anomaly > +t, 1 = anomaly
-// < -t, 2 = |anomaly| > t (both). The QFOR core reads params 0/1 (K, Alpha) at
-// the same indices as the plain QFOR mode. Params: 0 = K, 1 = Alpha,
-// 2 = Div Sigma, 3 = Side, 4 = Sparse Skip.
+// The gate signal is the raw divergence field or its ANOMALY (raw minus the
+// neighbourhood median -- see normalDivergenceAnomaly; raw divergence is
+// curvature-dominated on curved models, the anomaly high-passes that away),
+// thresholded at Sigma Thresh multiples of the signal's robust scale -- 0
+// means a strict sign test (e.g. raw > 0 = every convex point is a
+// candidate). Side picks the direction: 0 = signal > +t, 1 = signal < -t,
+// 2 = |signal| > t (both). The gate's neighbour count is independent of
+// QFOR's K so the divergence estimate and the quadric fit can use different
+// neighbourhood scales.
+// Params (the "-- ... --" entries are section-header CHECKBOXES; their value
+// is the section's enable flag -- 0 removes that criterion entirely):
+//   0 = Divergence on/off, 1 = Div K, 2 = Sigma Thresh, 3 = Side,
+//   4 = Raw Field, 5 = QFOR on/off, 6 = K, 7 = Alpha, 8 = Sparse Skip.
+// Both on: drop = gated AND residual-flagged (the normal combination).
+// Divergence off: no gate -- plain QFOR over the whole cloud.
+// QFOR off: no residual test -- gated points drop as-is (a pure divergence
+// filter). Both off: nothing drops.
 void qforDivFlags(const ModeInput& in, std::vector<uint8_t>& drop, std::vector<uint8_t>& gate,
                   std::vector<Eigen::Vector3f>& nrmOut, std::vector<float>& resOut,
                   const ProgressFn& progress) {
@@ -876,12 +1059,25 @@ void qforDivFlags(const ModeInput& in, std::vector<uint8_t>& drop, std::vector<u
     gate.assign(pts.size(), 0);
     resOut.clear();
     if (pts.size() < 16) return;
-    const int k = (int)std::lround(P(in, 0, 24.0f));
-    gate = divergenceGate(in, k, P(in, 2, 2.0f), (int)std::lround(P(in, 3, 2.0f)),
-                          P(in, 5, 0.0f) != 0.0f, progress, 0.0f, 0.4f);
+    const bool divOn  = P(in, 0, 1.0f) != 0.0f;
+    const bool qforOn = P(in, 5, 1.0f) != 0.0f;
+    if (!divOn && !qforOn) { report(progress, 1.0f); return; }
 
-    resOut = qforResiduals(in, nrmOut, progress, 0.4f, 0.98f, P(in, 4, 1.0f) != 0.0f);
-    const float thresh = qforThreshold(in, resOut);
+    if (divOn) {
+        const int divK = (int)std::lround(P(in, 1, 16.0f));
+        gate = divergenceGate(in, divK, P(in, 2, 0.0f), (int)std::lround(P(in, 3, 0.0f)),
+                              P(in, 4, 1.0f) != 0.0f, progress, 0.0f, qforOn ? 0.4f : 1.0f);
+    } else {
+        gate.assign(pts.size(), 1);  // no gate: every point is a candidate
+    }
+
+    if (!qforOn) {  // gate IS the filter
+        for (size_t i = 0; i < pts.size(); ++i) drop[i] = gate[i] && isCandidate(in, i);
+        return;
+    }
+    resOut = qforResiduals(in, nrmOut, progress, divOn ? 0.4f : 0.0f, 0.98f,
+                           P(in, 8, 1.0f) != 0.0f, /*passes=*/2, /*kIdx=*/6);
+    const float thresh = qforThreshold(in, resOut, /*alphaIdx=*/7);
     for (size_t i = 0; i < pts.size(); ++i)
         drop[i] = gate[i] && std::fabs(resOut[i]) > thresh && isCandidate(in, i);
 }
@@ -909,6 +1105,7 @@ void qforDivFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
     std::vector<Eigen::Vector3f> nrm;
     std::vector<float> res;
     qforDivFlags(in, drop, gate, nrm, res, progress);
+    if (res.size() != drop.size()) return;  // QFOR section off: no quadric to project onto
     for (size_t i = 0; i < drop.size(); ++i)
         if (drop[i]) fitted[i] = in.points[i] - nrm[i] * res[i];
 }
@@ -1363,6 +1560,130 @@ void mlsFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
     mlsCompute(in, dev, fitted, progress, 1.0f);
 }
 
+// --- Filter: RIMLS (Robust Implicit MLS, edge-preserving) ----------------------
+// Simplified Oeztireli/Guennebaud/Gross 2009. The reference surface value at a
+// point is the weighted average of its neighbours' TANGENT-PLANE potentials
+// f_j = n_j . (p_i - p_j), iteratively REWEIGHTED two ways: a neighbour whose
+// potential disagrees with the consensus loses its vote (residual weight), and
+// a neighbour whose normal disagrees with the blended gradient loses its vote
+// (normal weight, sharpness = Sigma N). Across a crease the far face fails
+// BOTH tests, so the reference surface follows the near face instead of
+// rounding the edge -- crease points stop being false outliers (the known
+// QFOR weakness). residual = the converged potential f (signed, along the
+// blended gradient); global MAD threshold as QFOR.
+// Params: 0 = Radius %, 1 = Alpha, 2 = Sigma N.
+std::vector<float> rimlsResiduals(const ModeInput& in, std::vector<Eigen::Vector3f>& dirs,
+                                  const ProgressFn& progress, float p0, float p1) {
+    const auto& pts = in.points;
+    std::vector<float> res(pts.size(), 0.0f);
+    dirs.assign(pts.size(), Eigen::Vector3f::UnitY());
+    if (pts.size() < 8) return res;
+    geometry::SparseGrid grid;
+    Eigen::Vector3f mn, mx;
+    float diag = buildGrid(pts, grid, mn, mx);
+    const float h      = std::max(diag * P(in, 0, 2.0f) * 0.01f, 1e-9f);
+    const float sigmaN = P(in, 2, 0.8f);          // normal-difference sharpness
+    const float sigmaR = 0.5f * h;                // potential-consensus scale
+    const float inv2h2 = 1.0f / (2.0f * h * h);
+
+    const std::vector<Eigen::Vector3f> nrm =
+        in.normals.size() == pts.size()
+            ? in.normals
+            : geometry::estimateNormals(pts, 16, [&](float f) {
+                  report(progress, p0 + f * 0.4f * (p1 - p0));
+              });
+    const float pm = in.normals.size() == pts.size() ? p0 : p0 + 0.4f * (p1 - p0);
+
+    parallelFor(pts.size(), progress, pm, p1, [&](size_t i) {
+        thread_local std::vector<unsigned int> nbr;
+        thread_local std::vector<float> dist;
+        grid.pointsWithinRadius(pts, pts[i], h * 2.5f, nbr, dist);
+        if (nbr.size() < 6) return;
+        // Dense scans put thousands of points in the kernel radius, but the
+        // reweighted average only needs a few hundred well-spread samples:
+        // uniform-stride subsample (same cap as mlsCompute -- without it the
+        // 4 reweighting sweeps make RIMLS an order of magnitude slower).
+        constexpr size_t kMaxNbr = 256;
+        if (nbr.size() > kMaxNbr) {
+            size_t stride = nbr.size() / kMaxNbr + 1, w2 = 0;
+            for (size_t t = 0; t < nbr.size(); t += stride) {
+                nbr[w2]  = nbr[t];
+                dist[w2] = dist[t];
+                ++w2;
+            }
+            nbr.resize(w2);
+            dist.resize(w2);
+        }
+
+        // Per-neighbour invariants, computed ONCE: the plane potential and
+        // the spatial weight do not change across the reweighting sweeps.
+        thread_local std::vector<float> fxv, wv;
+        fxv.resize(nbr.size());
+        wv.resize(nbr.size());
+        for (size_t t = 0; t < nbr.size(); ++t) {
+            unsigned int j = nbr[t];
+            fxv[t] = nrm[j].dot(pts[i] - pts[j]);  // plane potential
+            wv[t]  = j == i ? 0.0f                 // leave-one-out
+                            : std::exp(-dist[t] * inv2h2);
+        }
+
+        float           f    = 0.0f;
+        Eigen::Vector3f grad = nrm[i];
+        const float invSr2 = 1.0f / (sigmaR * sigmaR);
+        const float invSn2 = 1.0f / (sigmaN * sigmaN);
+        for (int it = 0; it < 4; ++it) {
+            float           num = 0.0f, den = 0.0f;
+            Eigen::Vector3f gnum = Eigen::Vector3f::Zero();
+            for (size_t t = 0; t < nbr.size(); ++t) {
+                float a = wv[t];
+                if (a == 0.0f) continue;
+                if (it > 0) {  // robust reweights
+                    float dr = fxv[t] - f;
+                    float dn = (nrm[nbr[t]] - grad).squaredNorm();
+                    a *= std::exp(-dr * dr * invSr2 - dn * invSn2);
+                }
+                num  += a * fxv[t];
+                gnum += a * nrm[nbr[t]];
+                den  += a;
+            }
+            if (den < 1e-12f) break;
+            f = num / den;
+            if (gnum.squaredNorm() > 1e-12f) grad = gnum.normalized();
+        }
+        res[i]  = f;      // signed height above (+) / below (-) the RIMLS surface
+        dirs[i] = grad;
+    });
+    return res;
+}
+
+void rimlsColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                 debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
+    const auto& pts = in.points;
+    if (pts.size() < 16) return;
+    std::vector<Eigen::Vector3f> dirs;
+    std::vector<float> res = rimlsResiduals(in, dirs, progress, 0.0f, 0.98f);
+    const float thresh = qforThreshold(in, res);  // Alpha at param index 1
+    std::vector<uint8_t> keep(pts.size());
+    for (size_t i = 0; i < pts.size(); ++i) keep[i] = std::fabs(res[i]) <= thresh;
+    keepNonCandidates(in, keep);
+    keepToColors(keep, colors);
+}
+
+// RIMLS "Fit": project the outliers onto the edge-preserving surface.
+void rimlsFit(const ModeInput& in, std::vector<Eigen::Vector3f>& fitted,
+              const ProgressFn& progress) {
+    const auto& pts = in.points;
+    fitted = pts;
+    if (pts.size() < 16) return;
+    std::vector<Eigen::Vector3f> dirs;
+    std::vector<float> res = rimlsResiduals(in, dirs, progress, 0.0f, 0.98f);
+    const float thresh = qforThreshold(in, res);
+    for (size_t i = 0; i < pts.size(); ++i)
+        if (std::fabs(res[i]) > thresh && isCandidate(in, i))
+            fitted[i] = pts[i] - dirs[i] * res[i];
+}
+
 // --- Filter: Protrusion detect (MLS AND PFOR) ---------------------------------
 // "Find what sticks out": a point is a protrusion only when BOTH independent
 // tests agree -- its MLS significance (how far ABOVE the energy-weighted
@@ -1742,6 +2063,157 @@ void runICP(const ModeInput& in, debug::DebugDraw& out, const ProgressFn& progre
     }
 }
 
+// --- Analyze: RANSAC Shapes (plane / sphere / cylinder detection) --------------
+// Greedy multi-model RANSAC in the spirit of Schnabel et al.: repeatedly draw
+// minimal samples, hypothesize a plane (3 points), sphere (4 points), or
+// cylinder (2 points + their normals), score by inliers within Dist of the
+// surface, keep the best shape, assign + remove its inliers, repeat until no
+// candidate reaches Min Pts. Each detected shape paints its inliers one
+// palette color; unassigned points keep their original color. Deterministic
+// (fixed seed) so repeated runs agree. Best on CAD-like scans; organic
+// surfaces mostly stay unassigned.
+// Params: 0 = Dist %, 1 = Min Pts %, 2 = Max Shapes.
+void ransacShapesColors(const ModeInput& in, std::vector<Eigen::Vector3f>& colors,
+                        debug::DebugDraw& extras, const ProgressFn& progress) {
+    (void)extras;
+    const auto& pts = in.points;
+    colors.assign(pts.size(), Eigen::Vector3f(-1, -1, -1));  // keep original
+    if (pts.size() < 50) return;
+    Eigen::Vector3f mn, mx;
+    const float  diag      = boundsExtent(pts, mn, mx).norm();
+    const float  eps       = diag * P(in, 0, 1.0f) * 0.01f;
+    const size_t minPts    = std::max<size_t>(30, (size_t)(pts.size() * P(in, 1, 10.0f) * 0.01f));
+    const int    maxShapes = (int)std::lround(P(in, 2, 4.0f));
+
+    const std::vector<Eigen::Vector3f> nrm =  // cylinders need normals
+        in.normals.size() == pts.size()
+            ? in.normals
+            : geometry::estimateNormals(pts, 16, [&](float f) { report(progress, f * 0.3f); });
+
+    std::vector<int>    shapeOf(pts.size(), -1);
+    std::vector<size_t> remaining(pts.size());
+    for (size_t i = 0; i < pts.size(); ++i) remaining[i] = i;
+    std::mt19937 rng(12345);  // deterministic
+
+    // Inlier tests for one hypothesis over `remaining`.
+    auto planeCount = [&](const Eigen::Vector3f& n, float d0, std::vector<size_t>* out) {
+        size_t cnt = 0;
+        for (size_t i : remaining)
+            if (std::fabs(n.dot(pts[i]) - d0) < eps) {
+                ++cnt;
+                if (out) out->push_back(i);
+            }
+        return cnt;
+    };
+    auto sphereCount = [&](const Eigen::Vector3f& m, float r, std::vector<size_t>* out) {
+        size_t cnt = 0;
+        for (size_t i : remaining)
+            if (std::fabs((pts[i] - m).norm() - r) < eps) {
+                ++cnt;
+                if (out) out->push_back(i);
+            }
+        return cnt;
+    };
+    auto cylCount = [&](const Eigen::Vector3f& c0, const Eigen::Vector3f& a, float r,
+                        std::vector<size_t>* out) {
+        size_t cnt = 0;
+        for (size_t i : remaining) {
+            Eigen::Vector3f d = pts[i] - c0;
+            float axial = d.dot(a);
+            if (std::fabs((d - axial * a).norm() - r) < eps) {
+                ++cnt;
+                if (out) out->push_back(i);
+            }
+        }
+        return cnt;
+    };
+
+    for (int s = 0; s < maxShapes && remaining.size() >= minPts; ++s) {
+        // Best hypothesis this round: 0 = plane, 1 = sphere, 2 = cylinder.
+        int             bestKind = -1;
+        size_t          bestCnt  = 0;
+        Eigen::Vector3f bp0, bp1;  // model params (meaning depends on kind)
+        float           bs0 = 0.0f;
+        auto pick = [&]() { return remaining[rng() % remaining.size()]; };
+
+        for (int it = 0; it < 500; ++it) {
+            int kind = it % 3;
+            if (kind == 0) {  // plane from 3 points
+                Eigen::Vector3f a = pts[pick()], b = pts[pick()], c = pts[pick()];
+                Eigen::Vector3f n = (b - a).cross(c - a);
+                if (n.squaredNorm() < 1e-16f) continue;
+                n.normalize();
+                float  d0  = n.dot(a);
+                size_t cnt = planeCount(n, d0, nullptr);
+                if (cnt > bestCnt) { bestCnt = cnt; bestKind = 0; bp0 = n; bs0 = d0; }
+            } else if (kind == 1) {  // sphere through 4 points (Kasa, exact)
+                Eigen::Matrix4f A;
+                Eigen::Vector4f rhs;
+                for (int t = 0; t < 4; ++t) {
+                    Eigen::Vector3f p = pts[pick()];
+                    A.row(t) << 2 * p.x(), 2 * p.y(), 2 * p.z(), 1.0f;
+                    rhs(t) = p.squaredNorm();
+                }
+                Eigen::FullPivLU<Eigen::Matrix4f> lu(A);
+                if (!lu.isInvertible()) continue;
+                Eigen::Vector4f x = lu.solve(rhs);
+                Eigen::Vector3f m(x.x(), x.y(), x.z());
+                float r2 = x.w() + m.squaredNorm();
+                if (r2 <= 0.0f) continue;
+                float r = std::sqrt(r2);
+                if (r > diag) continue;  // degenerate near-plane sphere
+                size_t cnt = sphereCount(m, r, nullptr);
+                if (cnt > bestCnt) { bestCnt = cnt; bestKind = 1; bp0 = m; bs0 = r; }
+            } else {  // cylinder from 2 points + normals
+                size_t i1 = pick(), i2 = pick();
+                if (i1 == i2) continue;
+                Eigen::Vector3f a = nrm[i1].cross(nrm[i2]);
+                if (a.squaredNorm() < 1e-4f) continue;  // near-parallel normals
+                a.normalize();
+                // Project both (point, normal) pairs onto the plane orthogonal
+                // to the axis; the center is where the two normal lines meet.
+                auto flat = [&](const Eigen::Vector3f& v) {
+                    return (v - v.dot(a) * a).eval();
+                };
+                Eigen::Vector3f p1 = flat(pts[i1]), n1 = flat(nrm[i1]);
+                Eigen::Vector3f p2 = flat(pts[i2]), n2 = flat(nrm[i2]);
+                // Least squares t1, t2 with p1 + t1 n1 = p2 + t2 n2.
+                Eigen::Matrix<float, 3, 2> M;
+                M.col(0) = n1;
+                M.col(1) = -n2;
+                Eigen::Vector3f rhs2 = p2 - p1;
+                Eigen::Matrix2f MtM = M.transpose() * M;
+                if (std::fabs(MtM.determinant()) < 1e-10f) continue;
+                Eigen::Vector2f t12 = MtM.inverse() * (M.transpose() * rhs2);
+                Eigen::Vector3f c0  = pts[i1] + t12.x() * nrm[i1];
+                float r = 0.5f * (((pts[i1] - c0) - (pts[i1] - c0).dot(a) * a).norm() +
+                                  ((pts[i2] - c0) - (pts[i2] - c0).dot(a) * a).norm());
+                if (r < eps || r > diag) continue;
+                size_t cnt = cylCount(c0, a, r, nullptr);
+                if (cnt > bestCnt) { bestCnt = cnt; bestKind = 2; bp0 = c0; bp1 = a; bs0 = r; }
+            }
+        }
+        if (bestKind < 0 || bestCnt < minPts) break;
+
+        std::vector<size_t> inliers;
+        if (bestKind == 0)      planeCount(bp0, bs0, &inliers);
+        else if (bestKind == 1) sphereCount(bp0, bs0, &inliers);
+        else                    cylCount(bp0, bp1, bs0, &inliers);
+        for (size_t i : inliers) shapeOf[i] = s;
+        std::vector<size_t> next;
+        next.reserve(remaining.size() - inliers.size());
+        for (size_t i : remaining)
+            if (shapeOf[i] < 0) next.push_back(i);
+        remaining.swap(next);
+        report(progress, 0.3f + 0.7f * (float)(s + 1) / (float)maxShapes);
+    }
+
+    const auto palette = color::GetPalette(maxShapes > 0 ? maxShapes : 1);
+    for (size_t i = 0; i < pts.size(); ++i)
+        if (shapeOf[i] >= 0 && shapeOf[i] < (int)palette.size())
+            colors[i] = palette[shapeOf[i]].head<3>();
+}
+
 using DrawFn  = void (*)(const ModeInput&, debug::DebugDraw&, const ProgressFn&);
 using ColorFn = void (*)(const ModeInput&, std::vector<Eigen::Vector3f>&, debug::DebugDraw&,
                          const ProgressFn&);
@@ -1772,6 +2244,12 @@ void pforPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const Prog
 }
 void qforPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
     pointsFromKeepColors(qforColors, in, o, p);
+}
+void sforPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    pointsFromKeepColors(sforColors, in, o, p);
+}
+void rimlsPoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
+    pointsFromKeepColors(rimlsColors, in, o, p);
 }
 void qforDivGatePoints(const ModeInput& in, std::vector<Eigen::Vector3f>& o, const ProgressFn& p) {
     // Not via pointsFromKeepColors: the 3-band viz paints gated-but-kept
@@ -1831,6 +2309,10 @@ const ModeEntry kModes[] = {
      {{"Blur Iters", 0.0f, 5.0f, 2.0f, true}}, sdfFitPoints, sdfFitPoints},
     {"Clustering", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, clusteringColors,
      {{"Radius %", 0.5f, 10.0f, 2.0f, false}}},
+    {"RANSAC Shapes", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, ransacShapesColors,
+     {{"Dist %", 0.2f, 5.0f, 1.0f, false, 0.1f},
+      {"Min Pts %", 1.0f, 50.0f, 10.0f, false},
+      {"Max Shapes", 1.0f, 8.0f, 4.0f, true}}},
     {"Curvature", nullptr, ModeCategory::Analyze, ApplyKind::Recolor, curvatureColors,
      {{"K Neighbors", 6.0f, 64.0f, 16.0f, true},
       {"Fit Thresh", 0.05f, 2.0f, 0.5f, false, 0.05f}},
@@ -1864,16 +2346,30 @@ const ModeEntry kModes[] = {
     {"Outlier: QFOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, qforColors,
      {{"K Neighbors", 10.0f, 256.0f, 24.0f, true},
       {"Alpha", 1.0f, 10.0f, 3.0f, false, 0.25f},
-      {"Sparse Skip", 0.0f, 1.0f, 1.0f, true}},
+      {"Sparse Skip", 0.0f, 1.0f, 1.0f, true},
+      {"Iterations", 1.0f, 8.0f, 2.0f, true}},
      qforFit, qforPoints},
-    {"Outlier: QFOR (Div Gate)", nullptr, ModeCategory::Filter, ApplyKind::Recolor,
-     qforDivColors,
+    {"Outlier: SFOR", nullptr, ModeCategory::Filter, ApplyKind::Recolor, sforColors,
      {{"K Neighbors", 10.0f, 256.0f, 24.0f, true},
       {"Alpha", 1.0f, 10.0f, 3.0f, false, 0.25f},
-      {"Div Sigma", 0.5f, 10.0f, 2.0f, false, 0.25f},
-      {"Side +|-|Both", 0.0f, 2.0f, 2.0f, true},
-      {"Sparse Skip", 0.0f, 1.0f, 1.0f, true},
-      {"Gate Raw", 0.0f, 1.0f, 0.0f, true}},
+      {"Sparse Skip", 0.0f, 1.0f, 1.0f, true}},
+     sforFit, sforPoints},
+    {"Outlier: RIMLS", nullptr, ModeCategory::Filter, ApplyKind::Recolor, rimlsColors,
+     {{"Radius %", 0.5f, 10.0f, 2.0f, false},
+      {"Alpha", 1.0f, 10.0f, 3.0f, false, 0.25f},
+      {"Sigma N", 0.2f, 2.0f, 0.5f, false, 0.1f}},
+     rimlsFit, rimlsPoints},
+    {"Outlier: QFOR (Div Gate)", nullptr, ModeCategory::Filter, ApplyKind::Recolor,
+     qforDivColors,
+     {{"-- Normal Divergence --", 0.0f, 1.0f, 1.0f, true},
+      {"K Neighbors", 6.0f, 128.0f, 16.0f, true},
+      {"Sigma Thresh (0 = sign)", 0.0f, 10.0f, 0.0f, false, 0.25f},
+      {"Side  0:+  1:-  2:both", 0.0f, 2.0f, 0.0f, true},
+      {"Raw Field (0 = anomaly)", 0.0f, 1.0f, 1.0f, true},
+      {"-- QFOR --", 0.0f, 1.0f, 1.0f, true},
+      {"K Neighbors", 10.0f, 256.0f, 24.0f, true},
+      {"Alpha", 1.0f, 10.0f, 3.0f, false, 0.25f},
+      {"Sparse Skip", 0.0f, 1.0f, 1.0f, true}},
      qforDivFit, qforDivGatePoints},
     {"Outlier: QFOR (Dev Gate)", nullptr, ModeCategory::Filter, ApplyKind::Recolor,
      qforDevColors,
@@ -2018,7 +2514,8 @@ bool modeSupportsCandidates(int index) {
     if (index < 0 || index >= kModeCount) return false;
     ColorFn f = kModes[index].colorFn;  // the filters that call keepNonCandidates
     return f == sorColors || f == rorColors || f == pforColors || f == qforColors ||
-           f == qforDivColors || f == qforDevColors || f == pforDivColors;
+           f == qforDivColors || f == qforDevColors || f == pforDivColors ||
+           f == sforColors || f == rimlsColors;
 }
 
 void runModePoints(int index, const ModeInput& in, std::vector<Eigen::Vector3f>& outPoints,
