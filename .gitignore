@@ -1,7 +1,14 @@
 # Build output
 /build/
+/build-sdk/
+/build-mt/
+/build-consumer/
+/build-c/
 /out/
 *.user
+
+# Staged binary SDK (scripts/package_sdk.ps1)
+/dist/
 
 # IDE
 .vs/

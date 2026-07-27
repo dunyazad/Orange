@@ -97,6 +97,7 @@ are drawn this way — a text atlas sampled by one quad per face.
 engine/                  the reusable engine (add_subdirectory(engine))
   render_api/            interface-only contract (header library)
   core/                  platform layer + ECS (components, systems, app loop)
+  c_api/                 orange_c.dll — plain-C facade (any toolchain/language)
   plugins/render_gl/     OpenGL backend plugin
   plugins/render_vk/     Vulkan backend plugin (built only if the Vulkan SDK exists)
   cmake/OrangeApp.cmake  orange_add_app() helper for building apps on the engine
@@ -115,6 +116,50 @@ cmake --build build --config Debug
 ```
 
 Binaries (app + plugins) land in `build/bin/`.
+
+## Use from another project (binary SDK)
+
+Orange installs as a **prebuilt library package** — another project links the
+binaries and includes the headers, with no Orange source in its tree. See
+[docs/USING_AS_LIBRARY.md](docs/USING_AS_LIBRARY.md) for the full guide.
+
+```powershell
+./scripts/package_sdk.ps1 -Configs Release           # static  -> dist/Orange-SDK-Release
+./scripts/package_sdk.ps1 -Configs Release -Shared   # orange_core.dll instead
+```
+
+That prefix holds `include/orange/{core,render}` (+ the bundled header-only
+`robin_hood`/Eigen), `lib/orange_core.lib`, the `lib/cmake/Orange` package
+config, and `bin/` with the runtime-loaded `render_gl`/`render_vk` plugins and
+`SDL3.dll`. The consumer side is three lines:
+
+```cmake
+find_package(Orange CONFIG REQUIRED)          # -DCMAKE_PREFIX_PATH=<sdk prefix>
+add_executable(myApp main.cpp)
+target_link_libraries(myApp PRIVATE orange::core)
+orange_copy_runtime(myApp)                    # plugins + SDL3 next to the exe
+```
+
+A working example lives in [`examples/consumer/`](examples/consumer/).
+
+### C ABI (`orange_c.dll`)
+
+`orange::core` is C++ (STL/Eigen in its headers), so a consumer must use the
+same compiler. `orange_c.dll` is the plain-C facade over the CPU toolkit —
+one header (`orange/c/orange.h`, `<stdint.h>` only) and one DLL, usable from any
+toolchain or any language with an FFI. Built with `-StaticCrt` it imports
+nothing but `KERNEL32.dll` (~0.5 MB), so shipping it is literally copying one
+file:
+
+```c
+OrangeMesh sphere = orangeBuildSphere(10.0f, 48, NULL);
+printf("%d triangles\n", orangeMeshTriangleCount(sphere));
+orangeMeshDestroy(sphere);
+```
+
+Primitives, point-cloud IO, normal estimation, smoothing, ICP, TSDF surface
+reconstruction and KD-tree queries are exposed. See
+[`examples/c_consumer/`](examples/c_consumer/) and the guide.
 
 ## Run
 

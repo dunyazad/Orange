@@ -43,6 +43,25 @@ target_link_libraries(orange_margin_probe PRIVATE orange::core)
 set_target_properties(orange_margin_probe PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+# C ABI wrapper (orange/c/orange.h), compiled as C against the wrapper source
+# with ORANGE_C_STATIC -- same entry points orange_c.dll exports, but linked into
+# the test exe so the suite does not depend on loading the DLL.
+if(ORANGE_BUILD_C_API)
+    add_executable(orange_c_tests test_c_api.c
+                   "${CMAKE_CURRENT_SOURCE_DIR}/../c_api/src/orange_c.cpp")
+    target_compile_definitions(orange_c_tests PRIVATE
+        ORANGE_C_STATIC=1
+        ORANGE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+        ORANGE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+        ORANGE_VERSION_PATCH=${PROJECT_VERSION_PATCH})
+    target_include_directories(orange_c_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../c_api/include")
+    target_link_libraries(orange_c_tests PRIVATE orange::core)
+    set_target_properties(orange_c_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    add_test(NAME orange_c_tests COMMAND orange_c_tests)
+endif()
+
 # Numeric build check on a real PLY (manual; needs an external file, not a CTest).
 add_executable(orange_ply_check check_ply.cpp)
 target_link_libraries(orange_ply_check PRIVATE orange::core)

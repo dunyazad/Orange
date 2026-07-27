@@ -62,6 +62,7 @@ CPU, Eigen-backed, CUDA-free utilities that live in `orange_core` (headers under
 engine/                  the reusable engine (CMake: add_subdirectory(engine))
   render_api/            interface-only C-ABI contract (header library) — no GL/VK/SDL
   core/                  platform layer + ECS (components, systems, app loop, window)
+  c_api/                 orange_c.dll — plain-C facade over the CPU toolkit
   plugins/render_gl/     OpenGL 3.3 backend plugin
   plugins/render_vk/     Vulkan backend plugin (built only if a Vulkan SDK is found)
   cmake/OrangeApp.cmake  orange_add_app() — the entry point every app uses
@@ -108,6 +109,64 @@ cmake --build D:/Library/Orange/build --config Debug
   session, delete `build/CMakeCache.txt`, and reconfigure.
 - Binaries land in `build/bin/Debug`. Run `appOrange.exe` (GL) or
   `appOrange.exe --vulkan`.
+
+## Binary SDK (consuming Orange from another project)
+
+The engine installs as a **prebuilt package** — other projects link binaries +
+headers, never the source. Rules live in `cmake/OrangeInstall.cmake` (included
+from the root CMakeLists when `ORANGE_INSTALL`, default ON), the package config
+template in `cmake/OrangeConfig.cmake.in`, consumer helpers in
+`cmake/OrangeRuntime.cmake`, packaging in `scripts/package_sdk.ps1`, a working
+consumer in `examples/consumer/`. Full guide: `docs/USING_AS_LIBRARY.md`.
+
+- Produce: `./scripts/package_sdk.ps1 [-Configs Release] [-Single] [-Zip]` →
+  `dist/Orange-SDK-<config>/` (or `cmake --install build --config … --prefix …`).
+- Consume: `find_package(Orange CONFIG REQUIRED)` → `orange::core`,
+  `orange::render_api` (exported names match the in-tree aliases via
+  `EXPORT_NAME`), plus `orange_copy_runtime(<target>)` /
+  `orange_add_app(<name> SOURCES …)` and `ORANGE_PLUGIN_DIR`.
+- The plugins are MODULE libraries: **not** in the export set (no link
+  interface), installed to `bin/` and copied next to the consumer exe by
+  `orange_copy_runtime()`. That copy is needed even for headless tools, since
+  `orange::core` public-links SDL3.
+- Public headers pull in `<robin_hood/robin_hood.h>` (sparse_grid.h) and
+  `<Eigen/…>` (math.h), so both are bundled into
+  `include/orange-third_party/` and reached through `INSTALL_INTERFACE` include
+  dirs. Every `target_include_directories` on `orange_core`/`orange_render_api`
+  is a `BUILD_INTERFACE`/`INSTALL_INTERFACE` pair — adding a raw absolute path
+  breaks relocatability.
+- `ORANGE_INSTALL` forces `SDL_INSTALL`/`ENTT_INSTALL` ON (they are public deps,
+  so `install(EXPORT)` fails without their own exports) and `SDL_TEST_LIBRARY`
+  OFF (its install rule references a target nothing builds).
+- ONNX/MobileSAM stays out of the exported interface (absolute build-machine
+  paths); the lib/dll/models are installed and `OrangeConfig.cmake` re-attaches
+  the import library. `ORANGE_ENABLE_ONNX`/`ORANGE_ONNX_MODEL_DIR` are PRIVATE.
+- `orange_core` gets `DEBUG_POSTFIX d`; plugin/SDL3 DLL names are
+  config-independent, so Debug and Release get separate prefixes by default.
+- `ORANGE_BUILD_SHARED=ON` (`package_sdk.ps1 -Shared`) builds `orange_core` as a
+  DLL/.so instead of a static archive — `bin/orange_core.dll` + `lib/orange_core.lib`
+  import library, exported via `WINDOWS_EXPORT_ALL_SYMBOLS` (headers carry no
+  `__declspec(dllexport)`; there are no exported data globals). Consumer CMake is
+  unchanged, and `orange_copy_runtime()` picks the DLL up with the rest of `bin/`.
+  This does **not** relax the same-toolchain requirement: the interface is still
+  C++ (STL/Eigen in headers); only the render-plugin boundary is a C ABI.
+  Note: Windows 11 Smart App Control blocks freshly built unsigned DLLs
+  (`LoadLibrary` error 4551), so distributed binaries should be code-signed.
+- **C ABI facade (`orange_c`, `ORANGE_BUILD_C_API` default ON).**
+  `engine/c_api/` — header `orange/c/orange.h` (only `<stdint.h>`), impl
+  `src/orange_c.cpp`. Always SHARED, links `orange::core` PRIVATE, so no C++
+  symbol leaks: consumers need one DLL + one header and **no matching
+  toolchain** (any compiler, or any language with an FFI). Opaque handles
+  (`OrangeVec3Array`/`OrangeMesh`/`OrangeKdTree`) with matching `*Destroy`, cdecl,
+  no exceptions across the boundary (every entry point wrapped in `guard()`;
+  failures return NULL/negative `OrangeStatus` + thread-local `orangeLastError()`),
+  mesh arrays are 9 floats per triangle, matrices column-major. Covers
+  primitives, point IO, `estimateNormals`/`smoothPoints`/`icpAlign`,
+  `pointsToMesh`, KD-tree queries. Bump `ORANGE_C_API_VERSION` on any
+  incompatible header change. Tests: `engine/tests/test_c_api.c` (CTest target
+  `orange_c_tests`) compiles the wrapper source with `ORANGE_C_STATIC` so the
+  suite needs no DLL load. `ORANGE_STATIC_CRT=ON` (/MT, set globally via
+  `CMAKE_MSVC_RUNTIME_LIBRARY`) makes `orange_c.dll` import only `KERNEL32`.
 
 ## Key facts to keep in mind
 

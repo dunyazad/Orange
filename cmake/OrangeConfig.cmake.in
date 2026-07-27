@@ -1,0 +1,47 @@
+@PACKAGE_INIT@
+
+# ---------------------------------------------------------------------------
+# OrangeConfig.cmake -- find_package(Orange CONFIG REQUIRED)
+#
+# Imports the prebuilt engine as binary targets:
+#   orange::core         engine core (ECS + platform + geometry toolkit), C++ ABI
+#   orange::c            orange_c.dll -- the plain-C facade, toolchain-independent
+#   orange::render_api   header-only C-ABI render contract
+#
+# and defines:
+#   ORANGE_PLUGIN_DIR    directory holding render_gl / render_vk (+ SDL3.dll)
+#   orange_copy_runtime(<target>)          copy those next to a built exe
+#   orange_add_app(<name> SOURCES <src>..) exe + link + runtime copy in one call
+# ---------------------------------------------------------------------------
+include(CMakeFindDependencyMacro)
+
+# SDL3 / EnTT are exported as their own packages into this same prefix by the
+# SDK install, so look here first (a system-wide SDL3/EnTT still wins if the
+# consumer put it earlier on CMAKE_PREFIX_PATH themselves).
+list(APPEND CMAKE_PREFIX_PATH "${PACKAGE_PREFIX_DIR}")
+
+find_dependency(SDL3 CONFIG)
+find_dependency(EnTT CONFIG)
+if(@ORANGE_EXPORT_EIGEN_PACKAGE@)
+    # Built against a system Eigen -- the consumer needs the same one.
+    find_dependency(Eigen3 CONFIG)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/OrangeTargets.cmake")
+
+# Optional ONNX Runtime (MobileSAM segmentation). Shipped as an import library
+# in the prefix rather than baked into the exported interface, since the build
+# machine's absolute path means nothing here.
+if(EXISTS "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/onnxruntime.lib")
+    set_property(TARGET orange::core APPEND PROPERTY
+        INTERFACE_LINK_LIBRARIES "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@/onnxruntime.lib")
+endif()
+
+# Runtime-loaded render backends live next to the executable, not on a link
+# line -- the consumer copies them with orange_copy_runtime().
+set(ORANGE_PLUGIN_DIR "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_BINDIR@")
+set(ORANGE_INCLUDE_DIR "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
+
+include("${CMAKE_CURRENT_LIST_DIR}/OrangeRuntime.cmake")
+
+check_required_components(Orange)

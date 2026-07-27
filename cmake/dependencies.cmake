@@ -8,6 +8,16 @@
 # ---------------------------------------------------------------------------
 include(FetchContent)
 
+# When Orange is packaged as a binary SDK (ORANGE_INSTALL), the fetched deps
+# that appear on orange_core's *public* interface must be installed and exported
+# into the same prefix -- otherwise install(EXPORT OrangeTargets) has no
+# SDL3::SDL3 / EnTT::EnTT to point at and the consumer cannot link. Both default
+# their install rules OFF when built as a subproject, so force them on.
+if(ORANGE_INSTALL)
+    set(SDL_INSTALL  ON CACHE BOOL "" FORCE)
+    set(ENTT_INSTALL ON CACHE BOOL "" FORCE)
+endif()
+
 # --- SDL3 -------------------------------------------------------------------
 # Windowing + input + GL context + Vulkan surface, on desktop AND mobile.
 find_package(SDL3 QUIET CONFIG)
@@ -16,6 +26,9 @@ if(NOT SDL3_FOUND)
     set(SDL_SHARED ON  CACHE BOOL "" FORCE)
     set(SDL_STATIC OFF CACHE BOOL "" FORCE)
     set(SDL_TEST   OFF CACHE BOOL "" FORCE)
+    # SDL3_test is a separate opt-in lib; leaving it ON adds an install rule for
+    # a target nothing builds, which breaks `cmake --install` of the SDK.
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(
         SDL3
         GIT_REPOSITORY https://github.com/libsdl-org/SDL.git

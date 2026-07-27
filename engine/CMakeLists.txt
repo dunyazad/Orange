@@ -18,6 +18,12 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/OrangeApp.cmake")
 add_subdirectory(render_api)   # interface-only C-ABI contract
 add_subdirectory(core)         # platform layer + ECS + plugin loader
 
+# Stable C ABI over the core's CPU toolkit, so other toolchains/languages can
+# use the engine through one DLL + one C header (ORANGE_BUILD_C_API, top level).
+if(ORANGE_BUILD_C_API)
+    add_subdirectory(c_api)
+endif()
+
 if(ORANGE_BUILD_TESTS)
     add_subdirectory(tests)    # headless orange_core unit tests (CTest)
 endif()
