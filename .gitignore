@@ -1,6 +1,7 @@
 # Build output
 /build/
 /build-sdk/
+/build-sdk-shared/
 /build-mt/
 /build-consumer/
 /build-c/
