@@ -47,7 +47,7 @@ block-beta
   misc["stb · robin_hood<br/>fonts/images · hash map"]
 
   classDef title fill:none,stroke:none,font-weight:bold
-  classDef label fill:#e8e8e8,stroke:#888,font-weight:bold
+  classDef label font-weight:bold
   classDef note fill:none,stroke:none,font-style:italic
   class T title
   class L1,L2,L3,L4,L5 label
