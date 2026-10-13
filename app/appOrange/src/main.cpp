@@ -42,6 +42,8 @@
 #include "orange/ecs/systems.h"
 #include "orange/ecs/undo.h"
 #include "orange/render/types.h"
+#include "orange/ui/menu_json.h"
+#include "orange/ui/node.h"
 
 using namespace orange;
 
@@ -899,7 +901,22 @@ int main(int argc, char** argv) {
         mb.vbo   = menuVbo.handle();
         mb.font  = &uiFont;
         mb.atlas = uiFont.texture;
-        mb.menus = ecs::defaultAppMenus();
+        // Menus come from the declarative ui/menus.json next to the exe; the
+        // C++ defaultAppMenus() tree is the fallback if the file is missing or
+        // fails to parse (so a bad edit never leaves the app without a menu).
+        {
+            const std::string menuPath =
+                (uiBase ? std::string(uiBase) : std::string()) + "ui/menus.json";
+            ui::Node  menuRoot;
+            std::string uiErr;
+            if (ui::loadUiFile(menuPath, menuRoot, &uiErr) &&
+                ui::menusFromUi(menuRoot, mb.menus, &uiErr)) {
+                SDL_Log("UI: menus loaded from %s", menuPath.c_str());
+            } else {
+                SDL_Log("UI: %s -- using built-in menus", uiErr.c_str());
+                mb.menus = ecs::defaultAppMenus();
+            }
+        }
         world.emplace<ecs::MenuBar>(e, mb);
     }
 

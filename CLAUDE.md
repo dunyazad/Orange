@@ -354,6 +354,23 @@ consumer in `examples/consumer/`. Full guide: `docs/USING_AS_LIBRARY.md`.
   real, pickable `Renderable` entity (at the camera pivot, scaled to orbit
   distance) with a matching `PickGeometry`. So generated shapes are themselves
   selectable and can be fed to the geometry operators above.
+- **Declarative UI from JSON (`orange::ui`, step 1 = menus):** `orange/ui/node.h`
+  defines a generic widget tree (`ui::Node`: `type`/`id`/`label`/`shortcut`/
+  `action`/`bind`, anchor + x/y/w/h/pad/gap, unknown scalar keys kept in
+  `props`, `children`) and `parseUiJson`/`loadUiFile` (nlohmann/json 3.11.3
+  vendored at `engine/third_party/nlohmann/json.hpp`, included only from
+  `engine/core/src/ui/*.cpp` — never from a public header, and not installed
+  with the SDK). `orange/ui/menu_json.h` bridges a `"menubar"` tree
+  (`menu` → `item`/`check`/`separator`/`modes`, one submenu level via
+  `children`) into `ecs::Menu` rows; `action` strings are `MenuAction`
+  enumerator names (table in `ui_menu.cpp`, `ModeN` parsed numerically;
+  unknown name = load error). appOrange reads `<exe dir>/ui/menus.json`
+  (copied from `app/appOrange/ui/` post-build) and falls back to the C++
+  `defaultAppMenus()` with an `SDL_Log` notice if the file is missing/invalid.
+  `orange_ui_tests` (CTest) checks the parser, the action-name round-trip, and
+  that `menus.json` reproduces `defaultAppMenus()` exactly — keep both in sync
+  (or drop the C++ tree once the JSON path is trusted). Next steps: generic
+  layout/input/render systems for panels, `bind` property paths, hot reload.
 - **Tree-view / scene outliner (`TreeView`):** a draggable overlay widget built
   on the same dynamic-VB + font-atlas quad pattern as the FPS widget. Lists the
   world's drawable entities under collapsible group headers (Meshes / Point

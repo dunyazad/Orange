@@ -21,6 +21,8 @@ add_library(orange_core ${_orange_core_type}
     src/console.cpp
     src/crash_handler.cpp
     src/ui_layout.cpp
+    src/ui/ui_json.cpp
+    src/ui/ui_menu.cpp
     src/geometry/sparse_grid.cpp
     src/geometry/sparse_data_block.cpp
     src/geometry/mesh_generation.cpp
@@ -58,6 +60,9 @@ target_include_directories(orange_core PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
     "$<INSTALL_INTERFACE:include>"
     # robin_hood (header-only) -- leaks into sparse_grid.h, so it ships too.
+    # nlohmann/json lives in the same dir but is PRIVATE in effect: only
+    # src/ui/*.cpp include it, no public header does, and OrangeInstall.cmake
+    # bundles robin_hood alone.
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../third_party>"
     "$<INSTALL_INTERFACE:include/orange-third_party>")
 target_include_directories(orange_core PRIVATE ${STB_INCLUDE_DIR})  # stb_image_write

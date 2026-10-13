@@ -1,0 +1,98 @@
+{
+  "type": "menubar",
+  "children": [
+    { "type": "menu", "label": "File", "children": [
+      { "type": "item", "label": "Open...",    "action": "OpenFile",   "shortcut": "Ctrl+O" },
+      { "type": "item", "label": "Save",       "action": "SaveFile",   "shortcut": "Ctrl+S" },
+      { "type": "item", "label": "Save As...", "action": "SaveFileAs", "shortcut": "Ctrl+Shift+S" },
+      { "type": "separator" },
+      { "type": "item", "label": "Screenshot", "action": "Screenshot", "shortcut": "C" },
+      { "type": "separator" },
+      { "type": "item", "label": "Quit",       "action": "Quit",       "shortcut": "Esc" }
+    ]},
+    { "type": "menu", "label": "Edit", "children": [
+      { "type": "item", "label": "Undo", "action": "Undo", "shortcut": "Ctrl+Z" },
+      { "type": "item", "label": "Redo", "action": "Redo", "shortcut": "Ctrl+Y" }
+    ]},
+    { "type": "menu", "label": "View", "children": [
+      { "type": "check", "label": "Ground Grid",         "action": "ToggleGrid",  "shortcut": "Space" },
+      { "type": "item",  "label": "Reset Camera",        "action": "ResetCamera", "shortcut": "R" },
+      { "type": "separator" },
+      { "type": "item",  "label": "Z-Up / Y-Up",         "action": "ToggleUpAxis" },
+      { "type": "item",  "label": "Perspective / Ortho", "action": "ToggleProjection" },
+      { "type": "separator" },
+      { "type": "item",  "label": "Font Size...",        "action": "FontSizeDialogToggle" }
+    ]},
+    { "type": "menu", "label": "Render", "children": [
+      { "type": "check", "label": "Lighting",         "action": "ToggleLighting", "shortcut": "`" },
+      { "type": "check", "label": "VSync",            "action": "ToggleVsync" },
+      { "type": "check", "label": "Cross-Section",    "action": "ToggleCrossSection" },
+      { "type": "separator" },
+      { "type": "check", "label": "Color: Original",  "action": "ColorOriginal" },
+      { "type": "check", "label": "Color: Height",    "action": "ColorHeight" },
+      { "type": "check", "label": "Color: Position",  "action": "ColorPosition" },
+      { "type": "check", "label": "Color: Grayscale", "action": "ColorGray" }
+    ]},
+    { "type": "menu", "label": "Draw", "children": [
+      { "type": "item", "label": "Hidden (None)",     "action": "DrawNone" },
+      { "type": "item", "label": "Solid",             "action": "DrawSolid" },
+      { "type": "item", "label": "Wireframe",         "action": "DrawWireframe" },
+      { "type": "item", "label": "Wireframe + Solid", "action": "DrawWireSolid" },
+      { "type": "item", "label": "Point",             "action": "DrawPoint" },
+      { "type": "separator" },
+      { "type": "item", "label": "Point Size +",      "action": "PointSizeUp",   "shortcut": "+" },
+      { "type": "item", "label": "Point Size -",      "action": "PointSizeDown", "shortcut": "-" }
+    ]},
+    { "type": "menu", "label": "Select", "children": [
+      { "type": "item", "label": "Select All On-Screen", "action": "SelectAll",      "shortcut": "Ctrl+A" },
+      { "type": "item", "label": "Clear Selection",      "action": "ClearSelection" },
+      { "type": "item", "label": "Delete Selected",      "action": "DeleteSelected", "shortcut": "Del" },
+      { "type": "item", "label": "Unhide All",           "action": "UnhideAll",      "shortcut": "H" }
+    ]},
+    { "type": "menu", "label": "Geometry", "children": [
+      { "type": "item", "label": "Off", "action": "ModeOff" },
+      { "type": "separator" },
+      { "type": "modes" },
+      { "type": "separator" },
+      { "type": "item", "label": "Poisson Reconstruction...", "action": "PoissonDialogToggle" },
+      { "type": "item", "label": "3D Compare (2 selected)",   "action": "Compare3D" }
+    ]},
+    { "type": "menu", "label": "Pipelines", "children": [
+      { "type": "item", "label": "Estimate Occlusal Plane", "children": [
+        { "type": "item", "label": "Estimate Occlusal Plane", "action": "PipelineOcclusalEstimate" },
+        { "type": "separator" },
+        { "type": "item", "label": "Whole-mesh PCA",   "action": "PipelineOcclusalWholePCA" },
+        { "type": "item", "label": "Find Cusp",        "action": "PipelineOcclusalFindCusp" },
+        { "type": "item", "label": "Plane from Cusps", "action": "PipelineOcclusalPlaneFromCusps" }
+      ]},
+      { "type": "item", "label": "Occlusal 2D Render",     "action": "PipelineOcclusal2DRender" },
+      { "type": "item", "label": "Segment 2D (Classical)", "action": "PipelineSegment2DClassical" },
+      { "type": "item", "label": "Segment 2D (SAM/AI)",    "action": "PipelineSegment2DSAM" },
+      { "type": "item", "label": "Segment 3D (Teeth)",     "action": "PipelineSegment3D" },
+      { "type": "separator" },
+      { "type": "item", "label": "Pipeline Design...",     "action": "PipelineDialogToggle" }
+    ]},
+    { "type": "menu", "label": "Create", "children": [
+      { "type": "item", "label": "Plane",    "action": "CreatePlane" },
+      { "type": "item", "label": "Box",      "action": "CreateBox" },
+      { "type": "item", "label": "Sphere",   "action": "CreateSphere" },
+      { "type": "item", "label": "Cylinder", "action": "CreateCylinder" },
+      { "type": "item", "label": "Cone",     "action": "CreateCone" },
+      { "type": "item", "label": "Torus",    "action": "CreateTorus" },
+      { "type": "item", "label": "Disk",     "action": "CreateDisk" },
+      { "type": "item", "label": "Capsule",  "action": "CreateCapsule" },
+      { "type": "item", "label": "Arrow",    "action": "CreateArrow" }
+    ]},
+    { "type": "menu", "label": "Spatial", "children": [
+      { "type": "check", "label": "Off",          "action": "SpatialNone" },
+      { "type": "check", "label": "BVH",          "action": "SpatialBVH" },
+      { "type": "check", "label": "Octree",       "action": "SpatialOctree" },
+      { "type": "check", "label": "KD-Tree",      "action": "SpatialKDTree" },
+      { "type": "check", "label": "Uniform Grid", "action": "SpatialGrid" },
+      { "type": "check", "label": "Loose Octree", "action": "SpatialLoose" },
+      { "type": "check", "label": "BSP",          "action": "SpatialBSP" },
+      { "type": "check", "label": "R-Tree",       "action": "SpatialRTree" },
+      { "type": "check", "label": "Ball Tree",    "action": "SpatialBall" }
+    ]}
+  ]
+}

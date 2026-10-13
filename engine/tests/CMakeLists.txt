@@ -14,6 +14,20 @@ set_target_properties(orange_gui_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 add_test(NAME orange_gui_tests COMMAND orange_gui_tests)
 
+# Declarative UI loader: JSON -> ui::Node, MenuAction names, menubar bridge.
+# When appOrange's menus.json is present it is also checked against the C++
+# defaultAppMenus() fallback so the two cannot drift apart.
+add_executable(orange_ui_tests test_ui_json.cpp)
+target_link_libraries(orange_ui_tests PRIVATE orange::core EnTT::EnTT)
+set_target_properties(orange_ui_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set(_orange_menus_json "${CMAKE_SOURCE_DIR}/app/appOrange/ui/menus.json")
+if(EXISTS "${_orange_menus_json}")
+    add_test(NAME orange_ui_tests COMMAND orange_ui_tests "${_orange_menus_json}")
+else()
+    add_test(NAME orange_ui_tests COMMAND orange_ui_tests)
+endif()
+
 # Spatial acceleration structures (BVH / Octree / KD-tree) vs brute force.
 add_executable(orange_spatial_tests test_spatial.cpp)
 target_link_libraries(orange_spatial_tests PRIVATE orange::core)
