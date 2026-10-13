@@ -16,17 +16,42 @@ core never links against OpenGL or Vulkan directly.
 
 ## Architecture
 
-```
-app/appOrange ───────────┐  loads at runtime (dlopen / LoadLibrary)
-   (a thin consumer)      │
-engine/core  ── ECS (EnTT), window (SDL3), plugin loader, app loop
-   │  depends on
-   ▼
-engine/render_api  ── IRenderer interface + C ABI contract (no GL/VK/SDL)
-   ▲  implements
-   │
-engine/plugins/render_gl  ── OpenGL 3.3 backend  (render_gl.dll / librender_gl.so)
-engine/plugins/render_vk  ── Vulkan backend      (render_vk.dll / librender_vk.so)
+```mermaid
+block-beta
+  columns 5
+  T["Orange — block diagram<br/>apps / engine / render plugins / third-party"]:5
+
+  L1["Apps"]
+  appOrange["appOrange<br/>demo viewer"]
+  cusp["cusp_probe<br/>CLI diagnostic"]
+  consumer["examples/consumer<br/>SDK · find_package"]
+  cconsumer["examples/c_consumer<br/>C ABI · any language"]
+
+  L2["Engine"]
+  core["core  (orange::core)<br/>ECS (EnTT) · window/input (SDL3)<br/>app loop · plugin loader<br/>systems · geometry · io · modes · ml"]:3
+  capi["c_api  (orange_c.dll)<br/>plain-C facade<br/>over core"]
+
+  L3["Render ABI"]
+  api["render_api  (orange::render_api)<br/>IRenderer + C plugin contract, v18<br/>no GL / VK / SDL"]:3
+  space
+
+  L4["Plugins"]
+  gl["render_gl.dll<br/>OpenGL 3.3"]
+  vk["render_vk.dll<br/>Vulkan"]
+  note["MODULE libs, loaded at runtime<br/>orangeRenderPluginInfo / Create / Destroy"]:2
+
+  L5["Third-party"]
+  sdl["SDL3<br/>window · input · GL ctx · VK surface"]
+  entt["EnTT<br/>ECS registry"]
+  eigen["Eigen<br/>math"]
+  misc["stb · robin_hood<br/>fonts/images · hash map"]
+
+  classDef title fill:none,stroke:none,font-weight:bold
+  classDef label fill:#e8e8e8,stroke:#888,font-weight:bold
+  classDef note fill:none,stroke:none,font-style:italic
+  class T title
+  class L1,L2,L3,L4,L5 label
+  class note note
 ```
 
 The **engine** (`engine/`: core + render plugins) is the reusable half and never
